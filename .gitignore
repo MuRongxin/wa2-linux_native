@@ -1,18 +1,12 @@
 /target
 
-# Extracted game data: regenerate locally from the game disc with
-#   wa2-native kcap/lac/extract  -- do not commit (huge + copyrighted).
-/assets
+# Game content as loose files. Built once from the user's own copy of the game
+# by tools/build_data_tree.py -- never commit (huge + copyrighted).
+/data
 
 # Intermediate numpy/rasterizer artifacts from tools/ experiments.
 *.npy
 tools/verify/
 
-# Extracted char.pak sprites (regenerate via kcap char.pak).
-char_extracted/
-
-# Standalone unpack dumps (regenerate with `wa2-native extract <pak>`).
-*_extracted/
-
-# Character/font sample rasters (copyrighted artwork, like /assets).
+# Character/font sample rasters (copyrighted artwork, like /data).
 tools/samples/

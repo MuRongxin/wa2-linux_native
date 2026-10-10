@@ -33,6 +33,7 @@ const SDL_PIXELFORMAT_RGBA32: u32 = 0x1676_2004; // == SDL_PIXELFORMAT_ABGR8888
 const SDL_TEXTUREACCESS_STATIC: c_int = 0;
 const SDL_QUIT: u32 = 0x100;
 const SDL_KEYDOWN: u32 = 0x300;
+const SDL_MOUSEMOTION: u32 = 0x400;
 const SDL_MOUSEBUTTONDOWN: u32 = 0x401;
 const SDLK_ESCAPE: i32 = 41;
 const SDLK_q: i32 = 20;
@@ -69,6 +70,7 @@ pub struct Sdl {
     f_render_present: unsafe extern "C" fn(*mut c_void),
     f_render_read_pixels: unsafe extern "C" fn(*mut c_void, *const c_void, u32, *mut c_void, c_int) -> c_int,
     f_get_pixel_format_name: unsafe extern "C" fn(u32) -> *const c_char,
+    f_get_window_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int),
     f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int,
     f_destroy_texture: unsafe extern "C" fn(*mut c_void),
     f_destroy_renderer: unsafe extern "C" fn(*mut c_void),
@@ -88,6 +90,10 @@ pub enum Input {
     Quit,
     /// Number key 1-9 pressed (for choice selection).
     Choice(u8),
+    /// Pointer event in *window* coordinates: motion (`pressed == false`) or a
+    /// button press (`pressed == true`). Use `Sdl::surface_pos` to convert to
+    /// the 1280x720 surface the game draws into.
+    Pointer { x: i32, y: i32, pressed: bool },
 }
 
 unsafe fn sym(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
@@ -128,6 +134,8 @@ impl Sdl {
         let f_render_present: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(sym(lib, "SDL_RenderPresent")?);
         let f_render_read_pixels: unsafe extern "C" fn(*mut c_void, *const c_void, u32, *mut c_void, c_int) -> c_int = std::mem::transmute(sym(lib, "SDL_RenderReadPixels")?);
         let f_get_pixel_format_name: unsafe extern "C" fn(u32) -> *const c_char = std::mem::transmute(sym(lib, "SDL_GetPixelFormatName")?);
+        let f_get_window_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) =
+            std::mem::transmute(sym(lib, "SDL_GetWindowSize")?);
         let f_open_audio: unsafe extern "C" fn(*const c_char, i32, u32, i32, i32, i32, i32) -> u32 = std::mem::transmute(sym(lib, "SDL_OpenAudioDevice")?);
         let f_queue_audio: unsafe extern "C" fn(u32, *const c_void, u32) -> u32 = std::mem::transmute(sym(lib, "SDL_QueueAudio")?);
         let f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(sym(lib, "SDL_PollEvent")?);
@@ -191,6 +199,7 @@ impl Sdl {
             f_render_present,
             f_render_read_pixels,
             f_get_pixel_format_name,
+            f_get_window_size,
             f_poll_event,
             f_destroy_texture,
             f_destroy_renderer,
@@ -278,12 +287,40 @@ impl Sdl {
                         SDLK_9 => out = Input::Choice(9),
                         _ => {}
                     }
+                } else if etype == SDL_MOUSEMOTION {
+                    // SDL_MouseMotionEvent: type,timestamp,windowID,which,state
+                    // (20 bytes) then Sint32 x, y.
+                    let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
+                    let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
+                    out = Input::Pointer { x, y, pressed: false };
                 } else if etype == SDL_MOUSEBUTTONDOWN {
-                    out = Input::Advance;
+                    // SDL_MouseButtonEvent: type..which (16), button,state,clicks,
+                    // padding (4), then Sint32 x, y.
+                    let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
+                    let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
+                    out = Input::Pointer { x, y, pressed: true };
                 }
             }
         }
+        if out != Input::None && std::env::var_os("WA2_DEBUG_INPUT").is_some() {
+            eprintln!("input: {:?}", out);
+        }
         out
+    }
+
+    /// Current window size in pixels (the surface is stretched to it).
+    pub fn window_size(&self) -> (i32, i32) {
+        let (mut w, mut h) = (0i32, 0i32);
+        unsafe { (self.f_get_window_size)(self.window, &mut w, &mut h); }
+        (w.max(1), h.max(1))
+    }
+
+    /// Map a pointer event's window coordinates onto the game surface
+    /// (`present` stretches the surface over the whole window, so this is a
+    /// plain linear scale).
+    pub fn surface_pos(&self, x: i32, y: i32, sw: u32, sh: u32) -> (i32, i32) {
+        let (ww, wh) = self.window_size();
+        (x * sw as i32 / ww, y * sh as i32 / wh)
     }
 
     /// Read back the current renderer target as RGBA (for verification),

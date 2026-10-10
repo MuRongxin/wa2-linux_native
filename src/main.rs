@@ -1,6 +1,7 @@
 mod archive;
 mod audio;
 mod codec;
+mod data;
 mod render;
 mod sdl2;
 mod video;
@@ -70,7 +71,7 @@ fn main() {
         }
         "font-test" => {
             if args.len() < 5 { eprintln!("usage: wa2-native font-test <font.tga> <charset.txt> <out.tga> [text]"); return; }
-            let font = match load_font(&args[2], &args[3]) { Some(f) => f, None => return };
+            let font = match load_font_charset(&args[2], &args[3]) { Some(f) => f, None => return };
             let charset = match std::fs::read_to_string(&args[3]) { Ok(s) => s, Err(e) => { eprintln!("error: {}", e); return; } };
             let sample: String = if args.len() >= 6 {
                 args[5..].join(" ")
@@ -90,7 +91,7 @@ fn main() {
             }
             let scen = match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); return; } };
             let page = vm::parse_scenario_text(&scen);
-            let font = match load_font(&args[3], &args[4]) { Some(f) => f, None => return };
+            let font = match load_font_charset(&args[3], &args[4]) { Some(f) => f, None => return };
             let bg = match std::fs::read(&args[5]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
                 Some(i) => i, None => { eprintln!("error: could not decode background {}", args[5]); return; }
             };
@@ -230,6 +231,7 @@ fn main() {
                         sdl2::Input::Fullscreen => break,
                         sdl2::Input::None => win.delay(16),
                         sdl2::Input::Choice(_) => win.delay(16),
+                        sdl2::Input::Pointer { .. } => win.delay(16),
                     }
                 }
             }
@@ -264,7 +266,7 @@ fn main() {
                 eprintln!("usage: wa2-native verify-window <font.tga> <charset.txt> <bg.tga>");
                 return;
             }
-            let font = match load_font(&args[2], &args[3]) { Some(f) => f, None => return };
+            let font = match load_font_charset(&args[2], &args[3]) { Some(f) => f, None => return };
             let bg = match std::fs::read(&args[4]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
                 Some(i) => i, None => { eprintln!("error bg"); return; }
             };
@@ -293,7 +295,7 @@ fn main() {
             }
             let scen = match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); return; } };
             let page = vm::parse_scenario_text(&scen);
-            let font = match load_font(&args[3], &args[4]) { Some(f) => f, None => return };
+            let font = match load_font_charset(&args[3], &args[4]) { Some(f) => f, None => return };
             let bg = match std::fs::read(&args[5]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
                 Some(i) => i,
                 None => { eprintln!("error: could not decode background {}", args[5]); return; }
@@ -331,50 +333,90 @@ fn main() {
                         sdl2::Input::Quit => return,
                         sdl2::Input::Fullscreen => break,
                         sdl2::Input::Choice(_) => { if idx < n - 1 { idx += 1; } break; }
+                        sdl2::Input::Pointer { pressed, .. } => { if pressed && idx < n - 1 { idx += 1; break; } win.delay(16); }
                         sdl2::Input::None => { win.delay(16); }
                     }
                 }
             }
         }
         "run" => {
-            // wa2-native run <script_dir> <font.tga> <charset.txt> <bg_dir> <start_id> [bgm.ogg] [voice_dir]
-            if args.len() < 7 {
-                eprintln!("usage: wa2-native run <script_dir> <font.tga> <charset.txt> <bg_dir> <start_id> [bgm.ogg] [voice_dir]");
-                return;
-            }
-            let script_dir = std::path::Path::new(&args[2]);
-            let bg_dir = std::path::Path::new(&args[5]);
-            let start_id = args[6].clone();
-            let font = match load_font(&args[3], &args[4]) { Some(f) => f, None => return };
+            // wa2-native run [start_id]                                  (data tree)
+            // wa2-native run <script_dir> <font.tga> <charset.txt> <bg_dir> <start_id> [bgm] [voice_dir]
             let mut win = match sdl2::Sdl::new("wa2-native", 1280, 720) {
                 Some(w) => w,
                 None => { eprintln!("error: SDL2 unavailable / no display. Try DISPLAY=:0"); return; }
             };
+            if args.len() < 7 {
+                // Data-tree mode: everything comes from `$WA2_DATA` or ./data.
+                let d = match data::Data::resolve() { Some(d) => d, None => return };
+                let start_id = args.get(2).cloned().unwrap_or_else(|| "1001".to_string());
+                let font = match load_font(&d) { Some(f) => f, None => return };
+                eprintln!(
+                    "wa2-native run: data={} start={} (Space/Click=next, Left=back, 1-9=choice, Esc/q=quit)",
+                    d.describe(), start_id
+                );
+                let session = Session::from_data(&d, None);
+                if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
+                    eprintln!("run error: {}", e);
+                }
+                return;
+            }
+            // Legacy explicit-path mode (kept for debugging single scenes).
+            let script_dir = std::path::PathBuf::from(&args[2]);
+            let bg_dir = std::path::PathBuf::from(&args[5]);
+            let start_id = args[6].clone();
+            let font = match load_font_paths(std::path::Path::new(&args[3]), None, Some(std::path::Path::new(&args[4]))) { Some(f) => f, None => return };
             let bgm_path = args.get(7).cloned();
-            let voice_dir = args.get(8).map(|s| std::path::PathBuf::from(s));
+            let voice_dir = args.get(8).map(std::path::PathBuf::from);
+            let session = Session {
+                script_dir: script_dir.clone(),
+                bg_dir: bg_dir.clone(),
+                bg_cn: None,
+                sprite_dir: find_sprite_dir(&bg_dir, &script_dir),
+                movie_dir: bg_dir.join("..").join("mv"),
+                voice_dir,
+                bgm: bgm_path,
+            };
             eprintln!("wa2-native run: start={} (Space/Click=next, Left=back, 1-9=choice, Esc/q=quit)", start_id);
-            if let Err(e) = run_game(&mut win, &font, script_dir, bg_dir, &start_id, bgm_path.as_deref(), voice_dir.as_deref()) {
+            if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
                 eprintln!("run error: {}", e);
             }
         }
         "title" => {
+            // wa2-native title [start_id]                                (data tree)
             // wa2-native title <script_dir> <font.tga> <charset.txt> <bg_dir> [start_id]
-            if args.len() < 6 {
-                eprintln!("usage: wa2-native title <script_dir> <font.tga> <charset.txt> <bg_dir> [start_id]");
-                return;
-            }
-            let script_dir = std::path::Path::new(&args[2]);
-            let bg_dir = std::path::Path::new(&args[5]);
-            let start_id = args.get(6).cloned().unwrap_or_else(|| "1001".to_string());
-            let font = match load_font(&args[3], &args[4]) { Some(f) => f, None => return };
             let mut win = match sdl2::Sdl::new("wa2-native", 1280, 720) {
                 Some(w) => w,
                 None => { eprintln!("error: SDL2 unavailable / no display. Try DISPLAY=:0"); return; }
             };
-            match run_title(&mut win, &font, bg_dir) {
+            let (font, session, start_id, bg_dir) = if args.len() >= 6 {
+                let script_dir = std::path::PathBuf::from(&args[2]);
+                let bg_dir = std::path::PathBuf::from(&args[5]);
+                let font = match load_font_paths(std::path::Path::new(&args[3]), None, Some(std::path::Path::new(&args[4]))) { Some(f) => f, None => return };
+                let start_id = args.get(6).cloned().unwrap_or_else(|| "1001".to_string());
+                let session = Session {
+                    script_dir: script_dir.clone(),
+                    bg_dir: bg_dir.clone(),
+                    bg_cn: None,
+                    sprite_dir: find_sprite_dir(&bg_dir, &script_dir),
+                    movie_dir: bg_dir.join("..").join("mv"),
+                    voice_dir: None,
+                    bgm: None,
+                };
+                (font, session, start_id, bg_dir)
+            } else {
+                let d = match data::Data::resolve() { Some(d) => d, None => return };
+                let font = match load_font(&d) { Some(f) => f, None => return };
+                let start_id = args.get(2).cloned().unwrap_or_else(|| "1001".to_string());
+                let bg_dir = d.bg();
+                let session = Session::from_data(&d, None);
+                eprintln!("wa2-native title: data={}", d.describe());
+                (font, session, start_id, bg_dir)
+            };
+            match run_title(&mut win, &font, &session.bg_dirs(), session.bg_cn.is_some()) {
                 TitleAction::Start => {
                     eprintln!("title: starting scene {}", start_id);
-                    if let Err(e) = run_game(&mut win, &font, script_dir, bg_dir, &start_id, None, None) {
+                    if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
                         eprintln!("run error: {}", e);
                     }
                 }
@@ -511,13 +553,15 @@ fn load_scenario(script_dir: &std::path::Path, id: &str) -> Option<Vec<u8>> {
     std::fs::read(&p).ok()
 }
 
-/// Try to load a background TGA by name from `bg_dir`. Returns None if the
-/// file is missing or fails to decode (caller keeps the previous background).
+/// Try to load a background / UI TGA by name, searching `dirs` in order (the
+/// Chinese override directory first, then the shared background directory).
+/// Returns None if the file is missing or fails to decode (the caller keeps the
+/// previous background).
 ///
 /// WA2 scripts sometimes reference a suffixed variant (e.g. `v100200_bg.tga`)
 /// while the archive contains the base name (`v100200.tga`). We try the exact
 /// name first, then strip common suffixes.
-fn load_background(bg_dir: &std::path::Path, name: &str) -> Option<codec::tga::TgaImage> {
+fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::TgaImage> {
     // Build candidate names: exact, then with suffixes stripped.
     let mut candidates = vec![name.to_string()];
     let lower = name.to_ascii_lowercase();
@@ -531,33 +575,53 @@ fn load_background(bg_dir: &std::path::Path, name: &str) -> Option<codec::tga::T
     candidates.push(format!("{}.tga", base));
     candidates.push(format!("{}.TGA", base));
 
-    for cand in candidates {
-        let p = bg_dir.join(&cand);
-        if let Ok(data) = std::fs::read(&p) {
-            if let Ok(img) = codec::tga::decode(&data) {
-                return Some(img);
+    for dir in dirs {
+        for cand in &candidates {
+            let p = dir.join(cand);
+            if let Ok(data) = std::fs::read(&p) {
+                if let Ok(img) = codec::tga::decode(&data) {
+                    return Some(img);
+                }
             }
         }
     }
     None
 }
 
-/// Find a voice file for the given scenario and voice line index.
+/// Voice file lookup, indexed once instead of scanning the directory per line.
 ///
-/// Voice files are named `{scenario}_{line:04d}_{XX}.OGG` where `line` is the
-/// .txt field index of the speaker token. There may be multiple character
-/// variants; we return the first match.
-fn find_voice(voice_dir: &std::path::Path, scenario: &str, line: u32) -> Option<String> {
-    let prefix = format!("{}_{:04}_", scenario, line);
-    let entries = std::fs::read_dir(voice_dir).ok()?;
-    for entry in entries.flatten() {
-        if let Ok(name) = entry.file_name().into_string() {
-            if name.starts_with(&prefix) {
-                return Some(entry.path().to_string_lossy().into_owned());
+/// Voice files are named `{scenario}_{line:04d}_{XX}.OGG`, where `line` is the
+/// token index of the speaker token; `XX` is a per-character variant, so the
+/// first file for a `{scenario}_{line}` key wins.
+struct VoiceIndex {
+    map: std::collections::HashMap<String, std::path::PathBuf>,
+}
+
+impl VoiceIndex {
+    fn build(dir: &std::path::Path) -> VoiceIndex {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let name = match e.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                // "1008_0199_04.OGG" -> "1008_0199"
+                let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name);
+                let mut parts = stem.splitn(3, '_');
+                let key = match (parts.next(), parts.next()) {
+                    (Some(a), Some(b)) => format!("{}_{}", a, b),
+                    _ => continue,
+                };
+                map.entry(key).or_insert_with(|| e.path());
             }
         }
+        VoiceIndex { map }
     }
-    None
+
+    fn find(&self, scenario: &str, line: u32) -> Option<&std::path::Path> {
+        self.map.get(&format!("{}_{:04}", scenario, line)).map(|p| p.as_path())
+    }
 }
 
 /// Build a solid-color fallback background image.
@@ -569,17 +633,62 @@ fn solid_bg(w: u32, h: u32, color: [u8; 3]) -> codec::tga::TgaImage {
     codec::tga::TgaImage { width: w, height: h, rgba }
 }
 
+/// Where every kind of media comes from for one play session.
+///
+/// Built either from the loose-file data tree (`Session::from_data`) or from
+/// explicit CLI paths (legacy debugging form). Everything the engine loads at
+/// runtime goes through here - no `.pak` archive is opened.
+struct Session {
+    script_dir: std::path::PathBuf,
+    bg_dir: std::path::PathBuf,
+    /// Chinese-patch UI overrides - the 31 images shipped loose in the game's
+    /// `grp/` directory, which win over the same-named files inside `grp.pak`.
+    /// Consulted before `bg_dir`; `None` in Japanese mode.
+    bg_cn: Option<std::path::PathBuf>,
+    /// Loose `*.tga` character sprites, or `None` to disable sprites.
+    sprite_dir: Option<std::path::PathBuf>,
+    /// Movies as plain `*.wmv` / `*.asf` files.
+    movie_dir: std::path::PathBuf,
+    voice_dir: Option<std::path::PathBuf>,
+    bgm: Option<String>,
+}
+
+impl Session {
+    fn from_data(d: &data::Data, bgm: Option<String>) -> Session {
+        Session {
+            script_dir: d.script(),
+            bg_dir: d.bg(),
+            bg_cn: if d.cn { Some(d.root.join("bg_cn")) } else { None },
+            sprite_dir: Some(d.sprite()),
+            movie_dir: d.movie(),
+            voice_dir: Some(d.voice()),
+            bgm,
+        }
+    }
+
+    /// Directories searched for images, in priority order.
+    fn bg_dirs(&self) -> Vec<&std::path::Path> {
+        let mut v = Vec::new();
+        if let Some(cn) = self.bg_cn.as_deref() {
+            v.push(cn);
+        }
+        v.push(self.bg_dir.as_path());
+        v
+    }
+}
+
 /// Full game loop: play scenes starting from `start_id`, following CATCH jumps
 /// and presenting choices to the player.
 fn run_game(
     win: &mut sdl2::Sdl,
     font: &render::Font,
-    script_dir: &std::path::Path,
-    bg_dir: &std::path::Path,
+    s: &Session,
     start_id: &str,
-    bgm_path: Option<&str>,
-    voice_dir: Option<&std::path::Path>,
 ) -> Result<(), String> {
+    let script_dir = s.script_dir.as_path();
+    let bg_dir = s.bg_dir.as_path();
+    let voice_dir = s.voice_dir.as_deref();
+    let bgm_path = s.bgm.as_deref();
     const W: u32 = 1280;
     const H: u32 = 720;
     let mut current_id = start_id.to_string();
@@ -603,13 +712,22 @@ fn run_game(
         None
     };
 
+    // WA2_AUTO       : advance text *and* pick choices automatically (unattended runs)
+    // WA2_AUTO_TEXT  : advance text only, stop at choices (interactive verification)
+    let auto_pick = std::env::var_os("WA2_AUTO").is_some();
+    let auto_text = auto_pick || std::env::var_os("WA2_AUTO_TEXT").is_some();
+
+    // Voice files are indexed once: the directory holds ~39k entries and the
+    // old code scanned it for every single line.
+    let voices = voice_dir.map(VoiceIndex::build);
+
     let mut cur_surf = render::render_scene(&bg, "", font, W, H);
-    let mut bank = find_char_pak(bg_dir, script_dir).map(|pak| {
-        eprintln!("char.pak: {}", pak.display());
-        SpriteBank::new(pak)
+    let mut bank = s.sprite_dir.as_ref().filter(|p| p.is_dir()).map(|dir| {
+        eprintln!("sprites: {}", dir.display());
+        SpriteBank::new(dir.clone())
     });
     if bank.is_none() {
-        eprintln!("note: char.pak not found - character sprites disabled");
+        eprintln!("note: no sprite directory - character sprites disabled");
     }
     let mut sprites: Vec<ActiveSprite> = Vec::new();
     let mut focus: Option<u32> = None;
@@ -638,9 +756,9 @@ fn run_game(
                         None => body,
                     };
                     // Voice playback keyed by the speaker token index.
-                    if let (Some(vd), Some(vt), Some(mx)) = (voice_dir, voice_tok, mixer.as_ref()) {
-                        if let Some(vf) = find_voice(vd, &current_id, vt) {
-                            mx.play(&vf, 1.0, false);
+                    if let (Some(vi), Some(vt), Some(mx)) = (voices.as_ref(), voice_tok, mixer.as_ref()) {
+                        if let Some(vf) = vi.find(&current_id, vt) {
+                            mx.play(&vf.to_string_lossy(), 1.0, false);
                         }
                     }
                     cur_surf = draw_scene(&bg, &display, font, &sprites, focus, W, H);
@@ -674,17 +792,32 @@ fn run_game(
                     // `.AMP` tokens are palette/effect tints we do not apply; the
                     // empty token clears to black.
                     if name.is_empty() {
+                        eprintln!("  bg: <black>");
                         bg = solid_bg(W, H, [0, 0, 0]);
                     } else if name.to_ascii_lowercase().ends_with(".tga") {
-                        if let Some(img) = load_background(bg_dir, &name) {
-                            bg = img;
+                        match load_background(&s.bg_dirs(), &name) {
+                            Some(img) => {
+                                eprintln!("  bg: {} ({}x{})", name, img.width, img.height);
+                                bg = img;
+                            }
+                            // Missing files are the norm for the overlay layers of
+                            // a layered CG (`v100200_bg.tga` etc. ship only inside
+                            // the base image), so say so once instead of silently
+                            // keeping the previous background.
+                            None => eprintln!("  bg: {} NOT FOUND", name),
                         }
+                    } else {
+                        eprintln!("  bg: {} (effect, ignored)", name);
                     }
                     cur_surf = draw_scene(&bg, "", font, &sprites, focus, W, H);
+                    // Show it immediately: a background change is a visible event
+                    // on its own (the original engine repaints here), and the next
+                    // script op may be a movie that takes over the screen.
+                    win.present(&cur_surf);
                 }
                 vm::lscr::Event::Movie { name } => {
                     eprintln!("  movie: {}", name);
-                    let _ = play_movie(win, bg_dir, &name);
+                    let _ = play_movie(win, &s.movie_dir, &name);
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::Choice { options } => {
@@ -695,34 +828,72 @@ fn run_game(
                             vm::strip_choice_prefix(&c).unwrap_or(c)
                         })
                         .collect();
-                    let mut body = String::from("—— 请选择 ——\n");
+                    let mut body = String::from("\u{2014}\u{2014} \u{9009}\u{62e9} \u{2014}\u{2014}\n");
                     for (i, o) in opts.iter().enumerate() {
                         body.push_str(&format!("{}. {}\n", i + 1, o));
                     }
+                    // Option i sits on text line i+1 (line 0 is the header), so its
+                    // screen band is known and can be used for pointer hit testing.
+                    // Render the plain frame once and copy it per frame - a full
+                    // re-render is far too slow to repeat while the mouse moves.
+                    let cell = font.cell() as i32;
+                    let line_h = cell + 4;
+                    let box_h = (H / 4).max(140);
+                    let box_y = (H - box_h - 24) as i32;
+                    let opt_top = |i: usize| box_y + 18 + (i as i32 + 1) * line_h;
+                    let base = draw_scene(&bg, &body, font, &sprites, focus, W, H);
+                    let mut hover: Option<usize> = None;
                     cur_surf = draw_scene(&bg, &body, font, &sprites, focus, W, H);
                     win.present(&cur_surf);
-                    let chosen = if std::env::var_os("WA2_AUTO").is_some() {
+                    eprintln!(
+                        "  choice: presenting {} options (click one, or press 1-{})",
+                        opts.len(),
+                        opts.len()
+                    );
+                    let chosen = if auto_pick {
                         win.delay(300);
                         1u32
                     } else {
                         loop {
+                            let mut frame = render::Surface {
+                                width: base.width,
+                                height: base.height,
+                                pixels: base.pixels.clone(),
+                            };
+                            if let Some(i) = hover {
+                                let y = opt_top(i) - 6;
+                                frame.fill_rect(40, y, W - 80, (line_h + 4) as u32, [130, 190, 255, 70]);
+                            }
+                            win.present(&frame);
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(()),
                                 sdl2::Input::Choice(n) if (n as usize) <= opts.len() => {
                                     break n as u32
                                 }
-                                sdl2::Input::None => win.delay(16),
-                                sdl2::Input::Choice(_) => win.delay(16),
-                                _ => {}
+                                sdl2::Input::Pointer { x, y, pressed } => {
+                                    let (_, sy) = win.surface_pos(x, y, W, H);
+                                    let hit = (0..opts.len()).find(|i| {
+                                        sy >= opt_top(*i) - 6 && sy < opt_top(*i) + line_h
+                                    });
+                                    hover = hit;
+                                    if pressed {
+                                        if let Some(i) = hit {
+                                            break (i + 1) as u32;
+                                        }
+                                    }
+                                    win.delay(16);
+                                }
+                                _ => win.delay(16),
                             }
                         }
                     };
                     eprintln!("  choice: {} / {}", chosen, opts.len());
                     it.set_choice_result(chosen);
                 }
+
                 vm::lscr::Event::Wait => {
                     win.present(&cur_surf);
-                    if std::env::var_os("WA2_AUTO").is_some() {
+                    if auto_text {
                         // auto-advance mode (demo / verification): keep stepping
                         win.delay(40);
                     } else {
@@ -763,11 +934,14 @@ fn load_program(script_dir: &std::path::Path, id: &str) -> Option<vm::lscr::Prog
     }
 }
 
-/// Locate `char.pak` (standing-character sprites) near the media directories.
-fn find_char_pak(bg_dir: &std::path::Path, script_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("WA2_CHARPAK") {
+/// Locate a directory of loose `*.tga` character sprites (legacy layout helper).
+///
+/// The data tree passes its own sprite directory explicitly; this is only used
+/// by the explicit-path CLI form, where it tries the common layouts.
+fn find_sprite_dir(bg_dir: &std::path::Path, script_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("WA2_SPRITES") {
         let pb = std::path::PathBuf::from(p);
-        if pb.exists() {
+        if pb.is_dir() {
             return Some(pb);
         }
     }
@@ -778,11 +952,10 @@ fn find_char_pak(bg_dir: &std::path::Path, script_dir: &std::path::Path) -> Opti
         script_dir.to_path_buf(),
         script_dir.join(".."),
     ] {
-        cands.push(base.join("char.pak"));
-        cands.push(base.join("char.PAK"));
-        cands.push(base.join("IC").join("char.pak"));
+        cands.push(base.join("sprite"));
+        cands.push(base.join("char"));
     }
-    cands.into_iter().find(|p| p.exists())
+    cands.into_iter().find(|p| p.is_dir())
 }
 
 /// Character id -> candidate sprite name prefixes (romaji-first; refined from
@@ -827,29 +1000,47 @@ fn sprite_prefixes(cid: u32) -> &'static [&'static str] {
     }
 }
 
-/// Character sprite bank backed by `char.pak`. On construction it scans the
-/// whole archive for entry names so resolution can be a fast in-memory lookup
-/// instead of a guessed hardcoded table.
+/// Character sprite bank backed by a directory of loose `*.tga` files.
+///
+/// On construction it indexes the directory once, so resolution is an in-memory
+/// lookup. (The previous archive-backed version sliced filenames by byte index,
+/// which panicked on the archives' one non-ASCII entry name; a directory scan
+/// and a prefix rule that walks `char`s cannot panic.)
 struct SpriteBank {
-    pak: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    /// lowercased file names present in the directory
     index: std::collections::HashSet<String>,
+    /// Every prefix in the directory, in deterministic order.
     all_prefixes: Vec<String>,
     cache: std::collections::HashMap<String, codec::tga::TgaImage>,
 }
 
 impl SpriteBank {
-    fn new(pak: std::path::PathBuf) -> SpriteBank {
-        let names = archive::kcap::list_names(&pak);
-        let index: std::collections::HashSet<String> = names.iter().cloned().collect();
-        let mut pset = std::collections::HashSet::new();
-        for n in &names {
-            let stem = n.strip_suffix(".tga").unwrap_or(n);
-            if stem.len() >= 9 {
-                pset.insert(stem[..stem.len() - 6].to_string());
+    fn new(dir: std::path::PathBuf) -> SpriteBank {
+        let mut index = std::collections::HashSet::new();
+        let mut pset = std::collections::BTreeSet::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = match e.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let lower = name.to_ascii_lowercase();
+                let stem = match lower.strip_suffix(".tga") {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                // Prefix = the leading ASCII letters ("tak013101" -> "tak").
+                // Char-based, so non-ASCII names cannot split a codepoint.
+                let p: String = stem.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+                if !p.is_empty() {
+                    pset.insert(p);
+                }
+                index.insert(lower);
             }
         }
         SpriteBank {
-            pak,
+            dir,
             index,
             all_prefixes: pset.into_iter().collect(),
             cache: Default::default(),
@@ -857,12 +1048,13 @@ impl SpriteBank {
     }
 
     fn get(&mut self, name: &str) -> Option<&codec::tga::TgaImage> {
-        if !self.cache.contains_key(name) {
-            let data = archive::kcap::read_entry(&self.pak, name)?;
+        let key = name.to_ascii_lowercase();
+        if !self.cache.contains_key(&key) {
+            let data = std::fs::read(self.dir.join(&key)).ok()?;
             let img = codec::tga::decode(&data).ok()?;
-            self.cache.insert(name.to_string(), img);
+            self.cache.insert(key.clone(), img);
         }
-        self.cache.get(name)
+        self.cache.get(&key)
     }
 
     /// Resolve `(char, series, variant)` to a real sprite file name.
@@ -895,7 +1087,7 @@ impl SpriteBank {
                         continue;
                     }
                     for &vv in &[v as u32, 101u32, 102u32] {
-                        let name = format!("{}{:03}{:03}.tga", pf, s as u32, vv);
+                        let name = format!("{}{:03}{:03}.tga", pf, s as u32, vv).to_ascii_lowercase();
                         if self.index.contains(&name) {
                             return Some(name);
                         }
@@ -1003,116 +1195,236 @@ enum TitleAction {
     Quit,
 }
 
-/// Original-style title screen: the WA2 logo, the main menu (はじめから /
-/// つづきから / オプション / スペシャル / ゲーム終了), and the copyright line.
-/// Arrow keys move, Space/Enter confirms, Esc quits. Items whose subsystems do
-/// not exist yet (save/option/special) answer with a "準備中" notice.
+/// Original title screen, composed from the game's own title graphics.
 ///
-/// `WA2_TITLE_AUTO=<n>` pre-selects item `n` and confirms it (for scripted
-/// verification runs; 0 starts the game, 4 quits).
-fn run_title(win: &mut sdl2::Sdl, font: &render::Font, bg_dir: &std::path::Path) -> TitleAction {
+/// Because the menu is drawn from image atlases instead of engine-side strings,
+/// it is automatically in the game's language - the Chinese patch ships
+/// translated copies of every one of these images and they win over the
+/// Japanese ones in `bg_dirs`.
+///
+///   T0011  752x448   logo (transparent; the backdrop is its edge colour #011D59)
+///   T0100  640x640   menu atlas: 16 rows x 2 columns of 320x40 tiles,
+///                    left column = normal (white), right = selected (gold)
+///   T0101  320x80    highlight bar: two 320x40 frames (dim / bright)
+///   T0020  264x24    copyright line
+///
+/// The bar slides between items and flashes its bright frame while it moves,
+/// which is the selection feedback the original has. Arrow keys move,
+/// Space/Enter confirms, Esc quits; items whose subsystems do not exist yet
+/// answer with a notice.
+///
+/// `WA2_TITLE_AUTO=<n>` pre-selects item `n` and confirms it (verification runs).
+fn run_title(
+    win: &mut sdl2::Sdl,
+    font: &render::Font,
+    bg_dirs: &[&std::path::Path],
+    cn: bool,
+) -> TitleAction {
     const W: u32 = 1280;
     const H: u32 = 720;
-    let items = ["はじめから", "つづきから", "オプション", "スペシャル", "ゲーム終了"];
-    let logo = load_background(bg_dir, "T0011.tga");
-    let copyright = load_background(bg_dir, "T0020.tga");
+    const ITEM_W: i32 = 320;
+    const ITEM_H: i32 = 40;
+    const PITCH: i32 = 40;
+    const N: usize = 5;
+    const X0: i32 = (W as i32 - ITEM_W) / 2;
+    const Y0: i32 = 432;
+    const BACKDROP: [u8; 4] = [1, 29, 89, 255]; // T0011's edge colour
+
+    // Only used when the menu atlas is missing from the data tree.
+    let fallback_items = if cn {
+        ["开始游戏", "继续游戏", "系统设置", "特别模式", "结束游戏"]
+    } else {
+        ["はじめから", "つづきから", "オプション", "スペシャル", "ゲーム終了"]
+    };
+    let notice_text = if cn { "此功能尚未实现" } else { "ただいま準備中です" };
+
+    let logo = load_background(bg_dirs, "T0011.tga");
+    let copyright = load_background(bg_dirs, "T0020.tga");
+    let menu = load_background(bg_dirs, "T0100.tga");
+    let bar = load_background(bg_dirs, "T0101.tga");
+    if menu.is_none() {
+        eprintln!("title: T0100.tga not found, falling back to engine-drawn menu text");
+    }
+
+    let item_y = |i: usize| (Y0 + i as i32 * PITCH) as f32;
     let mut sel = 0usize;
     let mut notice: Option<&str> = None;
+    let mut bar_y = item_y(0);
+    let mut flash_until = std::time::Instant::now();
     let mut auto_pick: Option<usize> = std::env::var_os("WA2_TITLE_AUTO")
         .and_then(|v| v.to_string_lossy().parse::<usize>().ok())
-        .map(|p| p.min(items.len() - 1));
+        .map(|p| p.min(N - 1));
     if let Some(p) = auto_pick {
         sel = p;
+        bar_y = item_y(p);
     }
+
     loop {
-        // Compose: dark-blue backdrop, logo top-center, menu center, copyright
-        // bottom-right.
-        let mut s = render::Surface::new(W, H, [10, 18, 52, 255]);
-        if let Some(ref lg) = logo {
-            s.blit(lg, (W as i32 - lg.width as i32) / 2, 10);
-        }
-        let cell = font.cell() as i32;
-        let x0 = W as i32 / 2 - (cell * 5) / 2; // longest item: 5 glyphs
-        let y0 = 440i32;
-        for (i, item) in items.iter().enumerate() {
-            let y = y0 + i as i32 * (cell + 6);
-            if i == sel {
-                s.fill_rect(x0 - 34, y - 8, (cell * 5 + 68) as u32, (cell + 16) as u32, [230, 240, 255, 46]);
-                font.draw(&mut s, "＞", x0 - cell, y);
+        // ---- input (non-blocking so the bar can animate) --------------------
+        let mut confirm = false;
+        if auto_pick.is_some() {
+            auto_pick = None;
+            win.delay(600);
+            confirm = true;
+        } else {
+            match win.poll_input() {
+                sdl2::Input::Up => {
+                    sel = (sel + N - 1) % N;
+                    flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
+                }
+                sdl2::Input::Down => {
+                    sel = (sel + 1) % N;
+                    flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
+                }
+                sdl2::Input::Advance => confirm = true,
+                sdl2::Input::Choice(k) => {
+                    sel = ((k as usize).saturating_sub(1)).min(N - 1);
+                    flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
+                    confirm = true;
+                }
+                sdl2::Input::Quit => return TitleAction::Quit,
+                // Pointer: hovering highlights the item under the cursor, a
+                // click on an item confirms it. The original is mouse-driven,
+                // so this is the primary way to pick a menu entry.
+                sdl2::Input::Pointer { x, y, pressed } => {
+                    let (sx, sy) = win.surface_pos(x, y, W, H);
+                    if let Some(i) = (0..N).find(|i| {
+                        let iy = Y0 + *i as i32 * PITCH;
+                        sx >= X0 && sx < X0 + ITEM_W && sy >= iy && sy < iy + ITEM_H
+                    }) {
+                        if i != sel {
+                            sel = i;
+                            flash_until =
+                                std::time::Instant::now() + std::time::Duration::from_millis(160);
+                        }
+                        if pressed {
+                            confirm = true;
+                        }
+                    }
+                }
+                _ => {}
             }
-            font.draw(&mut s, item, x0, y);
+        }
+
+        // ---- animate the highlight bar -------------------------------------
+        let target = item_y(sel);
+        if (bar_y - target).abs() > 0.5 {
+            bar_y += (target - bar_y) * 0.30;
+        } else {
+            bar_y = target;
+        }
+        let flashing = std::time::Instant::now() < flash_until;
+
+        // ---- compose --------------------------------------------------------
+        let mut s = render::Surface::new(W, H, BACKDROP);
+        if let Some(ref lg) = logo {
+            s.blit(lg, (W as i32 - lg.width as i32) / 2, 24);
+        }
+        // Highlight bar first: the item tiles are transparent except for the
+        // glyphs, so it shows through behind the selected label.
+        if let Some(ref b) = bar {
+            let frame = if flashing { ITEM_H } else { 0 };
+            s.blit_region(b, 0, frame, ITEM_W as u32, ITEM_H as u32, X0, bar_y as i32);
+        }
+        match menu {
+            Some(ref m) => {
+                for i in 0..N {
+                    let col = if i == sel { ITEM_W } else { 0 };
+                    s.blit_region(
+                        m,
+                        col,
+                        i as i32 * ITEM_H,
+                        ITEM_W as u32,
+                        ITEM_H as u32,
+                        X0,
+                        Y0 + i as i32 * PITCH,
+                    );
+                }
+            }
+            None => {
+                let cell = font.cell() as i32;
+                for (i, item) in fallback_items.iter().enumerate() {
+                    let y = Y0 + i as i32 * PITCH;
+                    font.draw(&mut s, item, X0 + 40, y);
+                }
+            }
         }
         if let Some(n) = notice {
-            // Backdrop strip: the logo art sits behind this area, and plain
-            // white-on-light-blue would be unreadable.
-            let wpx = n.chars().count() as i32 * cell;
-            let nx = W as i32 / 2 - wpx / 2;
-            s.fill_rect(nx - 16, 372, (wpx + 32) as u32, (cell + 12) as u32, [10, 18, 52, 235]);
-            font.draw(&mut s, n, nx, 378);
+            // Engine-side strings are *not* renderable with the game atlas in
+            // Chinese mode: the patch's text is Shift-JIS-coded pseudo-Japanese
+            // (its glyphs live in repainted cells), so real Simplified Chinese
+            // has no glyphs. Use the system CJK font for this one label and fall
+            // back to the bitmap font if it is unavailable.
+            let mut drawn = false;
+            if cn {
+                let strip_h = font.cell() + 24;
+                if let Some((rw, rh, rgba)) =
+                    render::text::block_rgba(&[n.to_string()], 640, strip_h, 26, render::text::DEFAULT_FONT)
+                {
+                    let nx = W as i32 / 2 - rw as i32 / 2;
+                    s.fill_rect(nx - 16, 366, rw + 32, rh + 8, [1, 29, 89, 235]);
+                    s.blit_rgba(&rgba, rw, rh, nx, 370);
+                    drawn = true;
+                }
+            }
+            if !drawn {
+                let cell = font.cell() as i32;
+                let wpx = n.chars().count() as i32 * cell;
+                let nx = W as i32 / 2 - wpx / 2;
+                s.fill_rect(nx - 16, 372, (wpx + 32) as u32, (cell + 12) as u32, [1, 29, 89, 235]);
+                font.draw(&mut s, n, nx, 378);
+            }
         }
         if let Some(ref cp) = copyright {
             s.blit(cp, W as i32 - cp.width as i32 - 24, H as i32 - cp.height as i32 - 14);
         }
         win.present(&s);
 
-        let mut confirm = false;
-        if auto_pick.is_some() {
-            auto_pick = None;
-            win.delay(800);
-            confirm = true;
-        } else {
-            match wait_input(win) {
-                sdl2::Input::Up => sel = (sel + items.len() - 1) % items.len(),
-                sdl2::Input::Down => sel = (sel + 1) % items.len(),
-                sdl2::Input::Advance => confirm = true,
-                sdl2::Input::Choice(k) => {
-                    sel = ((k as usize).saturating_sub(1)).min(items.len() - 1);
-                    confirm = true;
-                }
-                sdl2::Input::Quit => return TitleAction::Quit,
-                _ => {}
+        // ---- act on the confirmation ---------------------------------------
+        if confirm {
+            if notice.is_some() {
+                notice = None;
+                continue;
+            }
+            match sel {
+                0 => return TitleAction::Start,
+                4 => return TitleAction::Quit,
+                _ => notice = Some(notice_text),
             }
         }
-        if !confirm {
-            continue;
-        }
-        if notice.is_some() {
-            notice = None;
-            continue;
-        }
-        match sel {
-            0 => return TitleAction::Start,
-            4 => return TitleAction::Quit,
-            _ => notice = Some("ただいま準備中です"),
-        }
+        win.delay(16);
     }
 }
 
-/// Play a movie (`mvNN` token) found next to the background directory. Returns
-/// after EOF or any key press.
-fn play_movie(win: &mut sdl2::Sdl, media_dir: &std::path::Path, name: &str) -> Option<()> {
-    // Scripts name movies "mv01".."mv24"; archives ship version pairs like
-    // mv010.pak/mv011.pak — try the plain name first, then the 0 and 1 versions.
-    let bases = [
-        media_dir.to_path_buf(),
-        media_dir.join(".."),
-        media_dir.join("IC"),
-        media_dir.join("../mv"),
+/// Play a movie (`mvNN` token) from the movie directory.
+///
+/// The movies are raw ASF/WMV files (the original `mv*.pak` is not an archive:
+/// its first bytes are the ASF GUID), so the data tree stores them as plain
+/// `*.wmv`. Scripts name them "mv01".."mv24" while the files ship as version
+/// pairs (`mv010`, `mv011`), so we try the plain name first, then 0 and 1.
+fn play_movie(win: &mut sdl2::Sdl, movie_dir: &std::path::Path, name: &str) -> Option<()> {
+    let cands = [
+        name.to_ascii_lowercase(),
+        format!("{}0", name.to_ascii_lowercase()),
+        format!("{}1", name.to_ascii_lowercase()),
     ];
-    let cands = [name.to_string(), format!("{}0", name), format!("{}1", name)];
     let mut path = None;
-    'outer: for base in &bases {
-        for cand in &cands {
-            for ext in [".pak", ".PAK"] {
-                let p = base.join(format!("{}{}", cand, ext));
-                if p.exists() {
-                    path = Some(p);
-                    break 'outer;
-                }
+    'outer: for cand in &cands {
+        for ext in [".wmv", ".asf", ".WMV", ".ASF", ".pak", ".PAK"] {
+            let p = movie_dir.join(format!("{}{}", cand, ext));
+            if p.is_file() {
+                path = Some(p);
+                break 'outer;
             }
         }
     }
-    let path = path?;
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("  movie {} not found in {} (skipped)", name, movie_dir.display());
+            return None;
+        }
+    };
     let mut movie = video::Movie::open(path.to_str()?)?;
     eprintln!("  playing movie {} ({}x{} @ {:.2}fps)", name, movie.width, movie.height, movie.fps);
     let mut frame = vec![0u8; (movie.width * movie.height * 4) as usize];
@@ -1139,26 +1451,46 @@ fn wait_input(win: &mut sdl2::Sdl) -> sdl2::Input {
     }
 }
 
-/// Load a font atlas + charset and build a Font.
+/// Load the font for a data tree: atlas + authoritative cell map.
 ///
-/// Two atlas sizes exist: the 14pt sheets are 1920px wide (24px cells) and the
-/// body80 sheets are 3200px wide (40px cells).
-///
-/// The charset file must list glyphs in atlas cell order starting at cell 0
-/// (`start_pos = 0`), which is how the SJIS-ordered charset
-/// (`wa2_sjis_charset.txt`, generated from the exe's font table) is laid out:
-/// cell 1 = '!', cell 33 = 'A', CJK from cell ~524 on. Verified against the
-/// atlas bitmaps (see the glyph checks in the port history).
-fn load_font(atlas_path: &str, charset_path: &str) -> Option<render::Font> {
+/// The cell map (`wa2_cell_map_{jp,cn}.tsv`) is the game exe's own font table
+/// expressed as atlas cells, so glyph lookup is exact for both the Japanese and
+/// the Chinese atlas - no heuristics, no codec ambiguity.
+fn load_font(d: &data::Data) -> Option<render::Font> {
+    load_font_paths(&d.atlas(), Some(&d.cell_map()), None)
+}
+
+/// Load a font atlas with either an authoritative cell map, a legacy charset
+/// table, or both (the cell map wins).
+fn load_font_paths(
+    atlas_path: &std::path::Path,
+    cell_map: Option<&std::path::Path>,
+    charset_path: Option<&std::path::Path>,
+) -> Option<render::Font> {
     let atlas = match std::fs::read(atlas_path).ok().and_then(|d| codec::tga::decode(&d).ok()) {
         Some(i) => i,
-        None => { eprintln!("error: could not decode font atlas {}", atlas_path); return None; }
+        None => { eprintln!("error: could not decode font atlas {}", atlas_path.display()); return None; }
     };
     let cell = if atlas.width >= 3000 { 40 } else { 24 };
     eprintln!("font atlas {}x{} -> cell={}", atlas.width, atlas.height, cell);
+
+    if let Some(map) = cell_map {
+        match render::Font::from_cell_map(atlas, cell, map) {
+            Ok(f) => {
+                eprintln!("font cell map: {} ({} glyphs)", map.display(), f.mapped_glyphs());
+                return Some(f);
+            }
+            Err(e) => {
+                eprintln!("error reading cell map {}: {}", map.display(), e);
+                return None;
+            }
+        }
+    }
+
+    let charset_path = charset_path?;
     let charset = match std::fs::read_to_string(charset_path) {
         Ok(s) => s,
-        Err(e) => { eprintln!("error reading {}: {}", charset_path, e); return None; }
+        Err(e) => { eprintln!("error reading {}: {}", charset_path.display(), e); return None; }
     };
     // Two charset flavours need different handling:
     //  * a 1:1 atlas table (SJIS-ordered charset.txt, ~7.7k chars) whose
@@ -1174,6 +1506,15 @@ fn load_font(atlas_path: &str, charset_path: &str) -> Option<render::Font> {
         eprintln!("font charset: 1:1 table ({} ws kept) start_pos=0", ws);
         Some(render::Font::from_charset_raw(atlas, &charset, cell, 0))
     }
+}
+
+/// Legacy 2-argument form used by the single-scene debugging commands.
+fn load_font_charset(atlas_path: &str, charset_path: &str) -> Option<render::Font> {
+    load_font_paths(
+        std::path::Path::new(atlas_path),
+        None,
+        Some(std::path::Path::new(charset_path)),
+    )
 }
 
 /// Resolve the output directory: explicit arg if present, else `<stem><suffix>`.

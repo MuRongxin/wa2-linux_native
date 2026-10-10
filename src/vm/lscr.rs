@@ -263,6 +263,13 @@ pub struct Interp<'a> {
     rec_kind: u32,
     rec_tok_hit: bool,
     rec_act_hit: bool,
+    /// Every token referenced inside the current record, in order.
+    ///
+    /// ACT176 ("load graphic from <dir>") carries its arguments as
+    /// (slot, name, x, y, ?, alpha, dir, ?) - the image name is the first token
+    /// and is followed by an empty token and the directory token, so the single
+    /// `tok` field (which keeps the *last* token) is not enough.
+    rec_toks: Vec<u32>,
 }
 
 impl<'a> Interp<'a> {
@@ -284,6 +291,7 @@ impl<'a> Interp<'a> {
             rec_kind: 0,
             rec_tok_hit: false,
             rec_act_hit: false,
+            rec_toks: Vec::new(),
         }
     }
 
@@ -336,6 +344,7 @@ impl<'a> Interp<'a> {
                     self.rec_kind = kind;
                     self.rec_tok_hit = false;
                     self.rec_act_hit = false;
+                    self.rec_toks.clear();
                     if let Some(ev) = sprite_ev {
                         return ev;
                     }
@@ -343,6 +352,7 @@ impl<'a> Interp<'a> {
                 Op::Tok { n, .. } => {
                     self.tok = Some(n);
                     self.rec_tok_hit = true;
+                    self.rec_toks.push(n);
                 }
                 Op::Int { v, .. } => self.ints.push(v),
                 Op::Flt { v, .. } => self.flts.push(v),
@@ -516,6 +526,26 @@ impl<'a> Interp<'a> {
                     if let Some(t) = self.p.token(n) {
                         self.options.push(t.to_string());
                     }
+                }
+                None
+            }
+            176 => {
+                // Load a graphic from a source directory (`grp`), e.g.
+                //   Val(slot) Tok("v100200.tga") Val(x) Val(y) Tok("") Val(a)
+                //   Tok("grp") Val(flag) Act176
+                // Only the base layer of a layered CG ships as a real file
+                // (`v100200_bg/_chr/_chreff/_eff.tga` do not exist), so the
+                // first existing token wins and becomes the displayed image.
+                for t in &self.rec_toks {
+                    let name = match self.p.token(*t) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let lower = name.to_ascii_lowercase();
+                    if !lower.ends_with(".tga") || lower.starts_with("sys_") {
+                        continue;
+                    }
+                    return Some(Event::Bg { name: name.to_string() });
                 }
                 None
             }

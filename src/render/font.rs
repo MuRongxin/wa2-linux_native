@@ -21,8 +21,19 @@ pub struct Font {
     atlas: TgaImage,
     cell: u32,
     cols: u32,
-    /// char -> grid cell index
+    /// char -> grid cell index (legacy charset tables / explicit map files)
     map: HashMap<char, u32>,
+    /// Shift-JIS code -> grid cell index, loaded from a `wa2_cell_map_*.tsv`.
+    ///
+    /// This is the authoritative table (it is the game exe's own font table,
+    /// converted to cells); when present it takes priority over every heuristic
+    /// in `resolve_cell`. Keying by *code* rather than by character is
+    /// deliberate: Shift-JIS 0x8160/0x817C decode to different Unicode
+    /// codepoints depending on the codec (U+301C vs U+FF5E, U+2212 vs U+FF0D),
+    /// so a char-keyed table silently loses those glyphs.
+    code_map: HashMap<u32, u32>,
+    /// True when `code_map` came from an authoritative table.
+    authoritative: bool,
 }
 
 impl Font {
@@ -48,7 +59,57 @@ impl Font {
 
     pub fn new(atlas: TgaImage, cell: u32, map: HashMap<char, u32>) -> Font {
         let cols = atlas.width / cell;
-        Font { atlas, cell, cols, map }
+        Font {
+            atlas,
+            cell,
+            cols,
+            map,
+            code_map: HashMap::new(),
+            authoritative: false,
+        }
+    }
+
+    /// Build a font from a `wa2_cell_map_*.tsv` (`<sjis-code> <char> <cell>`),
+    /// which is the game exe's own font table expressed as atlas cells.
+    ///
+    /// With this table loaded, glyph lookup is exact - no hand-tuned formulas,
+    /// no codec ambiguity - and the Chinese atlas (`cn_body80.tga`) works with
+    /// the same code path as the Japanese one.
+    pub fn from_cell_map(atlas: TgaImage, cell: u32, path: &std::path::Path) -> std::io::Result<Font> {
+        let data = std::fs::read_to_string(path)?;
+        let mut code_map = HashMap::new();
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let (code, _ch, cellidx) = match (it.next(), it.next(), it.next()) {
+                (Some(a), Some(b), Some(c)) => (a, b, c),
+                _ => continue,
+            };
+            let code = match code.strip_prefix("0x").or_else(|| code.strip_prefix("0X")) {
+                Some(h) => u32::from_str_radix(h, 16).ok(),
+                None => code.parse::<u32>().ok(),
+            };
+            if let (Some(code), Ok(cellidx)) = (code, cellidx.parse::<u32>()) {
+                code_map.insert(code, cellidx);
+            }
+        }
+        let cols = atlas.width / cell;
+        Ok(Font {
+            atlas,
+            cell,
+            cols,
+            map: HashMap::new(),
+            code_map,
+            authoritative: true,
+        })
+    }
+
+    /// Number of mapped glyphs (diagnostic).
+    pub fn mapped_glyphs(&self) -> usize {
+        if self.authoritative { self.code_map.len() } else { self.map.len() }
     }
 
     /// Build a font from a charset string whose characters occupy cells
@@ -114,6 +175,27 @@ impl Font {
     ///    verified with "春希小春雪菜和泉千晶冬馬曽北原屋敷"
     /// ASCII uses `cell = code - 0x20` (cell 0 = blank, 16 = '0', 33 = 'A').
     pub fn resolve_cell(&self, ch: char) -> Option<u32> {
+        if self.authoritative {
+            // Exact path: ASCII at `code - 0x20` (verified against both atlases),
+            // everything double-byte from the exe font table. Characters the
+            // table does not contain are left blank on purpose - a wrong glyph
+            // reads worse than a gap, and the heuristic formulas below are known
+            // to be off by one in places (e.g. ム renders as ・).
+            if let Some(bytes) = crate::codec::sjis::encode_char(ch) {
+                if bytes.len() == 1 {
+                    let c = bytes[0] as u32;
+                    if (0x20..=0x7E).contains(&c) {
+                        return Some(c - 0x20);
+                    }
+                } else if bytes.len() == 2 {
+                    let code = ((bytes[0] as u32) << 8) | bytes[1] as u32;
+                    if let Some(cell) = self.code_map.get(&code) {
+                        return Some(*cell);
+                    }
+                }
+            }
+            return self.map.get(&ch).copied();
+        }
         if let Some(bytes) = crate::codec::sjis::encode_char(ch) {
             // ASCII: atlas cell 0 is 0x20 (blank), cell 1 = '!', cell 16 = '0',
             // cell 33 = 'A' — matches the contact sheets. (The earlier -1 shift
