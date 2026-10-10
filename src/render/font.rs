@@ -132,7 +132,11 @@ impl Font {
                         if (0x40..=0x7E).contains(&t) {
                             138 + (t - 0x3F)
                         } else if (0x80..=0x9E).contains(&t) {
-                            138 + (t - 0x40)
+                            // The atlas inserts one extra glyph at cell 202 (a
+                            // "·"-like mark), shifting every symbol from ÷
+                            // (0x8180) onward by +1 — verified cell-by-cell:
+                            // ÷=203, ＆=224, ☆=228, ＜=206, ＞=207.
+                            139 + (t - 0x40)
                         } else {
                             -1
                         }

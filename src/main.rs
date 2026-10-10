@@ -224,6 +224,8 @@ fn main() {
                     match win.poll_input() {
                         sdl2::Input::Advance => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Back => { if idx > 0 { idx -= 1; } break; }
+                        sdl2::Input::Up => { if idx > 0 { idx -= 1; } break; }
+                        sdl2::Input::Down => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Quit => return,
                         sdl2::Input::Fullscreen => break,
                         sdl2::Input::None => win.delay(16),
@@ -324,6 +326,8 @@ fn main() {
                     match win.poll_input() {
                         sdl2::Input::Advance => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Back => { if idx > 0 { idx -= 1; } break; }
+                        sdl2::Input::Up => { if idx > 0 { idx -= 1; } break; }
+                        sdl2::Input::Down => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Quit => return,
                         sdl2::Input::Fullscreen => break,
                         sdl2::Input::Choice(_) => { if idx < n - 1 { idx += 1; } break; }
@@ -351,6 +355,30 @@ fn main() {
             eprintln!("wa2-native run: start={} (Space/Click=next, Left=back, 1-9=choice, Esc/q=quit)", start_id);
             if let Err(e) = run_game(&mut win, &font, script_dir, bg_dir, &start_id, bgm_path.as_deref(), voice_dir.as_deref()) {
                 eprintln!("run error: {}", e);
+            }
+        }
+        "title" => {
+            // wa2-native title <script_dir> <font.tga> <charset.txt> <bg_dir> [start_id]
+            if args.len() < 6 {
+                eprintln!("usage: wa2-native title <script_dir> <font.tga> <charset.txt> <bg_dir> [start_id]");
+                return;
+            }
+            let script_dir = std::path::Path::new(&args[2]);
+            let bg_dir = std::path::Path::new(&args[5]);
+            let start_id = args.get(6).cloned().unwrap_or_else(|| "1001".to_string());
+            let font = match load_font(&args[3], &args[4]) { Some(f) => f, None => return };
+            let mut win = match sdl2::Sdl::new("wa2-native", 1280, 720) {
+                Some(w) => w,
+                None => { eprintln!("error: SDL2 unavailable / no display. Try DISPLAY=:0"); return; }
+            };
+            match run_title(&mut win, &font, bg_dir) {
+                TitleAction::Start => {
+                    eprintln!("title: starting scene {}", start_id);
+                    if let Err(e) = run_game(&mut win, &font, script_dir, bg_dir, &start_id, None, None) {
+                        eprintln!("run error: {}", e);
+                    }
+                }
+                TitleAction::Quit => eprintln!("title: quit"),
             }
         }
         "lscr-trace" => {
@@ -967,6 +995,97 @@ fn clean_text(s: &str) -> String {
         }
     }
     out
+}
+
+/// What the title screen resolved to.
+enum TitleAction {
+    Start,
+    Quit,
+}
+
+/// Original-style title screen: the WA2 logo, the main menu (はじめから /
+/// つづきから / オプション / スペシャル / ゲーム終了), and the copyright line.
+/// Arrow keys move, Space/Enter confirms, Esc quits. Items whose subsystems do
+/// not exist yet (save/option/special) answer with a "準備中" notice.
+///
+/// `WA2_TITLE_AUTO=<n>` pre-selects item `n` and confirms it (for scripted
+/// verification runs; 0 starts the game, 4 quits).
+fn run_title(win: &mut sdl2::Sdl, font: &render::Font, bg_dir: &std::path::Path) -> TitleAction {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let items = ["はじめから", "つづきから", "オプション", "スペシャル", "ゲーム終了"];
+    let logo = load_background(bg_dir, "T0011.tga");
+    let copyright = load_background(bg_dir, "T0020.tga");
+    let mut sel = 0usize;
+    let mut notice: Option<&str> = None;
+    let mut auto_pick: Option<usize> = std::env::var_os("WA2_TITLE_AUTO")
+        .and_then(|v| v.to_string_lossy().parse::<usize>().ok())
+        .map(|p| p.min(items.len() - 1));
+    if let Some(p) = auto_pick {
+        sel = p;
+    }
+    loop {
+        // Compose: dark-blue backdrop, logo top-center, menu center, copyright
+        // bottom-right.
+        let mut s = render::Surface::new(W, H, [10, 18, 52, 255]);
+        if let Some(ref lg) = logo {
+            s.blit(lg, (W as i32 - lg.width as i32) / 2, 10);
+        }
+        let cell = font.cell() as i32;
+        let x0 = W as i32 / 2 - (cell * 5) / 2; // longest item: 5 glyphs
+        let y0 = 440i32;
+        for (i, item) in items.iter().enumerate() {
+            let y = y0 + i as i32 * (cell + 6);
+            if i == sel {
+                s.fill_rect(x0 - 34, y - 8, (cell * 5 + 68) as u32, (cell + 16) as u32, [230, 240, 255, 46]);
+                font.draw(&mut s, "＞", x0 - cell, y);
+            }
+            font.draw(&mut s, item, x0, y);
+        }
+        if let Some(n) = notice {
+            // Backdrop strip: the logo art sits behind this area, and plain
+            // white-on-light-blue would be unreadable.
+            let wpx = n.chars().count() as i32 * cell;
+            let nx = W as i32 / 2 - wpx / 2;
+            s.fill_rect(nx - 16, 372, (wpx + 32) as u32, (cell + 12) as u32, [10, 18, 52, 235]);
+            font.draw(&mut s, n, nx, 378);
+        }
+        if let Some(ref cp) = copyright {
+            s.blit(cp, W as i32 - cp.width as i32 - 24, H as i32 - cp.height as i32 - 14);
+        }
+        win.present(&s);
+
+        let mut confirm = false;
+        if auto_pick.is_some() {
+            auto_pick = None;
+            win.delay(800);
+            confirm = true;
+        } else {
+            match wait_input(win) {
+                sdl2::Input::Up => sel = (sel + items.len() - 1) % items.len(),
+                sdl2::Input::Down => sel = (sel + 1) % items.len(),
+                sdl2::Input::Advance => confirm = true,
+                sdl2::Input::Choice(k) => {
+                    sel = ((k as usize).saturating_sub(1)).min(items.len() - 1);
+                    confirm = true;
+                }
+                sdl2::Input::Quit => return TitleAction::Quit,
+                _ => {}
+            }
+        }
+        if !confirm {
+            continue;
+        }
+        if notice.is_some() {
+            notice = None;
+            continue;
+        }
+        match sel {
+            0 => return TitleAction::Start,
+            4 => return TitleAction::Quit,
+            _ => notice = Some("ただいま準備中です"),
+        }
+    }
 }
 
 /// Play a movie (`mvNN` token) found next to the background directory. Returns

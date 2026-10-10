@@ -34,15 +34,15 @@ const SDL_TEXTUREACCESS_STATIC: c_int = 0;
 const SDL_QUIT: u32 = 0x100;
 const SDL_KEYDOWN: u32 = 0x300;
 const SDL_MOUSEBUTTONDOWN: u32 = 0x401;
-const SDLK_ESCAPE: i32 = 9;
-const SDLK_q: i32 = 0x71;
+const SDLK_ESCAPE: i32 = 41;
+const SDLK_q: i32 = 20;
 const SDLK_SPACE: i32 = 44;
 const SDLK_RETURN: i32 = 40;
 const SDLK_RIGHT: i32 = 79;
 const SDLK_DOWN: i32 = 81;
 const SDLK_LEFT: i32 = 80;
 const SDLK_UP: i32 = 82;
-const SDLK_F11: i32 = 89;
+const SDLK_F11: i32 = 95;
 const SDLK_1: i32 = 30;
 const SDLK_2: i32 = 31;
 const SDLK_3: i32 = 32;
@@ -81,6 +81,9 @@ pub enum Input {
     None,
     Advance,
     Back,
+    /// Menu navigation (arrow up / down).
+    Up,
+    Down,
     Fullscreen,
     Quit,
     /// Number key 1-9 pressed (for choice selection).
@@ -252,14 +255,18 @@ impl Sdl {
                 if etype == SDL_QUIT {
                     out = Input::Quit;
                 } else if etype == SDL_KEYDOWN {
-                    // SDL_Keysym starts at offset 12 in SDL_KeyboardEvent;
-                    // scancode is the first int there.
-                    let sc = i32::from_ne_bytes([ev[12], ev[13], ev[14], ev[15]]);
+                    // SDL_KeyboardEvent layout: type(4) + timestamp(4) +
+                    // windowID(4) + state/repeat/padding(4), then SDL_Keysym at
+                    // offset 16 whose first field is the scancode; the key
+                    // constants above are SDL scancode values.
+                    let sc = i32::from_ne_bytes([ev[16], ev[17], ev[18], ev[19]]);
                     match sc {
                         SDLK_ESCAPE | SDLK_q => out = Input::Quit,
                         SDLK_F11 => out = Input::Fullscreen,
-                        SDLK_LEFT | SDLK_UP => out = Input::Back,
-                        SDLK_SPACE | SDLK_RETURN | SDLK_RIGHT | SDLK_DOWN => out = Input::Advance,
+                        SDLK_LEFT => out = Input::Back,
+                        SDLK_UP => out = Input::Up,
+                        SDLK_SPACE | SDLK_RETURN | SDLK_RIGHT => out = Input::Advance,
+                        SDLK_DOWN => out = Input::Down,
                         SDLK_1 => out = Input::Choice(1),
                         SDLK_2 => out = Input::Choice(2),
                         SDLK_3 => out = Input::Choice(3),

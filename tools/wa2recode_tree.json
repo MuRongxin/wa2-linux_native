@@ -1,0 +1,351 @@
+{
+  "sha": "8de8e10c439cb1097095148a7782ec7a03b3bb6f",
+  "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/8de8e10c439cb1097095148a7782ec7a03b3bb6f",
+  "tree": [
+    {
+      "path": ".github",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "ab55f63b7f46924093785ba6c13e714c749b7a41",
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/ab55f63b7f46924093785ba6c13e714c749b7a41"
+    },
+    {
+      "path": ".github/workflows",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "e4ef52ff2a324341f367f2a11445bb3fe6aa764f",
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/e4ef52ff2a324341f367f2a11445bb3fe6aa764f"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "2ad9945871d374251b6bb1b755b8a0a6a3d488fd",
+      "size": 2304,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/2ad9945871d374251b6bb1b755b8a0a6a3d488fd"
+    },
+    {
+      "path": "Dockerfile",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "b54b7e8d6cd12f3cd3badc3a9f2e3dd55fd8f5c2",
+      "size": 541,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/b54b7e8d6cd12f3cd3badc3a9f2e3dd55fd8f5c2"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "9a3e733a523e0881959744ec7bcd0ee94c4d4113",
+      "size": 2566,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/9a3e733a523e0881959744ec7bcd0ee94c4d4113"
+    },
+    {
+      "path": "compose.yaml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "a6c164ddd6bef4c7f720428f11752cdf8c2bb29c",
+      "size": 84,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/a6c164ddd6bef4c7f720428f11752cdf8c2bb29c"
+    },
+    {
+      "path": "data.zip.gpg",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3754c3240f269b374e4c27bfc7d533319192e524",
+      "size": 21299695,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/3754c3240f269b374e4c27bfc7d533319192e524"
+    },
+    {
+      "path": "translate.sh",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "b041b87f31ea84a41a92ced085d08a7c89b641d3",
+      "size": 1629,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/b041b87f31ea84a41a92ced085d08a7c89b641d3"
+    },
+    {
+      "path": "wa2refont",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "59f2348efdae0373e11be58106d4723f1bb5399b",
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/59f2348efdae0373e11be58106d4723f1bb5399b"
+    },
+    {
+      "path": "wa2refont/requirements.txt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "acdce055d5f337164c3bff19d05cc9a877746941",
+      "size": 34,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/acdce055d5f337164c3bff19d05cc9a877746941"
+    },
+    {
+      "path": "wa2refont/res",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "77514f9d201efa3def524a6e102b310b508d0cc0",
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/77514f9d201efa3def524a6e102b310b508d0cc0"
+    },
+    {
+      "path": "wa2refont/res/GenSenRounded-R.ttc",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3354b96fee7b345024b5b6a1930003280820d1d1",
+      "size": 15408480,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/3354b96fee7b345024b5b6a1930003280820d1d1"
+    },
+    {
+      "path": "wa2refont/res/wa2-special-contents.chs.txt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "2534a843e9fd180574974eddd2887686ada51a94",
+      "size": 11007,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/2534a843e9fd180574974eddd2887686ada51a94"
+    },
+    {
+      "path": "wa2refont/res/wa2-special-contents.cht.txt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3c3164cda7eafefac86cfcae99d5e6b2022aaa7b",
+      "size": 11368,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/3c3164cda7eafefac86cfcae99d5e6b2022aaa7b"
+    },
+    {
+      "path": "wa2refont/res/wa2.chs.txt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "f21370d1c17acd273ab3ba58b476f92a6c35a774",
+      "size": 11212,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/f21370d1c17acd273ab3ba58b476f92a6c35a774"
+    },
+    {
+      "path": "wa2refont/res/wa2.cht.txt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "8ed00545624c4aee3891f98d82c18f11f90f569a",
+      "size": 11574,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/8ed00545624c4aee3891f98d82c18f11f90f569a"
+    },
+    {
+      "path": "wa2refont/src",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "9dd7673e66ba617486a747d42c49654382dbc82a",
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/9dd7673e66ba617486a747d42c49654382dbc82a"
+    },
+    {
+      "path": "wa2refont/src/code_map.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3cc85c261cb519ef0cb2262c29639e0b75e6249e",
+      "size": 2051,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/3cc85c261cb519ef0cb2262c29639e0b75e6249e"
+    },
+    {
+      "path": "wa2refont/src/decode_translate.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "d9c86e9721ebded55cddacd0381ddcede0fd47e9",
+      "size": 3181,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/d9c86e9721ebded55cddacd0381ddcede0fd47e9"
+    },
+    {
+      "path": "wa2refont/src/decoder.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "c2f3ce1f65fee2f5aab34632361c211587a839ae",
+      "size": 2503,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/c2f3ce1f65fee2f5aab34632361c211587a839ae"
+    },
+    {
+      "path": "wa2refont/src/decoder_translator.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "813a35e4e099388f9b348801888e66ca43a0f2f0",
+      "size": 2513,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/813a35e4e099388f9b348801888e66ca43a0f2f0"
+    },
+    {
+      "path": "wa2refont/src/encoder.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "d28a13904dcc5bf42009d85f9359e54bffc2e80c",
+      "size": 1684,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/d28a13904dcc5bf42009d85f9359e54bffc2e80c"
+    },
+    {
+      "path": "wa2refont/src/refont.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3df60b726354eda490e812dce395dc4cee47faa4",
+      "size": 1837,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/3df60b726354eda490e812dce395dc4cee47faa4"
+    },
+    {
+      "path": "wa2refont/src/translation_character_map.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "a221412e8c78e6012f3a8cb10260b760c712a4e9",
+      "size": 22088,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/a221412e8c78e6012f3a8cb10260b760c712a4e9"
+    },
+    {
+      "path": "wa2refont/src/translation_map.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "44f5afd915d8fedcc7c2116c7186144fd163763f",
+      "size": 14298,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/44f5afd915d8fedcc7c2116c7186144fd163763f"
+    },
+    {
+      "path": "wa2refont/src/utils.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "16c7d21ee06b40bc575566a7077f8f70f46171ba",
+      "size": 547,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/16c7d21ee06b40bc575566a7077f8f70f46171ba"
+    },
+    {
+      "path": "wa2refont/test",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "fcb8d6da794991f214ea11245fa6dd543703765a",
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/fcb8d6da794991f214ea11245fa6dd543703765a"
+    },
+    {
+      "path": "wa2refont/test/test_decode.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "666d3195bf7efebb1fa5cf3a3a8c7c4000c81230",
+      "size": 669,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/666d3195bf7efebb1fa5cf3a3a8c7c4000c81230"
+    },
+    {
+      "path": "wa2refont/test/test_decode_translate.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "9294570d8566ff2fe635e257d39a3d222c5d828c",
+      "size": 288,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/9294570d8566ff2fe635e257d39a3d222c5d828c"
+    },
+    {
+      "path": "wa2refont/test/test_decoder.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "2b0183ea086e0ce1abee9bb11a643ebe3b9c4125",
+      "size": 656,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/2b0183ea086e0ce1abee9bb11a643ebe3b9c4125"
+    },
+    {
+      "path": "wa2refont/test/test_decoder_translator.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3e42d0018778fe4936aa3c0ffd8c11d2fe5869d5",
+      "size": 1050,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/3e42d0018778fe4936aa3c0ffd8c11d2fe5869d5"
+    },
+    {
+      "path": "wa2repack",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "460555879dd05e706aa6cccba871a80ab84495f1",
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/460555879dd05e706aa6cccba871a80ab84495f1"
+    },
+    {
+      "path": "wa2repack/CMakeLists.txt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "931ffbc589c2f8bc5dc0b9bc5ae695a9806d9ff4",
+      "size": 236,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/931ffbc589c2f8bc5dc0b9bc5ae695a9806d9ff4"
+    },
+    {
+      "path": "wa2repack/src",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "e0604223c4bf372294711df9bca738bd4c4a3600",
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/trees/e0604223c4bf372294711df9bca738bd4c4a3600"
+    },
+    {
+      "path": "wa2repack/src/kcap_types.h",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "b64e364ada30eb5760ef5f3c2c2dfa113f5cb622",
+      "size": 480,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/b64e364ada30eb5760ef5f3c2c2dfa113f5cb622"
+    },
+    {
+      "path": "wa2repack/src/lzss.cpp",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "cbe2c3199d217361c77e811cf2fd9d5e7c419cde",
+      "size": 17484,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/cbe2c3199d217361c77e811cf2fd9d5e7c419cde"
+    },
+    {
+      "path": "wa2repack/src/lzss.h",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "68b26cbf67782a13de4b9230d8a2c73de856a434",
+      "size": 145,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/68b26cbf67782a13de4b9230d8a2c73de856a434"
+    },
+    {
+      "path": "wa2repack/src/main.cpp",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "4cc499cbc0a545d2d20bfba79d32b574b01a8b78",
+      "size": 912,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/4cc499cbc0a545d2d20bfba79d32b574b01a8b78"
+    },
+    {
+      "path": "wa2repack/src/pack.cpp",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "5c783c79b862ecc3c2802b88a70c8d3f343888b4",
+      "size": 4242,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/5c783c79b862ecc3c2802b88a70c8d3f343888b4"
+    },
+    {
+      "path": "wa2repack/src/pack.h",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "b38d945dfcf7ee3e454e2f23ab607ae770f4e4ce",
+      "size": 133,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/b38d945dfcf7ee3e454e2f23ab607ae770f4e4ce"
+    },
+    {
+      "path": "wa2repack/src/unpack.cpp",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "7f3735b596f63b3f69a99ab3353bcd62552e5d5f",
+      "size": 2688,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/7f3735b596f63b3f69a99ab3353bcd62552e5d5f"
+    },
+    {
+      "path": "wa2repack/src/unpack.h",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "d33c69fc3adc8d679476c62b81f7a8e7b35cd541",
+      "size": 127,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/d33c69fc3adc8d679476c62b81f7a8e7b35cd541"
+    },
+    {
+      "path": "wa2repack/src/utils.cpp",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "9dc5599282eaec992c6c79690581d8288bfc667b",
+      "size": 1506,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/9dc5599282eaec992c6c79690581d8288bfc667b"
+    },
+    {
+      "path": "wa2repack/src/utils.h",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "318aa773cc15621e51adfe0eb0801c2d27a1b248",
+      "size": 544,
+      "url": "https://api.github.com/repos/hoshino-yui/wa2recode/git/blobs/318aa773cc15621e51adfe0eb0801c2d27a1b248"
+    }
+  ],
+  "truncated": false
+}

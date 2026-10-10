@@ -10,3 +10,9 @@ tools/verify/
 
 # Extracted char.pak sprites (regenerate via kcap char.pak).
 char_extracted/
+
+# Standalone unpack dumps (regenerate with `wa2-native extract <pak>`).
+*_extracted/
+
+# Character/font sample rasters (copyrighted artwork, like /assets).
+tools/samples/

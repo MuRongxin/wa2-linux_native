@@ -1,0 +1,31 @@
+render: readable dialog via system CJK font; fix audio/video; sprite scaffolding
+
+Dialog text was unreadable because the shipped Japanese atlas cell order is
+unrecoverable (tried: code_maps formula, Shift-JIS order, Noto template
+matching, wa2_cset alignment - all wrong), and the Chinese atlas has no kana.
+
+Text:
+- render/text.rs: rasterize dialog lines with Noto Sans CJK via an ffmpeg
+  drawtext chain (one drawtext per line - ffmpeg renders in-text newlines as
+  stray placeholder glyphs). render::render_scene_sysfont composites it.
+- CLI: scene-noto / play-noto (play-noto takes optional bgm.ogg).
+- Font config fixed: cell is 24 for 14pt (1920px) and 40 for body80 (3200px);
+  wa2 charsets map at start_pos=748. Unmapped chars now leave a gap instead of
+  a magenta placeholder box.
+
+Audio:
+- The audio subsystem was never initialised (only SDL_INIT_VIDEO), so every
+  queue went to an invalid device. Now init SDL_INIT_VIDEO|SDL_INIT_AUDIO,
+  set SDL_AUDIODRIVER=pulse before init (PipeWire system), and use the correct
+  SDL_OpenAudioDevice signature (device, is32bit, freq, allowed, devid*).
+
+Video:
+- mv*.pak are raw ASF/WMV; ffmpeg rawvideo rgba -> SDL texture.
+
+Sprite scaffolding (work in progress):
+- vm/lscr.rs: Event::Sprite{char_id,series,variant} + Event::SpriteFocus.
+- archive/kcap.rs: read_entry(pak,name) to pull one entry out of char.pak.
+- sdl2 Input::Choice(u8) for number-key choice selection.
+
+Also: run.sh launcher; .gitignore excludes assets/ (884MB extracted game data)
+and *.npy artifacts - regenerate those locally via kcap/lac/extract.
