@@ -1059,12 +1059,16 @@ impl SpriteBank {
 
     /// Resolve `(char, series, variant)` to a real sprite file name.
     ///
-    /// The shipped scripts' `(series, variant)` encoding does not always match
-    /// the on-disk filename 1:1 (off-by-one in the series field, and a few
-    /// missing poses), and the `char_id -> prefix` guess table is imperfect.
-    /// So we search: preferred prefixes first, then every prefix present in the
-    /// archive, over a small window of series/variant values. The first name
-    /// that actually exists in the archive wins.
+    /// The shipped scripts' `(series, variant)` values match the file names
+    /// directly for the vast majority of cues, so the search walks *outward*
+    /// from the exact value (0, -1, +1, -2, +2). The previous order started at
+    /// -2, which made almost every pose collapse onto `<prefix>001101.tga` (the
+    /// variant-2 file, or the 101 fallback) - standing sprites then never
+    /// changed expression, and characters sharing a prefix (10/15 -> tak,
+    /// 12/17 -> oto) became indistinguishable duplicates on screen.
+    ///
+    /// The neutral-pose fallback (`...101`) is only tried after the whole
+    /// neighbourhood search has failed.
     fn resolve(&mut self, cid: u32, series: u32, variant: u32) -> Option<String> {
         let mut prefixes: Vec<String> =
             sprite_prefixes(cid).iter().map(|s| s.to_string()).collect();
@@ -1073,30 +1077,44 @@ impl SpriteBank {
                 prefixes.push(p.clone());
             }
         }
+        const DELTAS: [i32; 5] = [0, -1, 1, -2, 2];
         let s_base = series as i32;
         let v_base = variant as i32;
         for pf in &prefixes {
-            for ds in -2..=2i32 {
+            for ds in DELTAS {
                 let s = s_base + ds;
                 if s < 0 {
                     continue;
                 }
-                for dv in -2..=2i32 {
+                for dv in DELTAS {
                     let v = v_base + dv;
                     if v < 0 {
                         continue;
                     }
-                    for &vv in &[v as u32, 101u32, 102u32] {
-                        let name = format!("{}{:03}{:03}.tga", pf, s as u32, vv).to_ascii_lowercase();
-                        if self.index.contains(&name) {
-                            return Some(name);
-                        }
+                    let name = format!("{}{:03}{:03}.tga", pf, s as u32, v as u32).to_ascii_lowercase();
+                    if self.index.contains(&name) {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+        // Last resort: the character's neutral pose.
+        for pf in &prefixes {
+            for s in [s_base, 1i32] {
+                if s < 0 {
+                    continue;
+                }
+                for v in [101u32, 102, 100] {
+                    let name = format!("{}{:03}{:03}.tga", pf, s as u32, v).to_ascii_lowercase();
+                    if self.index.contains(&name) {
+                        return Some(name);
                     }
                 }
             }
         }
         None
     }
+
 }
 
 /// A character currently on screen.
