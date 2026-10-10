@@ -578,7 +578,7 @@ fn run_game(
     let mut cur_surf = render::render_scene(&bg, "", font, W, H);
     let mut bank = find_char_pak(bg_dir, script_dir).map(|pak| {
         eprintln!("char.pak: {}", pak.display());
-        SpriteBank { pak, cache: Default::default() }
+        SpriteBank::new(pak)
     });
     if bank.is_none() {
         eprintln!("note: char.pak not found - character sprites disabled");
@@ -799,13 +799,35 @@ fn sprite_prefixes(cid: u32) -> &'static [&'static str] {
     }
 }
 
-/// Lazily-loaded character sprite cache backed by `char.pak`.
+/// Character sprite bank backed by `char.pak`. On construction it scans the
+/// whole archive for entry names so resolution can be a fast in-memory lookup
+/// instead of a guessed hardcoded table.
 struct SpriteBank {
     pak: std::path::PathBuf,
+    index: std::collections::HashSet<String>,
+    all_prefixes: Vec<String>,
     cache: std::collections::HashMap<String, codec::tga::TgaImage>,
 }
 
 impl SpriteBank {
+    fn new(pak: std::path::PathBuf) -> SpriteBank {
+        let names = archive::kcap::list_names(&pak);
+        let index: std::collections::HashSet<String> = names.iter().cloned().collect();
+        let mut pset = std::collections::HashSet::new();
+        for n in &names {
+            let stem = n.strip_suffix(".tga").unwrap_or(n);
+            if stem.len() >= 9 {
+                pset.insert(stem[..stem.len() - 6].to_string());
+            }
+        }
+        SpriteBank {
+            pak,
+            index,
+            all_prefixes: pset.into_iter().collect(),
+            cache: Default::default(),
+        }
+    }
+
     fn get(&mut self, name: &str) -> Option<&codec::tga::TgaImage> {
         if !self.cache.contains_key(name) {
             let data = archive::kcap::read_entry(&self.pak, name)?;
@@ -815,15 +837,41 @@ impl SpriteBank {
         self.cache.get(name)
     }
 
-    /// Resolve `(char, series, variant)` to a sprite file name, trying a few
-    /// variant fallbacks when the exact file is missing from the archive.
+    /// Resolve `(char, series, variant)` to a real sprite file name.
+    ///
+    /// The shipped scripts' `(series, variant)` encoding does not always match
+    /// the on-disk filename 1:1 (off-by-one in the series field, and a few
+    /// missing poses), and the `char_id -> prefix` guess table is imperfect.
+    /// So we search: preferred prefixes first, then every prefix present in the
+    /// archive, over a small window of series/variant values. The first name
+    /// that actually exists in the archive wins.
     fn resolve(&mut self, cid: u32, series: u32, variant: u32) -> Option<String> {
-        let variants = [variant, variant.saturating_sub(1), variant + 1, 101, 102];
-        for pf in sprite_prefixes(cid) {
-            for v in variants {
-                let name = format!("{}{:03}{:03}.tga", pf, series, v);
-                if self.get(&name).is_some() {
-                    return Some(name);
+        let mut prefixes: Vec<String> =
+            sprite_prefixes(cid).iter().map(|s| s.to_string()).collect();
+        for p in &self.all_prefixes {
+            if !prefixes.iter().any(|x| x.eq_ignore_ascii_case(p)) {
+                prefixes.push(p.clone());
+            }
+        }
+        let s_base = series as i32;
+        let v_base = variant as i32;
+        for pf in &prefixes {
+            for ds in -2..=2i32 {
+                let s = s_base + ds;
+                if s < 0 {
+                    continue;
+                }
+                for dv in -2..=2i32 {
+                    let v = v_base + dv;
+                    if v < 0 {
+                        continue;
+                    }
+                    for &vv in &[v as u32, 101u32, 102u32] {
+                        let name = format!("{}{:03}{:03}.tga", pf, s as u32, vv);
+                        if self.index.contains(&name) {
+                            return Some(name);
+                        }
+                    }
                 }
             }
         }
@@ -993,7 +1041,20 @@ fn load_font(atlas_path: &str, charset_path: &str) -> Option<render::Font> {
         Ok(s) => s,
         Err(e) => { eprintln!("error reading {}: {}", charset_path, e); return None; }
     };
-    Some(render::Font::from_charset(atlas, &charset, cell, 0))
+    // Two charset flavours need different handling:
+    //  * a 1:1 atlas table (SJIS-ordered charset.txt, ~7.7k chars) whose
+    //    leading entries are REAL blank/space glyphs. Stripping whitespace
+    //    there shifts every glyph by one cell (cell 0 = space, cell 1 = !).
+    //  * a formatted charset (wa2.cht.txt / wa2_cset.txt) containing wrapping
+    //    newlines/spaces, which must be stripped; those start at cell 748.
+    let ws = charset.chars().filter(|c| c.is_whitespace()).count();
+    if ws > 10 {
+        eprintln!("font charset: formatted ({} ws stripped) start_pos=748", ws);
+        Some(render::Font::from_charset(atlas, &charset, cell, 748))
+    } else {
+        eprintln!("font charset: 1:1 table ({} ws kept) start_pos=0", ws);
+        Some(render::Font::from_charset_raw(atlas, &charset, cell, 0))
+    }
 }
 
 /// Resolve the output directory: explicit arg if present, else `<stem><suffix>`.

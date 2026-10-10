@@ -7,3 +7,6 @@
 # Intermediate numpy/rasterizer artifacts from tools/ experiments.
 *.npy
 tools/verify/
+
+# Extracted char.pak sprites (regenerate via kcap char.pak).
+char_extracted/

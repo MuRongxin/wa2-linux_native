@@ -66,6 +66,20 @@ impl Font {
         Font::new(atlas, cell, map)
     }
 
+    /// Build a font from a charset string, KEEPING whitespace.
+    ///
+    /// Use for charsets that map 1:1 onto the atlas and whose first entries are
+    /// legitimately blank/space glyphs (e.g. the SJIS-ordered table where cell 0
+    /// is a space and cell 1 is '!'). Stripping whitespace there would shift
+    /// every glyph by one cell.
+    pub fn from_charset_raw(atlas: TgaImage, charset: &str, cell: u32, start_pos: u32) -> Font {
+        let mut map = HashMap::new();
+        for (i, ch) in charset.chars().enumerate() {
+            map.insert(ch, start_pos + i as u32);
+        }
+        Font::new(atlas, cell, map)
+    }
+
     /// Load an explicit char->cell map. Each line of `path` is
     /// `<char>\t<cell>` (cell decimal). Unknown characters fall back.
     pub fn from_map_file(atlas: TgaImage, cell: u32, path: &str) -> std::io::Result<Font> {

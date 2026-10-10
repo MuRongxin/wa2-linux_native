@@ -83,6 +83,35 @@ pub fn read_entry(pak: &Path, name: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// List every entry name in the archive (ASCII, lowercased), without
+/// decompressing any payload. Used by the sprite bank to build a fast lookup
+/// index so it can resolve `(char, series, variant)` against real filenames.
+pub fn list_names(pak: &Path) -> Vec<String> {
+    let mut f = match File::open(pak) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut hdr = [0u8; 16];
+    if f.read_exact(&mut hdr).is_err() || &hdr[0..4] != b"KCAP" {
+        return Vec::new();
+    }
+    let entry_count = le_u32(&hdr[12..16]) as usize;
+    let mut names = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let mut e = [0u8; 44];
+        if f.read_exact(&mut e).is_err() {
+            break;
+        }
+        let name_end = e[4..28].iter().position(|&b| b == 0).unwrap_or(24);
+        let raw_name = &e[4..4 + name_end];
+        let nm = String::from_utf8_lossy(raw_name).to_ascii_lowercase();
+        if !nm.is_empty() {
+            names.push(nm);
+        }
+    }
+    names
+}
+
 pub fn unpack(pak: &Path, out_dir: &Path) -> io::Result<()> {
     let mut f = File::open(pak)?;
     let mut hdr = [0u8; 16];
