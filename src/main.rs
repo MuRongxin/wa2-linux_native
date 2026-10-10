@@ -70,11 +70,8 @@ fn main() {
         }
         "font-test" => {
             if args.len() < 5 { eprintln!("usage: wa2-native font-test <font.tga> <charset.txt> <out.tga> [text]"); return; }
-            let atlas = match codec::tga::decode(&match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); return; } }) {
-                Ok(i) => i, Err(e) => { eprintln!("tga decode error: {}", e); return; }
-            };
+            let font = match load_font(&args[2], &args[3]) { Some(f) => f, None => return };
             let charset = match std::fs::read_to_string(&args[3]) { Ok(s) => s, Err(e) => { eprintln!("error: {}", e); return; } };
-            let font = render::Font::from_charset(atlas, &charset, 24, 748);
             let sample: String = if args.len() >= 6 {
                 args[5..].join(" ")
             } else {
@@ -188,6 +185,52 @@ fn main() {
             }
             if let Err(e) = s.save_tga(&args[3]) { eprintln!("{}", e); return; }
             println!("saved frame0 {}x{} -> {}", movie.width, movie.height, args[3]);
+        }
+        "scene-noto" => {
+            // scene-noto <scenario.txt> <bg.tga> <out.tga>
+            if args.len() < 5 {
+                eprintln!("usage: wa2-native scene-noto <scenario.txt> <bg.tga> <out.tga>");
+                return;
+            }
+            let scen = match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); return; } };
+            let page = vm::parse_scenario_text(&scen);
+            let bg = match std::fs::read(&args[3]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
+                Some(i) => i, None => { eprintln!("bg fail"); return; }
+            };
+            let surf = render::render_scene_sysfont(&bg, &page.text(), 1280, 720, render::text::DEFAULT_FONT);
+            if let Err(e) = surf.save_tga(&args[4]) { eprintln!("{}", e); return; }
+            println!("scene-noto: {} chars -> {}", page.text().chars().count(), args[4]);
+        }
+        "play-noto" => {
+            // play-noto <scenario.txt> <bg.tga> [bgm.ogg]
+            if args.len() < 4 {
+                eprintln!("usage: wa2-native play-noto <scenario.txt> <bg.tga> [bgm.ogg]");
+                return;
+            }
+            let scen = match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); return; } };
+            let page = vm::parse_scenario_text(&scen);
+            let bg = match std::fs::read(&args[3]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
+                Some(i) => i, None => { eprintln!("bg fail"); return; }
+            };
+            let mut win = match sdl2::Sdl::new("wa2-native", 1280, 720) { Some(w) => w, None => { eprintln!("no SDL/display"); return; } };
+            let _mixer = if args.len() >= 5 { audio::Mixer::new(&win).map(|m| { m.play(&args[4], 0.8, true); m }) } else { None };
+            eprintln!("play-noto: {} lines (system font). Space/Right/Click=next, Left=back, Esc/q=quit", page.lines.len());
+            let mut idx: i32 = 0;
+            let n = page.lines.len() as i32;
+            loop {
+                let surf = render::render_scene_sysfont(&bg, &page.lines[idx.max(0) as usize], 1280, 720, render::text::DEFAULT_FONT);
+                win.present(&surf);
+                loop {
+                    match win.poll_input() {
+                        sdl2::Input::Advance => { if idx < n - 1 { idx += 1; } break; }
+                        sdl2::Input::Back => { if idx > 0 { idx -= 1; } break; }
+                        sdl2::Input::Quit => return,
+                        sdl2::Input::Fullscreen => break,
+                        sdl2::Input::None => win.delay(16),
+                        sdl2::Input::Choice(_) => win.delay(16),
+                    }
+                }
+            }
         }
         "tga-dump" => {
             if args.len() < 4 {
@@ -360,6 +403,9 @@ fn main() {
                         }
                         vm::lscr::Event::Bg { name } => println!("  [bg  ] {}", if name.is_empty() { "<black>" } else { &name }),
                         vm::lscr::Event::Movie { name } => println!("  [mv  ] {}", name),
+                        vm::lscr::Event::Sprite { char_id, series, variant } =>
+                            println!("  [spr ] char={} series={} variant={}", char_id, series, variant),
+                        vm::lscr::Event::SpriteFocus { char_id } => println!("  [fo-c] {}", char_id),
                         vm::lscr::Event::Choice { options } => {
                             let pick = seq.get(seq_i).copied().unwrap_or(1);
                             seq_i += 1;
@@ -486,25 +532,6 @@ fn find_voice(voice_dir: &std::path::Path, scenario: &str, line: u32) -> Option<
     None
 }
 
-/// Find a default background in `bg_dir` (the first 1280x720-ish TGA).
-fn find_default_background(bg_dir: &std::path::Path) -> Option<codec::tga::TgaImage> {
-    let entries = std::fs::read_dir(bg_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("tga") {
-            continue;
-        }
-        if let Ok(data) = std::fs::read(&path) {
-            if let Ok(img) = codec::tga::decode(&data) {
-                if img.width >= 1280 && img.height >= 720 {
-                    return Some(img);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Build a solid-color fallback background image.
 fn solid_bg(w: u32, h: u32, color: [u8; 3]) -> codec::tga::TgaImage {
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -528,9 +555,9 @@ fn run_game(
     const W: u32 = 1280;
     const H: u32 = 720;
     let mut current_id = start_id.to_string();
-    // Start with a real background from bg_dir if available, else solid color.
-    let mut bg = find_default_background(bg_dir)
-        .unwrap_or_else(|| solid_bg(W, H, [20, 20, 36]));
+    // Black until the script sets one: WA2 opens on a black screen (the IC
+    // prologue's "sepia.AMP" is a color-filter LUT, not a background image).
+    let mut bg = solid_bg(W, H, [0, 0, 0]);
 
     // Start BGM if requested (and keep mixer for voice playback).
     let mut mixer = if bgm_path.is_some() || voice_dir.is_some() {
@@ -549,6 +576,15 @@ fn run_game(
     };
 
     let mut cur_surf = render::render_scene(&bg, "", font, W, H);
+    let mut bank = find_char_pak(bg_dir, script_dir).map(|pak| {
+        eprintln!("char.pak: {}", pak.display());
+        SpriteBank { pak, cache: Default::default() }
+    });
+    if bank.is_none() {
+        eprintln!("note: char.pak not found - character sprites disabled");
+    }
+    let mut sprites: Vec<ActiveSprite> = Vec::new();
+    let mut focus: Option<u32> = None;
     loop {
         let prog = match load_program(script_dir, &current_id) {
             Some(p) => p,
@@ -579,8 +615,32 @@ fn run_game(
                             mx.play(&vf, 1.0, false);
                         }
                     }
-                    cur_surf = render::render_scene(&bg, &display, font, W, H);
+                    cur_surf = draw_scene(&bg, &display, font, &sprites, focus, W, H);
                     win.present(&cur_surf);
+                }
+                vm::lscr::Event::Sprite { char_id, series, variant } => {
+                    if let Some(bank) = bank.as_mut() {
+                        if let Some(name) = bank.resolve(char_id, series, variant) {
+                            if let Some(img) = bank.get(&name) {
+                                let img = img.clone();
+                                eprintln!("  sprite: {} (char {})", name, char_id);
+                                if let Some(sp) = sprites.iter_mut().find(|s| s.char_id == char_id) {
+                                    sp.img = img;
+                                    sp.name = name;
+                                } else {
+                                    if sprites.len() >= 3 {
+                                        sprites.remove(0);
+                                    }
+                                    sprites.push(ActiveSprite { char_id, name, img });
+                                }
+                            }
+                        } else {
+                            eprintln!("  sprite: char {} series {:03} variant {:03} not found", char_id, series, variant);
+                        }
+                    }
+                }
+                vm::lscr::Event::SpriteFocus { char_id } => {
+                    focus = Some(char_id);
                 }
                 vm::lscr::Event::Bg { name } => {
                     // `.AMP` tokens are palette/effect tints we do not apply; the
@@ -592,7 +652,7 @@ fn run_game(
                             bg = img;
                         }
                     }
-                    cur_surf = render::render_scene(&bg, "", font, W, H);
+                    cur_surf = draw_scene(&bg, "", font, &sprites, focus, W, H);
                 }
                 vm::lscr::Event::Movie { name } => {
                     eprintln!("  movie: {}", name);
@@ -611,16 +671,22 @@ fn run_game(
                     for (i, o) in opts.iter().enumerate() {
                         body.push_str(&format!("{}. {}\n", i + 1, o));
                     }
-                    cur_surf = render::render_scene(&bg, &body, font, W, H);
+                    cur_surf = draw_scene(&bg, &body, font, &sprites, focus, W, H);
                     win.present(&cur_surf);
-                    let chosen = loop {
-                        match win.poll_input() {
-                            sdl2::Input::Quit => return Ok(()),
-                            sdl2::Input::Choice(n) if (n as usize) <= opts.len() => {
-                                break n as u32
+                    let chosen = if std::env::var_os("WA2_AUTO").is_some() {
+                        win.delay(300);
+                        1u32
+                    } else {
+                        loop {
+                            match win.poll_input() {
+                                sdl2::Input::Quit => return Ok(()),
+                                sdl2::Input::Choice(n) if (n as usize) <= opts.len() => {
+                                    break n as u32
+                                }
+                                sdl2::Input::None => win.delay(16),
+                                sdl2::Input::Choice(_) => win.delay(16),
+                                _ => {}
                             }
-                            sdl2::Input::None => win.delay(16),
-                            _ => {}
                         }
                     };
                     eprintln!("  choice: {} / {}", chosen, opts.len());
@@ -628,14 +694,23 @@ fn run_game(
                 }
                 vm::lscr::Event::Wait => {
                     win.present(&cur_surf);
-                    match wait_input(win) {
-                        sdl2::Input::Quit => return Ok(()),
-                        _ => {}
+                    if std::env::var_os("WA2_AUTO").is_some() {
+                        // auto-advance mode (demo / verification): keep stepping
+                        win.delay(40);
+                    } else {
+                        match wait_input(win) {
+                            sdl2::Input::Quit => return Ok(()),
+                            _ => {}
+                        }
                     }
                 }
                 vm::lscr::Event::Jump { target, kind } => {
                     eprintln!("  {} -> {}", kind, target);
                     current_id = target;
+                    // new scene: standing sprites do not carry over
+                    sprites.clear();
+                    focus = None;
+                    bank.as_mut().map(|b| b.cache.clear());
                     break;
                 }
                 vm::lscr::Event::End => {
@@ -658,6 +733,155 @@ fn load_program(script_dir: &std::path::Path, id: &str) -> Option<vm::lscr::Prog
             None
         }
     }
+}
+
+/// Locate `char.pak` (standing-character sprites) near the media directories.
+fn find_char_pak(bg_dir: &std::path::Path, script_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("WA2_CHARPAK") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    let mut cands: Vec<std::path::PathBuf> = Vec::new();
+    for base in [
+        bg_dir.to_path_buf(),
+        bg_dir.join(".."),
+        script_dir.to_path_buf(),
+        script_dir.join(".."),
+    ] {
+        cands.push(base.join("char.pak"));
+        cands.push(base.join("char.PAK"));
+        cands.push(base.join("IC").join("char.pak"));
+    }
+    cands.into_iter().find(|p| p.exists())
+}
+
+/// Character id -> candidate sprite name prefixes (romaji-first; refined from
+/// the shipped scripts). The first prefix that yields an existing char.pak
+/// entry wins.
+fn sprite_prefixes(cid: u32) -> &'static [&'static str] {
+    match cid {
+        0 => &["har"],
+        1 => &["kaz"],
+        2 => &["set"],
+        3 => &["koh"],
+        4 => &["izu"],
+        5 => &["mar"],
+        10 => &["tak", "oto"],
+        11 => &["ioo", "tak"],
+        12 => &["oto"],
+        13 => &["pap"],
+        14 => &["oto", "mam"],
+        15 => &["tak", "oto"],
+        16 => &["you"],
+        17 => &["oto"],
+        18 => &["kaz"],
+        19 => &["tom"],
+        20 => &["Sat", "sat"],
+        21 => &["Sat"],
+        22 => &["nak"],
+        23 => &["say"],
+        24 => &["aco", "koh"],
+        25 => &["mih"],
+        27 => &["ueh", "mat"],
+        28 => &["kiz", "yos"],
+        29 => &["koh"],
+        30 => &["ham", "mat"],
+        31 => &["mat"],
+        32 => &["koh"],
+        33 => &["suz", "izu"],
+        34 => &["saw"],
+        35 => &["miy", "tom"],
+        36 => &["koh"],
+        37 => &["koh"],
+        _ => &[],
+    }
+}
+
+/// Lazily-loaded character sprite cache backed by `char.pak`.
+struct SpriteBank {
+    pak: std::path::PathBuf,
+    cache: std::collections::HashMap<String, codec::tga::TgaImage>,
+}
+
+impl SpriteBank {
+    fn get(&mut self, name: &str) -> Option<&codec::tga::TgaImage> {
+        if !self.cache.contains_key(name) {
+            let data = archive::kcap::read_entry(&self.pak, name)?;
+            let img = codec::tga::decode(&data).ok()?;
+            self.cache.insert(name.to_string(), img);
+        }
+        self.cache.get(name)
+    }
+
+    /// Resolve `(char, series, variant)` to a sprite file name, trying a few
+    /// variant fallbacks when the exact file is missing from the archive.
+    fn resolve(&mut self, cid: u32, series: u32, variant: u32) -> Option<String> {
+        let variants = [variant, variant.saturating_sub(1), variant + 1, 101, 102];
+        for pf in sprite_prefixes(cid) {
+            for v in variants {
+                let name = format!("{}{:03}{:03}.tga", pf, series, v);
+                if self.get(&name).is_some() {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// A character currently on screen.
+struct ActiveSprite {
+    char_id: u32,
+    #[allow(dead_code)]
+    name: String,
+    img: codec::tga::TgaImage,
+}
+
+/// Horizontal anchor for the idx-th of `count` on-screen characters.
+fn sprite_x_for(idx: usize, count: usize, w: u32) -> i32 {
+    let center = match (count, idx) {
+        (1, _) => 640,
+        (2, 0) => 360,
+        (2, 1) => 920,
+        (3, 0) => 330,
+        (3, 1) => 640,
+        (3, 2) => 950,
+        (_, i) => 330 + (i.min(2) as i32) * 310,
+    };
+    center - (w as i32 / 2)
+}
+
+/// Composite background + sprites + dialog box + text.
+fn draw_scene(
+    bg: &codec::tga::TgaImage,
+    text: &str,
+    font: &render::Font,
+    sprites: &[ActiveSprite],
+    focus: Option<u32>,
+    w: u32,
+    h: u32,
+) -> render::Surface {
+    let count = sprites.len();
+    let draws: Vec<render::SpriteDraw> = sprites
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let alpha = if count > 1 && focus.is_some() && focus != Some(s.char_id) {
+                170
+            } else {
+                255
+            };
+            render::SpriteDraw {
+                img: &s.img,
+                x: sprite_x_for(i, count, s.img.width),
+                y: (h as i32 - s.img.height as i32).max(0),
+                alpha,
+            }
+        })
+        .collect();
+    render::render_scene_ex(bg, text, font, w, h, &draws)
 }
 
 /// Clean scenario text for rendering: literal `\n` -> newline, `\k` removed,
@@ -700,17 +924,25 @@ fn clean_text(s: &str) -> String {
 /// Play a movie (`mvNN` token) found next to the background directory. Returns
 /// after EOF or any key press.
 fn play_movie(win: &mut sdl2::Sdl, media_dir: &std::path::Path, name: &str) -> Option<()> {
+    // Scripts name movies "mv01".."mv24"; archives ship version pairs like
+    // mv010.pak/mv011.pak — try the plain name first, then the 0 and 1 versions.
+    let bases = [
+        media_dir.to_path_buf(),
+        media_dir.join(".."),
+        media_dir.join("IC"),
+        media_dir.join("../mv"),
+    ];
+    let cands = [name.to_string(), format!("{}0", name), format!("{}1", name)];
     let mut path = None;
-    for base in [media_dir.to_path_buf(), media_dir.join(".."), media_dir.join("IC")] {
-        for ext in [".pak", ".PAK"] {
-            let p = base.join(format!("{}{}", name, ext));
-            if p.exists() {
-                path = Some(p);
-                break;
+    'outer: for base in &bases {
+        for cand in &cands {
+            for ext in [".pak", ".PAK"] {
+                let p = base.join(format!("{}{}", cand, ext));
+                if p.exists() {
+                    path = Some(p);
+                    break 'outer;
+                }
             }
-        }
-        if path.is_some() {
-            break;
         }
     }
     let path = path?;
@@ -745,23 +977,23 @@ fn wait_input(win: &mut sdl2::Sdl) -> sdl2::Input {
 /// Two atlas sizes exist: the 14pt sheets are 1920px wide (24px cells) and the
 /// body80 sheets are 3200px wide (40px cells).
 ///
-/// `start_pos` is 748 for the wa2 charset files: the atlas layout is
-/// [0..747] = base glyphs (ASCII / kana / symbols) and [748..] = the main
-/// charset listed in order. `wa2.cht.txt` is the Traditional-Chinese version of
-/// that charset and `wa2_cset.txt` the Japanese one, both in the same order --
-/// so either can be used with the matching atlas at start_pos = 748.
+/// The charset file must list glyphs in atlas cell order starting at cell 0
+/// (`start_pos = 0`), which is how the SJIS-ordered charset
+/// (`wa2_sjis_charset.txt`, generated from the exe's font table) is laid out:
+/// cell 1 = '!', cell 33 = 'A', CJK from cell ~524 on. Verified against the
+/// atlas bitmaps (see the glyph checks in the port history).
 fn load_font(atlas_path: &str, charset_path: &str) -> Option<render::Font> {
     let atlas = match std::fs::read(atlas_path).ok().and_then(|d| codec::tga::decode(&d).ok()) {
         Some(i) => i,
         None => { eprintln!("error: could not decode font atlas {}", atlas_path); return None; }
     };
     let cell = if atlas.width >= 3000 { 40 } else { 24 };
-    eprintln!("font atlas {}x{} -> cell={} start_pos=748", atlas.width, atlas.height, cell);
+    eprintln!("font atlas {}x{} -> cell={}", atlas.width, atlas.height, cell);
     let charset = match std::fs::read_to_string(charset_path) {
         Ok(s) => s,
         Err(e) => { eprintln!("error reading {}: {}", charset_path, e); return None; }
     };
-    Some(render::Font::from_charset(atlas, &charset, cell, 748))
+    Some(render::Font::from_charset(atlas, &charset, cell, 0))
 }
 
 /// Resolve the output directory: explicit arg if present, else `<stem><suffix>`.

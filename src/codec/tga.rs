@@ -8,6 +8,7 @@
 //! reliable (the white glyph entries have alpha 0); transparency is instead
 //! encoded as palette index 0 (fully transparent). We key on index 0.
 
+#[derive(Clone)]
 pub struct TgaImage {
     pub width: u32,
     pub height: u32,
@@ -48,7 +49,14 @@ pub fn decode(data: &[u8]) -> Result<TgaImage, String> {
         None
     };
 
-    let pixel_bytes = (depth / 8).max(1);
+    // WA2's char.pak sprites store `depth = 0` for 32-bit truecolor images
+    // (the standard depth byte was left zero); the payload length confirms 4
+    // bytes per pixel. Treat depth 0 on truecolor images as 32-bit.
+    let pixel_bytes = if depth == 0 && matches!(img_type & 0x7, 2) {
+        4
+    } else {
+        (depth / 8).max(1)
+    };
     let expected = width * height * pixel_bytes;
     let rle = matches!(img_type, 9 | 10 | 11);
     let base_type = img_type & 0x7; // 1=indexed, 2=truecolor, 3=gray

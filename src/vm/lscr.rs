@@ -231,6 +231,11 @@ pub enum Event {
     Bg { name: String },
     /// Play a movie (token like `mv01`).
     Movie { name: String },
+    /// Load/switch a character's standing sprite. The file name is
+    /// `{prefix}{series:03}{variant:03}.tga` inside `char.pak`.
+    Sprite { char_id: u32, series: u32, variant: u32 },
+    /// A character is now speaking (keep bright, dim the others).
+    SpriteFocus { char_id: u32 },
     /// Present a choice; call `set_choice_result` with 1..=options.len().
     Choice { options: Vec<String> },
     /// Wait for the player to advance.
@@ -254,6 +259,10 @@ pub struct Interp<'a> {
     pending_b: Option<u32>,
     last_kind: String,
     steps: u64,
+    /// current record tracking (for sprite-load detection)
+    rec_kind: u32,
+    rec_tok_hit: bool,
+    rec_act_hit: bool,
 }
 
 impl<'a> Interp<'a> {
@@ -272,6 +281,9 @@ impl<'a> Interp<'a> {
             pending_b: None,
             last_kind: String::new(),
             steps: 0,
+            rec_kind: 0,
+            rec_tok_hit: false,
+            rec_act_hit: false,
         }
     }
 
@@ -311,15 +323,26 @@ impl<'a> Interp<'a> {
             let op = self.p.ops[self.pc].clone();
             self.pc += 1;
             match op {
-                Op::Rec { .. } => {
+                Op::Rec { kind, .. } => {
+                    // Finalize the record we just left: a bare `(char, variant,
+                    // series*1000)` record followed by a `K16 ACT154/155` record
+                    // is a character sprite load.
+                    let sprite_ev = self.finish_record();
                     self.ints.clear();
                     self.flts.clear();
                     // Tokens are per-record: a record without a `3, N` op must not
                     // reuse the previous record's token (e.g. K23 `4, 144` = clear).
                     self.tok = None;
+                    self.rec_kind = kind;
+                    self.rec_tok_hit = false;
+                    self.rec_act_hit = false;
+                    if let Some(ev) = sprite_ev {
+                        return ev;
+                    }
                 }
                 Op::Tok { n, .. } => {
                     self.tok = Some(n);
+                    self.rec_tok_hit = true;
                 }
                 Op::Int { v, .. } => self.ints.push(v),
                 Op::Flt { v, .. } => self.flts.push(v),
@@ -362,6 +385,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Op::Act { id, .. } => {
+                    self.rec_act_hit = true;
                     if let Some(ev) = self.act(id) {
                         return ev;
                     }
@@ -377,6 +401,53 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// Detect a character sprite-load record: `K30` carrying exactly three ints
+    /// `(char_id, variant, series * 1000)` with no token/action, followed by a
+    /// `K16` record with `ACT154`/`ACT155`. The file resolved by the frontend is
+    /// `{prefix}{series:03}{variant:03}.tga` inside `char.pak`.
+    fn finish_record(&mut self) -> Option<Event> {
+        if self.rec_kind != 30 || self.rec_tok_hit || self.rec_act_hit || self.ints.len() != 3 {
+            return None;
+        }
+        let cid = self.ints[0];
+        let variant = self.ints[1];
+        let flag = self.ints[2];
+        if !((0..40).contains(&cid)
+            && (0..1000).contains(&variant)
+            && flag % 1000 == 0
+            && (1000..=30000).contains(&flag))
+        {
+            return None;
+        }
+        let mut j = self.pc;
+        let mut steps = 0;
+        let mut ok = false;
+        while j < self.p.ops.len() && steps < 10 {
+            match &self.p.ops[j] {
+                Op::Act { id, .. } => match *id {
+                    154 | 155 => {
+                        ok = true;
+                        break;
+                    }
+                    131 | 132 | 144 => break,
+                    _ => {}
+                },
+                Op::Tok { .. } => break,
+                _ => {}
+            }
+            j += 1;
+            steps += 1;
+        }
+        if !ok {
+            return None;
+        }
+        Some(Event::Sprite {
+            char_id: cid as u32,
+            series: (flag / 1000) as u32,
+            variant: variant as u32,
+        })
     }
 
     fn act(&mut self, id: u32) -> Option<Event> {
@@ -428,8 +499,15 @@ impl<'a> Interp<'a> {
                 None
             }
             138 => {
-                // voice parameters attached to the preceding speaker
+                // character focus for the current line (dim the others) +
+                // voice parameters for the following display
                 self.voice_pending = true;
+                if self.ints.len() >= 5 {
+                    let cid = self.ints[self.ints.len() - 5];
+                    if (0..40).contains(&cid) {
+                        return Some(Event::SpriteFocus { char_id: cid as u32 });
+                    }
+                }
                 None
             }
             208 => {

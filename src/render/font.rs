@@ -88,14 +88,65 @@ impl Font {
         Ok(Font::new(atlas, cell, map))
     }
 
-    /// Resolve a character to a glyph cell via the explicit charset/map only.
+    /// Resolve a character to a glyph cell.
     ///
-    /// NOTE: the Leaf `code_maps` kanji formula (189*(L-0x88)+(T-0x40)-95) was
-    /// found NOT to match the `font_jp` (fnt.pak) atlas layout — e.g. it places
-    /// 一 (0x88EA) at cell 75, which is blank there. Applying it yields *wrong*
-    /// glyphs (worse than a placeholder), so we deliberately do not fall back to
-    /// it. Chars absent from the map render as placeholder boxes.
+    /// Two-byte Shift-JIS characters are computed with the `jp_body80` atlas
+    /// layout, which was verified cell-by-cell against contact sheets:
+    ///  - 0x81 (punctuation/symbols): `cell = 138 + n`, n = 1 for 0x8140
+    ///    (、=140, 。=141, 「=192, 」=193, 『=194, …=174, ÷=202, ＆=223)
+    ///  - 0x82 (hiragana, 0x829F..0x82F1): `cell = 360 + (T-0x9F)` (ぁ..ん)
+    ///  - 0x83 (katakana, 0x8340..0x8396): `cell = 443 + j` (ァ..ヶ)
+    ///  - kanji (lead >= 0x88): `cell = 189*(L-0x88) + (T-0x40) + 653`,
+    ///    verified with "春希小春雪菜和泉千晶冬馬曽北原屋敷"
+    /// ASCII uses `cell = code - 0x20` (cell 0 = blank, 16 = '0', 33 = 'A').
     pub fn resolve_cell(&self, ch: char) -> Option<u32> {
+        if let Some(bytes) = crate::codec::sjis::encode_char(ch) {
+            // ASCII: atlas cell 0 is 0x20 (blank), cell 1 = '!', cell 16 = '0',
+            // cell 33 = 'A' — matches the contact sheets. (The earlier -1 shift
+            // came from charset files: `from_charset` strips whitespace, which
+            // also dropped the leading space glyph and shifted every ASCII cell.)
+            if bytes.len() == 1 {
+                let c = bytes[0] as i32;
+                if (0x20..=0x7E).contains(&c) {
+                    return Some((c - 0x20) as u32);
+                }
+            }
+            if bytes.len() == 2 {
+                let (l, t) = (bytes[0] as i32, bytes[1] as i32);
+                let cell = match l {
+                    0x81 => {
+                        if (0x40..=0x7E).contains(&t) {
+                            138 + (t - 0x3F)
+                        } else if (0x80..=0x9E).contains(&t) {
+                            138 + (t - 0x40)
+                        } else {
+                            -1
+                        }
+                    }
+                    0x82 => {
+                        if (0x9F..=0xF1).contains(&t) {
+                            360 + (t - 0x9F)
+                        } else {
+                            -1
+                        }
+                    }
+                    0x83 => {
+                        if (0x40..=0x7E).contains(&t) {
+                            443 + (t - 0x40)
+                        } else if (0x80..=0x96).contains(&t) {
+                            443 + (t - 0x41)
+                        } else {
+                            -1
+                        }
+                    }
+                    _ if l >= 0x88 => 189 * (l - 0x88) + (t - 0x40) + 653,
+                    _ => -1,
+                };
+                if cell >= 0 {
+                    return Some(cell as u32);
+                }
+            }
+        }
         self.map.get(&ch).copied()
     }
 

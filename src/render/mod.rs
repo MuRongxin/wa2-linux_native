@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{self, Write};
 
 pub mod font;
+pub mod text;
 pub use font::Font;
 
 pub struct Surface {
@@ -98,6 +99,50 @@ impl Surface {
         self.put(x, y, c);
     }
 
+    /// Like `blit_region` but scales the source alpha by `alpha` (0..=255),
+    /// used to dim non-speaking characters.
+    pub fn blit_region_alpha(
+        &mut self,
+        img: &TgaImage,
+        sx: i32,
+        sy: i32,
+        sw: u32,
+        sh: u32,
+        dx: i32,
+        dy: i32,
+        alpha: u8,
+    ) {
+        if alpha == 255 {
+            self.blit_region(img, sx, sy, sw, sh, dx, dy);
+            return;
+        }
+        for row in 0..sh as i32 {
+            for col in 0..sw as i32 {
+                let sxp = sx + col;
+                let syp = sy + row;
+                if sxp < 0 || syp < 0 || sxp >= img.width as i32 || syp >= img.height as i32 {
+                    continue;
+                }
+                let si = ((syp as u32) * img.width + (sxp as u32)) as usize * 4;
+                let a = (img.rgba[si + 3] as u32 * alpha as u32 / 255) as u8;
+                let c = [img.rgba[si], img.rgba[si + 1], img.rgba[si + 2], a];
+                self.put(dx + col, dy + row, c);
+            }
+        }
+    }
+
+    /// Blit a raw RGBA buffer (w*h*4) at (dx,dy) with alpha blending.
+    pub fn blit_rgba(&mut self, rgba: &[u8], w: u32, h: u32, dx: i32, dy: i32) {
+        for row in 0..h as i32 {
+            for col in 0..w as i32 {
+                let si = ((row as u32) * w + col as u32) as usize * 4;
+                if si + 3 >= rgba.len() { continue; }
+                let c = [rgba[si], rgba[si+1], rgba[si+2], rgba[si+3]];
+                self.put(dx + col, dy + row, c);
+            }
+        }
+    }
+
     /// Fill a rectangle (with alpha) - used for the dialog box.
     pub fn fill_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: [u8; 4]) {
         for row in 0..h as i32 {
@@ -131,13 +176,32 @@ impl Surface {
     }
 }
 
-/// Composite a visual-novel scene: background, bottom dialog box, and the given
-/// text rendered with `font` (one line per wrapped logical line).
-///
-/// `text` may contain literal `\n` (backslash + n) for line breaks and
-/// `<R..>` region tags, both stripped before rendering. Characters missing
-/// from the font map render as translucent magenta boxes (so gaps are visible).
+/// A character sprite to composite: image plus screen position and an alpha
+/// multiplier (used to dim non-speaking characters).
+pub struct SpriteDraw<'a> {
+    pub img: &'a TgaImage,
+    pub x: i32,
+    pub y: i32,
+    pub alpha: u8,
+}
+
+/// Composite a visual-novel scene: background, standing sprites, bottom dialog
+/// box, and the given text rendered with `font` (one line per wrapped logical
+/// line).
 pub fn render_scene(bg: &TgaImage, text: &str, font: &Font, w: u32, h: u32) -> Surface {
+    render_scene_ex(bg, text, font, w, h, &[])
+}
+
+/// Like [`render_scene`] but composites the supplied character sprites between
+/// the background and the dialog box.
+pub fn render_scene_ex(
+    bg: &TgaImage,
+    text: &str,
+    font: &Font,
+    w: u32,
+    h: u32,
+    sprites: &[SpriteDraw],
+) -> Surface {
     let mut s = Surface::new(w, h, [0, 0, 0, 255]);
     // Background, scaled to fit (nearest-neighbour stretch).
     let (bw, bh) = (bg.width as f32, bg.height as f32);
@@ -150,6 +214,11 @@ pub fn render_scene(bg: &TgaImage, text: &str, font: &Font, w: u32, h: u32) -> S
             let sy = (y as f32 / scale) as i32;
             s.blit_region(bg, sx, sy, 1, 1, ox as i32 + x as i32, oy as i32 + y as i32);
         }
+    }
+
+    // Standing character sprites (bottom-anchored), below the dialog box.
+    for sp in sprites {
+        s.blit_region_alpha(sp.img, 0, 0, sp.img.width, sp.img.height, sp.x, sp.y, sp.alpha);
     }
 
     // Dialog box near the bottom.
@@ -227,6 +296,55 @@ pub fn demo_scene(font: &TgaImage, sprite: Option<&TgaImage>, w: u32, h: u32) ->
             s.blit_region(font, gx, gy, cell, cell, dx, dy);
             n += 1;
         }
+    }
+    s
+}
+
+/// Like `render_scene`, but rasterizes the dialog text with a SYSTEM CJK font
+/// (ffmpeg drawtext) instead of the game bitmap atlas.
+///
+/// Use this when the atlas glyph order is unknown: text stays fully readable
+/// even though it is not drawn in the game's own face.
+pub fn render_scene_sysfont(
+    bg: &TgaImage,
+    text: &str,
+    w: u32,
+    h: u32,
+    fontfile: &str,
+) -> Surface {
+    let mut s = Surface::new(w, h, [0, 0, 0, 255]);
+    let (bw, bh) = (bg.width as f32, bg.height as f32);
+    let scale = (w as f32 / bw).min(h as f32 / bh);
+    let (dw, dh) = ((bw * scale) as u32, (bh * scale) as u32);
+    let (ox, oy) = ((w - dw) / 2, (h - dh) / 2);
+    for y in 0..dh {
+        for x in 0..dw {
+            let sx = (x as f32 / scale) as i32;
+            let sy = (y as f32 / scale) as i32;
+            s.blit_region(bg, sx, sy, 1, 1, ox as i32 + x as i32, oy as i32 + y as i32);
+        }
+    }
+    let box_h = (h / 4).max(140);
+    let box_y = (h - box_h - 24) as i32;
+    s.fill_rect(30, box_y, w - 60, box_h, [10, 10, 24, 200]);
+    s.fill_rect(30, box_y, w - 60, 2, [180, 200, 255, 220]);
+    s.fill_rect(30, box_y + box_h as i32 - 2, w - 60, 2, [180, 200, 255, 220]);
+
+    // strip <R..> region tags and turn literal backslash-n into real newlines
+    let cleaned: String = text.chars().filter(|&c| c != '\r').collect();
+    let cleaned = cleaned.replace("<R", "\u{1}").replace('>', "\u{1}");
+    let cleaned: String = cleaned
+        .split('\u{1}')
+        .enumerate()
+        .map(|(i, s)| if i % 2 == 0 { s } else { "" })
+        .collect();
+    let cleaned = cleaned.replace("\\n", "\n");
+    let lines: Vec<String> = cleaned.lines().map(|l| l.to_string()).collect();
+
+    let tw = w - 100;
+    let th = box_h - 30;
+    if let Some((rw, rh, rgba)) = text::block_rgba(&lines, tw, th, 26, fontfile) {
+        s.blit_rgba(&rgba, rw, rh, 50, box_y + 16);
     }
     s
 }

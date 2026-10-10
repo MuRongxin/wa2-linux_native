@@ -19,10 +19,12 @@ pub struct Movie {
 impl Movie {
     /// Probe dimensions/fps with ffprobe and spawn an ffmpeg rawvideo decoder.
     pub fn open(path: &str) -> Option<Movie> {
-        // probe
+        // Probe: WA2 movies are ASF/WMV whose `r_frame_rate` is a bogus 1000/1
+        // (timescale) and `avg_frame_rate` is 0/0, so derive fps from the decoded
+        // packet count and the duration instead.
         let out = Command::new("ffprobe")
-            .args(&["-v", "error", "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height,r_frame_rate",
+            .args(&["-v", "error", "-select_streams", "v:0", "-count_packets",
+                    "-show_entries", "stream=width,height,duration,nb_read_packets",
                     "-of", "csv=p=0", path])
             .output().ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
@@ -33,13 +35,10 @@ impl Movie {
                 width = parts[0].trim().parse().unwrap_or(1280);
                 height = parts[1].trim().parse().unwrap_or(720);
             }
-            if parts.len() >= 3 {
-                let rr = parts[2].trim();
-                if let Some((n, d)) = rr.split_once('/') {
-                    let n: f64 = n.parse().unwrap_or(0.0);
-                    let d: f64 = d.parse().unwrap_or(1.0);
-                    if d != 0.0 && n > 0.0 { fps = n / d; }
-                }
+            if parts.len() >= 4 {
+                let dur: f64 = parts[2].trim().parse().unwrap_or(0.0);
+                let n: f64 = parts[3].trim().parse().unwrap_or(0.0);
+                if dur > 0.0 && n > 0.0 { fps = n / dur; }
             }
         }
         let mut child = Command::new("ffmpeg")

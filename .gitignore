@@ -1,1 +1,9 @@
 /target
+
+# Extracted game data: regenerate locally from the game disc with
+#   wa2-native kcap/lac/extract  -- do not commit (huge + copyrighted).
+/assets
+
+# Intermediate numpy/rasterizer artifacts from tools/ experiments.
+*.npy
+tools/verify/

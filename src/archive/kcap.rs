@@ -39,6 +39,50 @@ fn out_path(out_dir: &Path, raw_name: &[u8]) -> PathBuf {
     pb
 }
 
+/// Read and decompress a single archive entry by (ASCII, case-insensitive)
+/// name. Used to load character sprites directly out of `char.pak` at runtime.
+pub fn read_entry(pak: &Path, name: &str) -> Option<Vec<u8>> {
+    let mut f = File::open(pak).ok()?;
+    let mut hdr = [0u8; 16];
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[0..4] != b"KCAP" {
+        return None;
+    }
+    let entry_count = le_u32(&hdr[12..16]) as usize;
+    let want = name.to_ascii_lowercase();
+    for _ in 0..entry_count {
+        let mut e = [0u8; 44];
+        f.read_exact(&mut e).ok()?;
+        let name_end = e[4..28].iter().position(|&b| b == 0).unwrap_or(24);
+        let raw_name = &e[4..4 + name_end];
+        let nm = String::from_utf8_lossy(raw_name).to_ascii_lowercase();
+        if nm != want {
+            continue;
+        }
+        let compressed = le_u32(&e[0..4]) != 0;
+        let offset = le_u32(&e[36..40]);
+        let length = le_u32(&e[40..44]);
+        if length == 0 {
+            return None;
+        }
+        f.seek(SeekFrom::Start(offset as u64)).ok()?;
+        if compressed {
+            let mut dh = [0u8; 8];
+            f.read_exact(&mut dh).ok()?;
+            let orig = le_u32(&dh[4..8]) as usize;
+            let comp_len = (length as usize).saturating_sub(8);
+            let mut comp = vec![0u8; comp_len];
+            f.read_exact(&mut comp).ok()?;
+            return Some(lzss::decompress(&comp, orig));
+        } else {
+            let mut d = vec![0u8; length as usize];
+            f.read_exact(&mut d).ok()?;
+            return Some(d);
+        }
+    }
+    None
+}
+
 pub fn unpack(pak: &Path, out_dir: &Path) -> io::Result<()> {
     let mut f = File::open(pak)?;
     let mut hdr = [0u8; 16];
