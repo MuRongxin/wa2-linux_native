@@ -78,6 +78,13 @@ impl Font {
     pub fn from_cell_map(atlas: TgaImage, cell: u32, path: &std::path::Path) -> std::io::Result<Font> {
         let data = std::fs::read_to_string(path)?;
         let mut code_map = HashMap::new();
+        // Secondary char->cell index. encode_char() (Unicode->Shift-JIS) is the
+        // primary lookup key, but the bundled reverse table is incomplete: many
+        // characters that DO appear in the *.tsv (and therefore in real text,
+        // e.g. 读/动/过/历/设/隐) fail to encode and would otherwise render
+        // blank. Indexing the literal character column too lets resolve_cell's
+        // `map` fallback find them.
+        let mut char_map: HashMap<char, u32> = HashMap::new();
         for line in data.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -94,6 +101,9 @@ impl Font {
             };
             if let (Some(code), Ok(cellidx)) = (code, cellidx.parse::<u32>()) {
                 code_map.insert(code, cellidx);
+                if let Some(ch) = _ch.chars().next() {
+                    char_map.insert(ch, cellidx);
+                }
             }
         }
         let cols = atlas.width / cell;
@@ -101,7 +111,7 @@ impl Font {
             atlas,
             cell,
             cols,
-            map: HashMap::new(),
+            map: char_map,
             code_map,
             authoritative: true,
         })
@@ -250,9 +260,72 @@ impl Font {
         self.map.get(&ch).copied()
     }
 
+    /// Draw `text` scaled so each glyph is `dest` pixels. The message window
+    /// uses this: the atlas cell is 40px, the original line is about 26px.
+    pub fn draw_sized(&self, surf: &mut Surface, text: &str, x: i32, y: i32, dest: u32) {
+        if dest == 0 {
+            return;
+        }
+        if dest == self.cell {
+            self.draw(surf, text, x, y);
+            return;
+        }
+        let src = self.cell as i32;
+        let dest_i = dest as i32;
+        let step = (src / dest_i).max(1);
+        let mut cx = x;
+        for ch in text.chars() {
+            if let Some(idx) = self.resolve_cell(ch) {
+                let gx = (idx % self.cols) as i32 * src;
+                let gy = (idx / self.cols) as i32 * src;
+                let sample = |sx: i32, sy: i32| -> [u8; 4] {
+                    if sx < gx || sy < gy || sx >= gx + src || sy >= gy + src {
+                        return [0, 0, 0, 0];
+                    }
+                    let i = ((sy as u32 * self.atlas.width + sx as u32) * 4) as usize;
+                    [
+                        self.atlas.rgba[i],
+                        self.atlas.rgba[i + 1],
+                        self.atlas.rgba[i + 2],
+                        self.atlas.rgba[i + 3],
+                    ]
+                };
+                for dy in 0..dest_i {
+                    for dx in 0..dest_i {
+                        let sx = gx + dx * src / dest_i;
+                        let sy = gy + dy * src / dest_i;
+                        let px = sample(sx, sy);
+                        if px[3] == 0 {
+                            let mut edge = 0u8;
+                            for oy in [-step, 0, step] {
+                                for ox in [-step, 0, step] {
+                                    edge = edge.max(sample(sx + ox, sy + oy)[3]);
+                                }
+                            }
+                            if edge > 0 {
+                                surf.blend_pixel(cx + dx, y + dy, [0, 0, 0, edge]);
+                            }
+                        } else {
+                            surf.blend_pixel(cx + dx, y + dy, px);
+                        }
+                    }
+                }
+            }
+            cx += dest_i;
+        }
+    }
+
     /// Draw `text` left-to-right starting at (x, y). Characters with no glyph
     /// cell are skipped (advancing by one cell).
     pub fn draw(&self, surf: &mut Surface, text: &str, x: i32, y: i32) {
+        self.draw_pitch(surf, text, x, y, self.cell as i32);
+    }
+
+    /// Draw at the atlas cell size, but advance by `pitch` (half of that for
+    /// ASCII). The message window does this: the ink only fills the middle of
+    /// the 40px cell, and the original steps about 28px so the strokes sit
+    /// next to each other.
+    pub fn draw_pitch(&self, surf: &mut Surface, text: &str, x: i32, y: i32, pitch: i32) {
         let mut cx = x;
         for ch in text.chars() {
             if let Some(idx) = self.resolve_cell(ch) {
@@ -260,9 +333,29 @@ impl Font {
                 let row = (idx / self.cols) as i32;
                 let gx = col * self.cell as i32;
                 let gy = row * self.cell as i32;
+                // A one-pixel black edge follows the glyph's coverage mask,
+                // keeping the original thin white strokes readable on CGs.
+                for py in -1..=self.cell as i32 {
+                    for px in -1..=self.cell as i32 {
+                        let mut alpha = 0;
+                        for oy in -1..=1 {
+                            for ox in -1..=1 {
+                                let (sx, sy) = (px + ox, py + oy);
+                                if sx >= 0 && sy >= 0 && sx < self.cell as i32 && sy < self.cell as i32 {
+                                    let i = (((gy + sy) as u32 * self.atlas.width + (gx + sx) as u32) * 4) as usize;
+                                    alpha = alpha.max(self.atlas.rgba[i + 3]);
+                                }
+                            }
+                        }
+                        if alpha > 0 {
+                            surf.blend_pixel(cx + px, y + py, [0, 0, 0, alpha]);
+                        }
+                    }
+                }
                 surf.blit_region(&self.atlas, gx, gy, self.cell, self.cell, cx, y);
             }
-            cx += self.cell as i32;
+            let adv = if (ch as u32) < 128 { pitch / 2 } else { pitch };
+            cx += adv;
         }
     }
 

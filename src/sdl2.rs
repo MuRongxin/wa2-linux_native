@@ -20,6 +20,7 @@ const RTLD_NOW: c_int = 2;
 
 // SDL constants
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
+const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
 const SDL_WINDOW_RESIZABLE: u32 = 0x0000_0020;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000u32 as i32;
@@ -94,6 +95,10 @@ pub enum Input {
     /// button press (`pressed == true`). Use `Sdl::surface_pos` to convert to
     /// the 1280x720 surface the game draws into.
     Pointer { x: i32, y: i32, pressed: bool },
+    /// Right mouse button pressed (its function is the `R_click` setting).
+    RightClick,
+    /// Pointer moved with the left button held (dragging).
+    Drag { x: i32, y: i32 },
 }
 
 unsafe fn sym(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
@@ -136,8 +141,10 @@ impl Sdl {
         let f_get_pixel_format_name: unsafe extern "C" fn(u32) -> *const c_char = std::mem::transmute(sym(lib, "SDL_GetPixelFormatName")?);
         let f_get_window_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) =
             std::mem::transmute(sym(lib, "SDL_GetWindowSize")?);
-        let f_open_audio: unsafe extern "C" fn(*const c_char, i32, u32, i32, i32, i32, i32) -> u32 = std::mem::transmute(sym(lib, "SDL_OpenAudioDevice")?);
-        let f_queue_audio: unsafe extern "C" fn(u32, *const c_void, u32) -> u32 = std::mem::transmute(sym(lib, "SDL_QueueAudio")?);
+        let f_open_audio: unsafe extern "C" fn(*const c_char, c_int, *const SdlAudioSpec, *mut SdlAudioSpec, c_int) -> u32 = std::mem::transmute(sym(lib, "SDL_OpenAudioDevice")?);
+        let f_queue_audio: unsafe extern "C" fn(u32, *const c_void, u32) -> c_int = std::mem::transmute(sym(lib, "SDL_QueueAudio")?);
+        let f_pause_audio: unsafe extern "C" fn(u32, c_int) = std::mem::transmute(sym(lib, "SDL_PauseAudioDevice")?);
+        let f_get_error: unsafe extern "C" fn() -> *const c_char = std::mem::transmute(sym(lib, "SDL_GetError")?);
         let f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(sym(lib, "SDL_PollEvent")?);
         let f_destroy_texture: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(sym(lib, "SDL_DestroyTexture")?);
         let f_destroy_renderer: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(sym(lib, "SDL_DestroyRenderer")?);
@@ -153,6 +160,13 @@ impl Sdl {
         // init video+audio together; if that fails, fall back to video only
         let r = init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
         if r != 0 { let _ = init(SDL_INIT_VIDEO); }
+        // Publish the audio API only after SDL has been loaded. Previously these
+        // pointers were resolved but never installed, so Mixer::new always got
+        // device 0 and every run was silent.
+        let _ = AUDIO.set(AudioFns { open: f_open_audio, queue: f_queue_audio, pause: f_pause_audio, get_error: f_get_error });
+        let f_full: unsafe extern "C" fn(*mut c_void, u32) -> c_int =
+            std::mem::transmute(sym(lib, "SDL_SetWindowFullscreen")?);
+        let _ = FULLSCREEN.set(f_full);
         let t = CString::new(title).ok()?;
         let window = f_create_window(
             t.as_ptr(),
@@ -254,7 +268,9 @@ impl Sdl {
         }
     }
 
-    /// Drain SDL events; return the first actionable input (advance/back/quit).
+    /// Drain SDL events. A click or key that shares the queue with later mouse
+    /// motion is kept: during skip the game spends a long time between polls,
+    /// and the motion that follows a click would otherwise replace it.
     pub fn poll_input(&mut self) -> Input {
         let mut ev = [0u8; 128];
         let mut out = Input::None;
@@ -289,16 +305,31 @@ impl Sdl {
                     }
                 } else if etype == SDL_MOUSEMOTION {
                     // SDL_MouseMotionEvent: type,timestamp,windowID,which,state
-                    // (20 bytes) then Sint32 x, y.
-                    let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
-                    let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
-                    out = Input::Pointer { x, y, pressed: false };
+                    // (20 bytes) then Sint32 x, y. `state` bit 0 is the left
+                    // button, which is how a drag is recognised.
+                    // Motion does not replace a click or key already taken
+                    // from this same queue.
+                    if matches!(out, Input::None | Input::Pointer { pressed: false, .. } | Input::Drag { .. }) {
+                        let state = u32::from_ne_bytes([ev[16], ev[17], ev[18], ev[19]]);
+                        let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
+                        let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
+                        out = if state & 1 != 0 {
+                            Input::Drag { x, y }
+                        } else {
+                            Input::Pointer { x, y, pressed: false }
+                        };
+                    }
                 } else if etype == SDL_MOUSEBUTTONDOWN {
                     // SDL_MouseButtonEvent: type..which (16), button,state,clicks,
                     // padding (4), then Sint32 x, y.
+                    let button = ev[16];
                     let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
                     let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
-                    out = Input::Pointer { x, y, pressed: true };
+                    out = if button == 3 {
+                        Input::RightClick
+                    } else {
+                        Input::Pointer { x, y, pressed: true }
+                    };
                 }
             }
         }
@@ -306,6 +337,14 @@ impl Sdl {
             eprintln!("input: {:?}", out);
         }
         out
+    }
+
+    /// Switch the window between windowed and fullscreen (the 「画面模式」
+    /// setting). SDL keeps the renderer/texture alive across the switch.
+    pub fn set_fullscreen(&self, on: bool) {
+        if let Some(f) = FULLSCREEN.get() {
+            unsafe { (f)(self.window, if on { 1 } else { 0 }); }
+        }
     }
 
     /// Current window size in pixels (the surface is stretched to it).
@@ -366,32 +405,51 @@ impl Drop for Sdl {
     }
 }
 // ---- Audio device (global fn table so the mixer thread can call SDL) ----
-const SDL_AUDIOSIZE_SAMPLES: i32 = 1024;
 const AUDIO_S16SYS: u32 = 0x8010;
-const SDL_INIT_AUDIO: u32 = 0x0000_0010;
+
+#[repr(C)]
+struct SdlAudioSpec {
+    freq: c_int,
+    format: u16,
+    channels: u8,
+    silence: u8,
+    samples: u16,
+    padding: u16,
+    size: u32,
+    callback: Option<unsafe extern "C" fn(*mut c_void, *mut u8, c_int)>,
+    userdata: *mut c_void,
+}
 
 struct AudioFns {
-    initsub: unsafe extern "C" fn(u32) -> c_int,
-    open: unsafe extern "C" fn(*const c_char, i32, i32, i32, *const c_void) -> u32,
-    queue: unsafe extern "C" fn(u32, *const c_void, u32) -> u32,
+    open: unsafe extern "C" fn(*const c_char, c_int, *const SdlAudioSpec, *mut SdlAudioSpec, c_int) -> u32,
+    queue: unsafe extern "C" fn(u32, *const c_void, u32) -> c_int,
     pause: unsafe extern "C" fn(u32, i32),
+    get_error: unsafe extern "C" fn() -> *const c_char,
 }
 
 static AUDIO: OnceLock<AudioFns> = OnceLock::new();
+static FULLSCREEN: OnceLock<unsafe extern "C" fn(*mut c_void, u32) -> c_int> = OnceLock::new();
 
 /// Open a playback device (48kHz stereo, 1024-frame buffer). 0 on failure.
 pub fn sdl_open_audio(rate: u32, ch: u16) -> u32 {
     let f = match AUDIO.get() { Some(f) => f, None => return 0 };
-    unsafe { (f.initsub)(SDL_INIT_AUDIO); } // initialise the audio subsystem
-    unsafe {
-        (f.open)(
-            std::ptr::null(),   // device
-            0,                   // is32bit (unused, must be 0)
-            rate as i32,// freq in Hz
-            0,                   // allowed_changes
-            std::ptr::null(),   // devid
-        )
+    let wanted = SdlAudioSpec {
+        freq: rate as c_int,
+        format: AUDIO_S16SYS as u16,
+        channels: ch as u8,
+        silence: 0,
+        samples: 1024,
+        padding: 0,
+        size: 0,
+        callback: None, // queued audio uses SDL_QueueAudio
+        userdata: std::ptr::null_mut(),
+    };
+    let dev = unsafe { (f.open)(std::ptr::null(), 0, &wanted, std::ptr::null_mut(), 0) };
+    if dev == 0 {
+        let err = unsafe { std::ffi::CStr::from_ptr((f.get_error)()) }.to_string_lossy();
+        eprintln!("SDL audio device open failed: {err}");
     }
+    dev
 }
 
 /// Push interleaved s16le bytes to the audio device.

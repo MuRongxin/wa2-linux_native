@@ -18,6 +18,7 @@ What it does (all steps are no-ops when the target already exists):
                                                names only overlap on 67 entries)
     data/voice       <- VOICE.PAK + IC/VOICE.PAK
     data/bgm         <- BGM.PAK + IC/BGM.PAK
+    data/se          <- SE.PAK + IC/SE.PAK
     data/font        <- fnt.pak (Japanese) + fon.pak (Chinese patch) atlases,
                         plus wa2_cell_map_{jp,cn}.tsv from tools/gen_cell_map.py
     data/movie       <- mv*.pak / IC/MV*.pak  (raw ASF -> *.wmv)
@@ -31,7 +32,7 @@ import shutil
 import subprocess
 import sys
 
-SUBDIRS = ["script", "script_cn", "bg", "bg_cn", "sprite", "voice", "bgm", "font", "movie"]
+SUBDIRS = ["script", "script_cn", "bg", "bg_cn", "sprite", "voice", "bgm", "se", "font", "movie"]
 
 
 def run(cmd):
@@ -123,13 +124,13 @@ def main():
             shutil.rmtree(t, ignore_errors=True)
     print("   ", len(os.listdir(os.path.join(out, "sprite"))), "sprites")
 
-    print("[6/6] VOICE.PAK + BGM.PAK (+ IC variants)")
-    for pak, dst in (("VOICE.PAK", "voice"), ("IC/VOICE.PAK", "voice"), ("BGM.PAK", "bgm"), ("IC/BGM.PAK", "bgm")):
+    print("[6/6] VOICE.PAK + BGM.PAK + SE.PAK (+ IC variants)")
+    for pak, dst in (("VOICE.PAK", "voice"), ("IC/VOICE.PAK", "voice"), ("BGM.PAK", "bgm"), ("IC/BGM.PAK", "bgm"), ("SE.PAK", "se"), ("IC/SE.PAK", "se")):
         t = os.path.join(tmp, dst + "_" + os.path.basename(os.path.dirname(pak) or "x"))
         if unpack(args.bin, os.path.join(g, pak), t):
             merge(t, os.path.join(out, dst))
             shutil.rmtree(t, ignore_errors=True)
-    for d in ("voice", "bgm"):
+    for d in ("voice", "bgm", "se"):
         print("   ", d, len(os.listdir(os.path.join(out, d))), "files")
 
     # --- fonts + cell maps --------------------------------------------------

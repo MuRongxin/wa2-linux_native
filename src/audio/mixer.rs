@@ -9,12 +9,22 @@
 
 use std::collections::VecDeque;
 use std::io::Read;
+use std::os::fd::AsRawFd;
+unsafe extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
+
+/// Mixer categories. The option screen's four volume sliders map onto these:
+/// `all` scales everything, the others scale one kind of sound.
+pub const CAT_ALL: usize = 0;
+pub const CAT_BGM: usize = 1;
+pub const CAT_SE: usize = 2;
+pub const CAT_VOICE: usize = 3;
+pub const CAT_COUNT: usize = 4;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 static PULLED: AtomicU64 = AtomicU64::new(0);
@@ -27,26 +37,34 @@ pub fn queued_bytes() -> u64 { QUEUED.load(Ordering::Relaxed) }
 
 /// One decoded audio stream (BGM, SE, voice, ...).
 pub struct Stream {
+    /// Source path, for diagnostics only.
+    label: String,
+    /// Which volume slider scales this stream.
+    cat: usize,
+    carry: Vec<u8>,
     child: Option<Child>,
     /// raw s16le frames not yet mixed
     pcm: VecDeque<i16>,
     pub volume: f32,
     pub looping: bool,
     eos: bool,
+    ramp: Option<(f32, f32, std::time::Instant, std::time::Duration, bool)>,
 }
 
 impl Stream {
     /// Spawn `ffmpeg -i <in> -f s16le -ar 48000 -ac 2 -` and stream-decode it.
-    pub fn spawn_ffmpeg(input: &str) -> Option<Stream> {
-        let child = Command::new("ffmpeg")
-            .args(&["-hide_banner", "-loglevel", "error", "-i", input,
-                    "-f", "s16le", "-ar", "48000", "-ac", "2", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        Some(Stream { child: Some(child), pcm: VecDeque::new(), volume: 1.0, looping: false, eos: false })
+    pub fn spawn_ffmpeg(input: &str, looping: bool) -> Option<Stream> {
+        let mut command = Command::new("ffmpeg");
+        command.args(["-hide_banner", "-loglevel", "error"]);
+        if looping { command.args(["-stream_loop", "-1"]); }
+        let child = command.args(["-i", input, "-f", "s16le", "-ar", "48000", "-ac", "2", "-"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+        // Linux O_NONBLOCK: no decoder may hold the mixer lock while waiting.
+        let fd = child.stdout.as_ref()?.as_raw_fd();
+        unsafe { let flags = fcntl(fd, 3); if flags >= 0 { fcntl(fd, 4, flags | 0x800); } }
+        Some(Stream { label: input.to_string(), cat: CAT_ALL, carry: Vec::new(),
+            child: Some(child), pcm: VecDeque::new(), volume: 1.0, looping, eos: false,
+            ramp: None })
     }
 }
 
@@ -58,6 +76,8 @@ pub struct Mixer {
 
 struct MixerInner {
     streams: Vec<Option<Stream>>,
+    /// gains[CAT_ALL] * gains[category] scales every stream.
+    gains: [f32; CAT_COUNT],
     quit: bool,
 }
 
@@ -66,42 +86,111 @@ impl Mixer {
     /// Returns None if SDL audio could not be initialised.
     pub fn new(sdl: &crate::sdl2::Sdl) -> Option<Mixer> {
         let dev = crate::sdl2::sdl_open_audio(SAMPLE_RATE, CHANNELS);
-        let inner = Arc::new(Mutex::new(MixerInner { streams: Vec::new(), quit: false }));
+        if dev == 0 {
+            return None;
+        }
+        let inner = Arc::new(Mutex::new(MixerInner {
+            streams: Vec::new(),
+            gains: [1.0; CAT_COUNT],
+            quit: false,
+        }));
         let inner2 = Arc::clone(&inner);
         let worker = thread::spawn(move || {
-            let mut carry: Vec<u8> = Vec::new();
+
             while !inner2.lock().unwrap().quit {
                 // pull any available PCM from children
                 {
                     let mut g = inner2.lock().unwrap();
                     for s in g.streams.iter_mut() {
                         if let Some(st) = s {
+                            if st.eos || st.pcm.len() >= 8192 { continue; }
                             let mut buf = [0u8; 4096];
                             if let Some(child) = st.child.as_mut() {
                                 if let Some(out) = child.stdout.as_mut() {
                                     match out.read(&mut buf) {
-                                        Ok(0) => { st.eos = true; }
+                                        Ok(0) => {
+                                            st.eos = true;
+                                            // Decoder exited on its own: reap it, or every
+                                            // finished SE/voice line stays a zombie.
+                                            if let Some(c) = st.child.as_mut() {
+                                                if matches!(c.try_wait(), Ok(Some(_))) {
+                                                    st.child = None;
+                                                }
+                                            }
+                                        }
                                         Ok(n) => {
-                                            carry.extend_from_slice(&buf[..n]);
-                                            let usable = carry.len() - (carry.len() % 2);
-                                            for ch in carry[..usable].chunks_exact(2) {
+                                            st.carry.extend_from_slice(&buf[..n]);
+                                            let usable = st.carry.len() - (st.carry.len() % 2);
+                                            for ch in st.carry[..usable].chunks_exact(2) {
                                                 st.pcm.push_back(i16::from_le_bytes([ch[0], ch[1]]));
                                             }
                                             PULLED.fetch_add((usable / 2) as u64, Ordering::Relaxed);
-                                            carry.drain(..usable);
+                                            st.carry.drain(..usable);
                                         }
+                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                         Err(_) => st.eos = true,
                                     }
                                 }
                             }
                         }
                     }
+                    // A decoder can exit a moment after EOF; collect those too so
+                    // finished streams never linger as zombies.
+                    for st in g.streams.iter_mut().flatten() {
+                        if st.eos {
+                            if let Some(c) = st.child.as_mut() {
+                                if matches!(c.try_wait(), Ok(Some(_))) {
+                                    st.child = None;
+                                }
+                            }
+                        }
+                    }
                 }
                 // mix & push
+                static LAST_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if std::env::var_os("WA2_DEBUG_AUDIO").is_some() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let prev = LAST_DBG.load(Ordering::Relaxed);
+                    if now.saturating_sub(prev) < 1000 {
+                        let block = mix_once(&inner2);
+                        crate::sdl2::sdl_queue_audio(dev, &block);
+                        thread::sleep(std::time::Duration::from_micros(21_333));
+                        continue;
+                    }
+                    LAST_DBG.store(now, Ordering::Relaxed);
+                    let g = inner2.lock().unwrap();
+                    let live = g
+                        .streams
+                        .iter()
+                        .filter(|s| s.as_ref().map(|st| !st.eos || !st.pcm.is_empty()).unwrap_or(false))
+                        .count();
+                    let gains = g.gains;
+                    let names: Vec<String> = g
+                        .streams
+                        .iter()
+                        .filter_map(|s| s.as_ref())
+                        .filter(|st| !st.pcm.is_empty() && st.volume > 0.001)
+                        .map(|st| {
+                            let p = std::path::Path::new(&st.label);
+                            let f = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                            let eff = st.volume * gains[0] * gains[st.cat];
+                            if eff < 0.99 { format!("{}@{:.2}", f, eff) } else { f }
+                        })
+                        .collect();
+                    let audible = names.len();
+                    let slots = g.streams.len();
+                    drop(g);
+                    eprintln!("  audio: n={} slots={} [{}]", audible, slots, names.join(" + "));
+                }
                 let block = mix_once(&inner2);
                 QUEUED.fetch_add(block.len() as u64, Ordering::Relaxed);
                 crate::sdl2::sdl_queue_audio(dev, &block);
-                thread::sleep(std::time::Duration::from_millis(10));
+                // 1024 stereo frames at 48 kHz take ~21.33 ms. Pushing every
+                // 10 ms made the SDL queue grow at over twice real time.
+                thread::sleep(std::time::Duration::from_micros(21_333));
             }
         });
         crate::sdl2::sdl_pause_audio(dev, false);
@@ -110,14 +199,57 @@ impl Mixer {
 
     /// Allocate a stream slot and start an ffmpeg decode into it.
     pub fn play(&self, input: &str, volume: f32, looping: bool) -> usize {
+        self.play_cat(input, volume, looping, CAT_ALL)
+    }
+
+    /// Like [`Mixer::play`] but tags the stream with a volume category.
+    pub fn play_cat(&self, input: &str, volume: f32, looping: bool, cat: usize) -> usize {
         let mut g = self.inner.lock().unwrap();
-        let mut s = match Stream::spawn_ffmpeg(input) {
+        let mut s = match Stream::spawn_ffmpeg(input, looping) {
             Some(s) => s, None => return usize::MAX,
         };
         s.volume = volume;
         s.looping = looping;
+        s.cat = cat.min(CAT_COUNT - 1);
         g.streams.push(Some(s));
         g.streams.len() - 1
+    }
+
+    /// Set one of the option screen's volume sliders (linear gain, 1.0 = 100%).
+    pub fn set_gain(&self, cat: usize, gain: f32) {
+        if cat >= CAT_COUNT {
+            return;
+        }
+        self.inner.lock().unwrap().gains[cat] = gain.clamp(0.0, 2.0);
+    }
+
+    pub fn gain(&self, cat: usize) -> f32 {
+        if cat >= CAT_COUNT {
+            return 1.0;
+        }
+        self.inner.lock().unwrap().gains[cat]
+    }
+
+    /// Script fades use frames at 60 Hz; nonpositive durations are immediate.
+    pub fn fade(&self, idx: usize, target: f32, frames: i32, stop: bool) {
+        if frames <= 0 && stop { self.stop(idx); return; }
+        let mut g = self.inner.lock().unwrap();
+        if let Some(Some(s)) = g.streams.get_mut(idx) {
+            if frames <= 0 { s.volume = target; s.ramp = None; }
+            else { s.ramp = Some((s.volume, target, std::time::Instant::now(),
+                std::time::Duration::from_secs_f64(frames as f64 / 60.0), stop)); }
+        }
+    }
+
+    pub fn settled(&self, idx: usize) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.streams.get(idx).and_then(|s| s.as_ref()).map(|s| s.ramp.is_none()).unwrap_or(true)
+    }
+
+    pub fn finished(&self, idx: usize) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.streams.get(idx).and_then(|s| s.as_ref())
+            .map(|s| s.eos && s.pcm.is_empty()).unwrap_or(true)
     }
 
     pub fn stop(&self, idx: usize) {
@@ -150,9 +282,24 @@ fn mix_once(inner: &Arc<Mutex<MixerInner>>) -> Vec<u8> {
     let mut acc = vec![0i32; frames];
     {
         let mut g = inner.lock().unwrap();
+        let g_gains = g.gains;
         for s in g.streams.iter_mut() {
             if let Some(st) = s {
-                let vol = (st.volume * 32767.0) as i32;
+                if let Some((from, to, start, duration, stop)) = st.ramp {
+                    let fraction = (start.elapsed().as_secs_f32() / duration.as_secs_f32()).min(1.0);
+                    st.volume = from + (to - from) * fraction;
+                    if fraction >= 1.0 {
+                        st.ramp = None;
+                        if stop {
+                            if let Some(mut c) = st.child.take() { let _ = c.kill(); let _ = c.wait(); }
+                            st.looping = false;
+                            st.eos = true;
+                            st.pcm.clear();
+                        }
+                    }
+                }
+                let g = g_gains[0] * g_gains[st.cat];
+                let vol = (st.volume * g * 65536.0) as i32;
                 for i in 0..frames {
                     let v = match st.pcm.pop_front() {
                         Some(x) => x as i32,

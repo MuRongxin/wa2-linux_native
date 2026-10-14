@@ -1,8 +1,12 @@
 mod archive;
 mod audio;
 mod codec;
+mod cmdbar;
 mod data;
+mod menu;
 mod render;
+mod save;
+mod saveload;
 mod sdl2;
 mod video;
 mod vm;
@@ -95,7 +99,15 @@ fn main() {
             let bg = match std::fs::read(&args[5]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
                 Some(i) => i, None => { eprintln!("error: could not decode background {}", args[5]); return; }
             };
-            let surf = render::render_scene(&bg, &page.text(), &font, 1280, 720);
+            // Optional 6th argument: an `.AMP` colour curve, for previewing the
+            // sepia/nega flashback looks without running the game.
+            let lut = args.get(7).and_then(|p| {
+                let d = std::fs::read(p).ok()?;
+                eprintln!("tint: {} ({} bytes)", p, d.len());
+                Some(d)
+            });
+            let surf =
+                render::render_scene_ex(&bg, &page.text(), &font, 1280, 720, &[], lut.as_deref(), true, None, None);
             if let Err(e) = surf.save_tga(&args[6]) { eprintln!("error writing {}: {}", args[6], e); std::process::exit(1); }
             println!("scene {} (voice={:?} bg={:?} next={:?}): {} lines, {} chars -> {}",
                 args[2], page.voice, page.background, page.next, page.lines.len(), page.text().chars().count(), args[6]);
@@ -229,6 +241,8 @@ fn main() {
                         sdl2::Input::Down => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Quit => return,
                         sdl2::Input::Fullscreen => break,
+                        sdl2::Input::RightClick => break,
+                        sdl2::Input::Drag { .. } => {}
                         sdl2::Input::None => win.delay(16),
                         sdl2::Input::Choice(_) => win.delay(16),
                         sdl2::Input::Pointer { .. } => win.delay(16),
@@ -332,6 +346,8 @@ fn main() {
                         sdl2::Input::Down => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Quit => return,
                         sdl2::Input::Fullscreen => break,
+                        sdl2::Input::RightClick => break,
+                        sdl2::Input::Drag { .. } => {}
                         sdl2::Input::Choice(_) => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Pointer { pressed, .. } => { if pressed && idx < n - 1 { idx += 1; break; } win.delay(16); }
                         sdl2::Input::None => { win.delay(16); }
@@ -376,6 +392,7 @@ fn main() {
                 movie_dir: bg_dir.join("..").join("mv"),
                 voice_dir,
                 bgm: bgm_path,
+                bg_index: BgIndex::build(&[&bg_dir]),
             };
             eprintln!("wa2-native run: start={} (Space/Click=next, Left=back, 1-9=choice, Esc/q=quit)", start_id);
             if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
@@ -402,6 +419,7 @@ fn main() {
                     movie_dir: bg_dir.join("..").join("mv"),
                     voice_dir: None,
                     bgm: None,
+                    bg_index: BgIndex::build(&[&bg_dir]),
                 };
                 (font, session, start_id, bg_dir)
             } else {
@@ -417,6 +435,12 @@ fn main() {
                 TitleAction::Start => {
                     eprintln!("title: starting scene {}", start_id);
                     if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
+                        eprintln!("run error: {}", e);
+                    }
+                }
+                TitleAction::Load(snap) => {
+                    eprintln!("title: loading scene {}", snap.scene);
+                    if let Err(e) = run_game_from(&mut win, &font, &session, snap) {
                         eprintln!("run error: {}", e);
                     }
                 }
@@ -465,16 +489,24 @@ fn main() {
                 while n < max_ev {
                     n += 1;
                     match it.next_event() {
-                        vm::lscr::Event::Text { text, speaker, voice_tok } => {
+                        vm::lscr::Event::Text { text, speaker, voice } => {
                             let body = clean_text(&text).replace('\n', " / ");
                             let sp = speaker.unwrap_or_default();
-                            let vt = voice_tok.map(|v| format!("v{}", v)).unwrap_or_default();
+                            let vt = voice.map(|v| format!("{}_{:04}_{:02}", v.scenario, v.line, v.char_id)).unwrap_or_default();
                             println!("  [text] speaker={:?} voice={} | {}", sp, vt, body);
                         }
-                        vm::lscr::Event::Bg { name } => println!("  [bg  ] {}", if name.is_empty() { "<black>" } else { &name }),
+                        vm::lscr::Event::BgScene { id, variant, frames } =>
+                            println!("  [bg  ] id={} var={} frames={}", id, variant, frames),
+                        vm::lscr::Event::Overlay { name, slot } => println!("  [ovl ] slot={} {}", slot, name),
+                        vm::lscr::Event::WaitFrames(n) => println!("  [wait] {} frames", n),
+                        vm::lscr::Event::Sound { opcode, args } =>
+                            println!("  [sound] ACT{} {:?}", opcode, args),
+                        vm::lscr::Event::Tint { name } => println!("  [tint] {}", if name.is_empty() { "<none>" } else { &name }),
                         vm::lscr::Event::Movie { name } => println!("  [mv  ] {}", name),
-                        vm::lscr::Event::Sprite { char_id, series, variant } =>
-                            println!("  [spr ] char={} series={} variant={}", char_id, series, variant),
+                        vm::lscr::Event::Sprite { char_id, series, variant, slot } =>
+                            println!("  [spr ] char={} series={} variant={} slot={}", char_id, series, variant, slot),
+                        vm::lscr::Event::SpriteExit { char_id, frames } =>
+                            println!("  [spr-] char={} frames={}", char_id, frames),
                         vm::lscr::Event::SpriteFocus { char_id } => println!("  [fo-c] {}", char_id),
                         vm::lscr::Event::Choice { options } => {
                             let pick = seq.get(seq_i).copied().unwrap_or(1);
@@ -588,13 +620,9 @@ fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::
     None
 }
 
-/// Voice file lookup, indexed once instead of scanning the directory per line.
-///
-/// Voice files are named `{scenario}_{line:04d}_{XX}.OGG`, where `line` is the
-/// token index of the speaker token; `XX` is a per-character variant, so the
-/// first file for a `{scenario}_{line}` key wins.
+/// Exact voice lookup by the identifiers from ACT137 and ACT138.
 struct VoiceIndex {
-    map: std::collections::HashMap<String, std::path::PathBuf>,
+    map: std::collections::HashMap<(u32, u32, u32), std::path::PathBuf>,
 }
 
 impl VoiceIndex {
@@ -602,26 +630,83 @@ impl VoiceIndex {
         let mut map = std::collections::HashMap::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
-                let name = match e.file_name().into_string() {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                // "1008_0199_04.OGG" -> "1008_0199"
-                let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name);
-                let mut parts = stem.splitn(3, '_');
-                let key = match (parts.next(), parts.next()) {
-                    (Some(a), Some(b)) => format!("{}_{}", a, b),
-                    _ => continue,
-                };
-                map.entry(key).or_insert_with(|| e.path());
+                let name = e.file_name().to_string_lossy().into_owned();
+                let Some((stem, ext)) = name.rsplit_once('.') else { continue };
+                if !ext.eq_ignore_ascii_case("ogg") { continue; }
+                let parts: Vec<_> = stem.split('_').collect();
+                if parts.len() != 3 { continue; }
+                if let (Ok(scene), Ok(line), Ok(character)) = (parts[0].parse(), parts[1].parse(), parts[2].parse()) {
+                    map.insert((scene, line, character), e.path());
+                }
             }
         }
+        eprintln!("voice: indexed {} clips from {}", map.len(), dir.display());
         VoiceIndex { map }
     }
 
-    fn find(&self, scenario: &str, line: u32) -> Option<&std::path::Path> {
-        self.map.get(&format!("{}_{:04}", scenario, line)).map(|p| p.as_path())
+    fn find(&self, cue: vm::lscr::VoiceCue) -> Option<&std::path::Path> {
+        self.map.get(&(cue.scenario, cue.line, cue.char_id)).map(|p| p.as_path())
     }
+}
+
+fn stop_voice(mx: &audio::Mixer, voice_stream: &mut Option<usize>) {
+    if let Some(slot) = voice_stream.take() {
+        mx.stop(slot);
+    }
+}
+
+/// Start one line's voice. `page_voice` stops whatever was still playing.
+fn play_voice(
+    mx: &audio::Mixer,
+    voices: &VoiceIndex,
+    settings: &menu::Settings,
+    voice_stream: &mut Option<usize>,
+    cue: vm::lscr::VoiceCue,
+) {
+    if settings.page_voice == 1 {
+        stop_voice(mx, voice_stream);
+    }
+    let muted = menu::char_row_of(cue.char_id)
+        .map(|row| settings.char_voice[row] == 0)
+        .unwrap_or(false);
+    if muted {
+        return;
+    }
+    if let Some(vf) = voices.find(cue) {
+        eprintln!("  voice: {}", vf.display());
+        let slot = mx.play_cat(&vf.to_string_lossy(), 1.0, false, crate::audio::mixer::CAT_VOICE);
+        if slot != usize::MAX {
+            *voice_stream = Some(slot);
+        }
+    } else {
+        eprintln!(
+            "  voice: MISSING {}_{:04}_{:02}.OGG",
+            cue.scenario, cue.line, cue.char_id
+        );
+    }
+}
+
+/// Load one of the game's `.AMP` colour curves by name (case-insensitive).
+fn load_tint(dirs: &[&std::path::Path], name: &str) -> Option<Vec<u8>> {
+    let want = name.to_ascii_lowercase();
+    for dir in dirs {
+        // exact first, then a case-insensitive scan (sepia.AMP vs sepia.amp)
+        if let Ok(d) = std::fs::read(dir.join(name)) {
+            return Some(d);
+        }
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if let Ok(n) = e.file_name().into_string() {
+                    if n.to_ascii_lowercase() == want {
+                        if let Ok(d) = std::fs::read(e.path()) {
+                            return Some(d);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Build a solid-color fallback background image.
@@ -631,6 +716,86 @@ fn solid_bg(w: u32, h: u32, color: [u8; 3]) -> codec::tga::TgaImage {
         rgba.extend_from_slice(&[color[0], color[1], color[2], 255]);
     }
     codec::tga::TgaImage { width: w, height: h, rgba }
+}
+
+/// Standing-character stage slots. K16's first value is the slot: 0/1/2 are
+/// the usual left/centre/right, 3/4 stand further out, and 7–10 are the back
+/// row used in group shots. Clamping everything above 2 onto the right slot
+/// stacked people who should have been standing apart.
+const SPRITE_SLOTS: usize = 11;
+/// Horizontal centre of each slot, in 1280-wide screen coordinates.
+const SPRITE_ANCHORS: [i32; SPRITE_SLOTS] = [
+    320, 640, 960, // 0 left, 1 centre, 2 right
+    140, 1140, // 3 far left, 4 far right
+    640, 640, // 5, 6 (unused by the scripts)
+    220, 500, 780, 1060, // 7–10 back row
+];
+/// Paint the back row and the outer pair before the front three, so a group
+/// shot doesn't hide the people standing behind.
+const SPRITE_DRAW_ORDER: [usize; SPRITE_SLOTS] = [7, 8, 9, 10, 3, 4, 5, 6, 0, 1, 2];
+
+/// Background file index for the ACT146/147 ids.
+///
+/// Files are named `b{id:04}{variant:02}.tga` (id 1004 variant 0 -> b100400.tga,
+/// id 1014 variant 10 -> b101410.tga). A few ids only ship one variant
+/// (b104402.tga with no b104400.tga), so each id keeps a fallback entry, with
+/// the `00` variant preferred.
+struct BgIndex {
+    by_name: std::collections::HashMap<String, String>,
+    by_id: std::collections::HashMap<u32, String>,
+}
+
+impl BgIndex {
+    fn build(dirs: &[&std::path::Path]) -> BgIndex {
+        use std::collections::hash_map::Entry;
+        let mut by_name = std::collections::HashMap::new();
+        let mut by_id = std::collections::HashMap::new();
+        for dir in dirs {
+            let rd = match std::fs::read_dir(dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for e in rd.flatten() {
+                let name = match e.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let lower = name.to_ascii_lowercase();
+                if !lower.starts_with('b') || !lower.ends_with(".tga") {
+                    continue;
+                }
+                let digits = lower[1..lower.len() - 4].to_string();
+                if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                let id: u32 = digits[..4].parse().unwrap_or(0);
+                by_name.entry(lower).or_insert_with(|| name.clone());
+                match by_id.entry(id) {
+                    Entry::Vacant(v) => {
+                        v.insert(name.clone());
+                    }
+                    Entry::Occupied(mut o) => {
+                        if digits.ends_with("00") {
+                            o.insert(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        BgIndex { by_name, by_id }
+    }
+
+    /// `b{id:04}{variant:02}.tga`, else any file of that id.
+    fn resolve(&self, id: i64, variant: u32) -> Option<String> {
+        if id <= 0 {
+            return None;
+        }
+        let exact = format!("b{:04}{:02}.tga", id, variant);
+        if let Some(n) = self.by_name.get(&exact) {
+            return Some(n.clone());
+        }
+        self.by_id.get(&(id as u32)).cloned()
+    }
 }
 
 /// Where every kind of media comes from for one play session.
@@ -651,6 +816,8 @@ struct Session {
     movie_dir: std::path::PathBuf,
     voice_dir: Option<std::path::PathBuf>,
     bgm: Option<String>,
+    /// ACT146/147 background id -> file index.
+    bg_index: BgIndex,
 }
 
 impl Session {
@@ -663,6 +830,7 @@ impl Session {
             movie_dir: d.movie(),
             voice_dir: Some(d.voice()),
             bgm,
+            bg_index: BgIndex::build(&[&d.bg()]),
         }
     }
 
@@ -679,25 +847,71 @@ impl Session {
 
 /// Full game loop: play scenes starting from `start_id`, following CATCH jumps
 /// and presenting choices to the player.
-fn run_game(
+/// Play from the start of a scene.
+pub fn run_game(
     win: &mut sdl2::Sdl,
     font: &render::Font,
     s: &Session,
     start_id: &str,
 ) -> Result<(), String> {
+    // Loop so that loading a save slot from the command bar restarts the run
+    // at the loaded position instead of ending the game.
+    let mut resume: Option<save::SaveState> = None;
+    loop {
+        match run_game_at(win, font, s, resume, start_id)? {
+            None => return Ok(()),
+            Some(snap) => resume = Some(snap),
+        }
+    }
+}
+
+/// Resume from a save slot.
+pub fn run_game_from(
+    win: &mut sdl2::Sdl,
+    font: &render::Font,
+    s: &Session,
+    snap: save::SaveState,
+) -> Result<(), String> {
+    let mut resume = Some(snap);
+    let scene = resume.as_ref().unwrap().scene.clone();
+    loop {
+        match run_game_at(win, font, s, resume, &scene)? {
+            None => return Ok(()),
+            Some(st) => resume = Some(st),
+        }
+    }
+}
+
+/// `resume` rebuilds the state of a save slot before the first scene runs.
+fn run_game_at(
+    win: &mut sdl2::Sdl,
+    font: &render::Font,
+    s: &Session,
+    resume: Option<save::SaveState>,
+    start_id: &str,
+) -> Result<Option<save::SaveState>, String> {
+    let mut resume = resume;
     let script_dir = s.script_dir.as_path();
     let bg_dir = s.bg_dir.as_path();
     let voice_dir = s.voice_dir.as_deref();
     let bgm_path = s.bgm.as_deref();
     const W: u32 = 1280;
     const H: u32 = 720;
+    // Function buttons (sys_00010) and the message-window frame (sys_00000).
+    let bar = cmdbar::CmdBar::load(&s.bg_dirs());
+    let msg_plate = load_background(&s.bg_dirs(), "sys_00001.tga");
+    let msg_frame = load_background(&s.bg_dirs(), "sys_00000.tga");
+    let mut cmd_auto = false;
+    let mut cmd_skip = false;
+    // Lines already shown, for the 履历 (backlog) screen.
+    let mut backlog: Vec<String> = Vec::new();
     let mut current_id = start_id.to_string();
     // Black until the script sets one: WA2 opens on a black screen (the IC
     // prologue's "sepia.AMP" is a color-filter LUT, not a background image).
     let mut bg = solid_bg(W, H, [0, 0, 0]);
 
     // Start BGM if requested (and keep mixer for voice playback).
-    let mut mixer = if bgm_path.is_some() || voice_dir.is_some() {
+    let mixer = if bgm_path.is_some() || voice_dir.is_some() || s.script_dir.parent().map(|p| p.join("bgm").is_dir() || p.join("se").is_dir()).unwrap_or(false) {
         match audio::Mixer::new(win) {
             Some(mx) => {
                 if let Some(bgm) = bgm_path {
@@ -720,6 +934,22 @@ fn run_game(
     // Voice files are indexed once: the directory holds ~39k entries and the
     // old code scanned it for every single line.
     let voices = voice_dir.map(VoiceIndex::build);
+    // Player settings (option screen / wa2.ini).
+    let mut settings = menu::Settings::load();
+    menu::apply(&settings, mixer.as_ref());
+
+    let mut bgm_track: Option<(i32, usize)> = None;
+    let mut fading_bgm: Option<usize> = None;
+    let mut voice_stream: Option<usize> = None;
+    // Voice of the line on screen while skip is running. Skip does not play
+    // it; turning skip off does, so the clip matches the text.
+    let mut skipped_voice: Option<vm::lscr::VoiceCue> = None;
+    let mut se_channels = std::collections::HashMap::<i32, usize>::new();
+    // SE channels that are fading out (ACT166) but still audible. Without this
+    // the slot leaves `se_channels` immediately, so a new SE on the same channel
+    // plays *on top of* the fading one - the BGM path keeps `fading_bgm` for
+    // exactly this reason.
+    let mut fading_se = std::collections::HashMap::<i32, usize>::new();
 
     let mut cur_surf = render::render_scene(&bg, "", font, W, H);
     let mut bank = s.sprite_dir.as_ref().filter(|p| p.is_dir()).map(|dir| {
@@ -729,14 +959,98 @@ fn run_game(
     if bank.is_none() {
         eprintln!("note: no sprite directory - character sprites disabled");
     }
-    let mut sprites: Vec<ActiveSprite> = Vec::new();
+    // Standing sprites live in numbered stage slots (K16's first value): slot 0
+    // left, 1 centre, 2 right. Slots are reused as characters move around.
+    let mut slots: [Option<ActiveSprite>; SPRITE_SLOTS] = Default::default();
+    // Active `.AMP` colour curve (sepia flashbacks, negative, ...).
+    let mut tint: Option<Vec<u8>> = None;
     let mut focus: Option<u32> = None;
+    // 「ウィンドウ一時消去」: when false, the dialog box and its text are hidden
+    // (the scene art stays). Toggled by the bottom command bar.
+    let mut window = true;
+    // Only these three are extra bookkeeping for save/load. The dialog box is
+    // not state - `cur_surf` holds the composited pixels but not the string -
+    // and the decoded background/tint cannot be stored, so their ids and names
+    // are kept next to them and re-resolved when a save is loaded.
+    let mut last_text = String::new();
+    let mut last_speaker: Option<String> = None;
+    let mut tint_name: Option<String> = None;
+    let mut bg_id: Option<(i64, u32)> = None;
+    // ---- resume from a save slot ----------------------------------------
+    if let Some(snap) = resume.as_ref() {
+        current_id = snap.scene.clone();
+        bg_id = snap.bg;
+        if let Some((id, variant)) = snap.bg {
+            if let Some(name) = s.bg_index.resolve(id, variant) {
+                if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                    bg = img;
+                }
+            }
+        }
+        tint_name = snap.tint.clone();
+        if let Some(name) = snap.tint.as_deref() {
+            tint = load_tint(&s.bg_dirs(), name);
+        }
+        for (i, entry) in snap.slots.iter().enumerate() {
+            let (char_id, name) = match entry {
+                Some(e) => e,
+                None => continue,
+            };
+            if let Some(img) = bank.as_mut().and_then(|b| b.get(name)).cloned() {
+                slots[i] = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img });
+            }
+        }
+        focus = snap.focus;
+        let (saved_name, saved_body) = split_saved_line(&snap.text);
+        last_text = saved_body;
+        last_speaker = snap
+            .vm
+            .speaker
+            .as_ref()
+            .map(|(n, _)| n.clone())
+            .or(saved_name);
+        // BGM comes back by id: the mixer slot it was playing on is gone.
+        if let (Some(mx), Some(id)) = (mixer.as_ref(), snap.bgm) {
+            let dir = script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
+            let stem = format!("BGM_{:03}", id);
+            let path = [format!("{}.OGG", stem), format!("{}_A.OGG", stem)]
+                .into_iter()
+                .map(|n| dir.join(n))
+                .find(|p| p.is_file());
+            if let Some(path) = path {
+                let slot = mx.play_cat(
+                    &path.to_string_lossy(),
+                    1.0,
+                    true,
+                    crate::audio::mixer::CAT_BGM,
+                );
+                if slot != usize::MAX {
+                    bgm_track = Some((id, slot));
+                }
+            }
+        }
+        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
+        win.present(&cur_surf);
+        eprintln!("load: scene {} at pc {}", current_id, snap.vm.pc);
+        // The save was taken while the engine waited for input, and `pc` is
+        // already past that wait, so the saved line has to be shown and waited
+        // on here - otherwise the interpreter would run straight into the next
+        // line and the player would never see where they left off.
+        if auto_text {
+            win.delay(300);
+        } else {
+            match wait_input(win) {
+                sdl2::Input::Quit => return Ok(None),
+                _ => {}
+            }
+        }
+    }
     loop {
         let prog = match load_program(script_dir, &current_id) {
             Some(p) => p,
             None => {
                 eprintln!("scene {} not found (.bnr/.txt)", current_id);
-                return Ok(());
+                return Ok(None);
             }
         };
         eprintln!(
@@ -747,37 +1061,68 @@ fn run_game(
             prog.entry
         );
         let mut it = vm::lscr::Interp::new(&prog);
+        // The saved position belongs to the first scene only; a later scene
+        // change means the player moved on, so it starts from its entry point.
+        if let Some(snap) = resume.take() {
+            it.restore(snap.vm);
+        }
         loop {
             match it.next_event() {
-                vm::lscr::Event::Text { text, speaker, voice_tok } => {
+                vm::lscr::Event::Text { text, speaker, voice } => {
                     let body = clean_text(&text);
-                    let display = match speaker {
-                        Some(sp) => format!("【{}】\n{}", sp, body),
-                        None => body,
-                    };
-                    // Voice playback keyed by the speaker token index.
-                    if let (Some(vi), Some(vt), Some(mx)) = (voices.as_ref(), voice_tok, mixer.as_ref()) {
-                        if let Some(vf) = vi.find(&current_id, vt) {
-                            mx.play(&vf.to_string_lossy(), 1.0, false);
+                    let muted = voice
+                        .and_then(|c| menu::char_row_of(c.char_id))
+                        .map(|row| settings.char_voice[row] == 0)
+                        .unwrap_or(false);
+                    let cue = voice.filter(|_| !muted);
+                    if cmd_skip {
+                        // Starting a clip per skipped line piles ffmpeg jobs up
+                        // across a scene change, and the one still audible is
+                        // no longer the line on screen.
+                        skipped_voice = cue;
+                        if let Some(mx) = mixer.as_ref() {
+                            stop_voice(mx, &mut voice_stream);
+                        }
+                    } else if let (Some(mx), Some(vi), Some(cue)) = (mixer.as_ref(), voices.as_ref(), cue) {
+                        skipped_voice = None;
+                        play_voice(mx, vi, &settings, &mut voice_stream, cue);
+                    } else if settings.page_voice == 1 {
+                        skipped_voice = None;
+                        if let Some(mx) = mixer.as_ref() {
+                            stop_voice(mx, &mut voice_stream);
                         }
                     }
-                    cur_surf = draw_scene(&bg, &display, font, &sprites, focus, W, H);
+                    cur_surf = draw_scene(&bg, &body, speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
                     win.present(&cur_surf);
+                    // Remember the current line for save (last_text) and backlog.
+                    last_speaker = speaker.clone();
+                    last_text = body.clone();
+                    let logged = match &speaker {
+                        Some(sp) => format!("{}：{}", sp, body),
+                        None => body.clone(),
+                    };
+                    backlog.push(logged);
+                    if backlog.len() > 200 { backlog.remove(0); }
                 }
-                vm::lscr::Event::Sprite { char_id, series, variant } => {
+                vm::lscr::Event::Sprite { char_id, series, variant, slot } => {
                     if let Some(bank) = bank.as_mut() {
                         if let Some(name) = bank.resolve(char_id, series, variant) {
                             if let Some(img) = bank.get(&name) {
                                 let img = img.clone();
-                                eprintln!("  sprite: {} (char {})", name, char_id);
-                                if let Some(sp) = sprites.iter_mut().find(|s| s.char_id == char_id) {
-                                    sp.img = img;
-                                    sp.name = name;
-                                } else {
-                                    if sprites.len() >= 3 {
-                                        sprites.remove(0);
+                                let idx = slot as usize;
+                                // One character occupies one slot. Moving them
+                                // (雪菜 from 2 to 1, and so on) has to clear
+                                // the place they just left.
+                                for s in slots.iter_mut() {
+                                    if s.as_ref().is_some_and(|a| a.char_id == char_id) {
+                                        *s = None;
                                     }
-                                    sprites.push(ActiveSprite { char_id, name, img });
+                                }
+                                if let Some(dst) = slots.get_mut(idx) {
+                                    eprintln!("  sprite: {} (char {}, slot {})", name, char_id, idx);
+                                    *dst = Some(ActiveSprite { char_id, name, img });
+                                } else {
+                                    eprintln!("  sprite: slot {} out of range", idx);
                                 }
                             }
                         } else {
@@ -785,35 +1130,194 @@ fn run_game(
                         }
                     }
                 }
+                vm::lscr::Event::SpriteExit { char_id, frames } => {
+                    let before = slots.iter().flatten().filter(|a| a.char_id == char_id).count();
+                    for s in slots.iter_mut() {
+                        if s.as_ref().is_some_and(|a| a.char_id == char_id) {
+                            *s = None;
+                        }
+                    }
+                    eprintln!("  sprite exit: char {} ({}f, removed {})", char_id, frames, before);
+                }
                 vm::lscr::Event::SpriteFocus { char_id } => {
                     focus = Some(char_id);
                 }
-                vm::lscr::Event::Bg { name } => {
-                    // `.AMP` tokens are palette/effect tints we do not apply; the
-                    // empty token clears to black.
-                    if name.is_empty() {
-                        eprintln!("  bg: <black>");
-                        bg = solid_bg(W, H, [0, 0, 0]);
-                    } else if name.to_ascii_lowercase().ends_with(".tga") {
-                        match load_background(&s.bg_dirs(), &name) {
-                            Some(img) => {
-                                eprintln!("  bg: {} ({}x{})", name, img.width, img.height);
-                                bg = img;
+                vm::lscr::Event::Tint { name } => {
+                    // Colour filter only - the background stays as it is.
+                    tint_name = if name.is_empty() { None } else { Some(name.clone()) };
+                    tint = if name.is_empty() {
+                        eprintln!("  tint: <none>");
+                        None
+                    } else {
+                        let dirs = s.bg_dirs();
+                        match load_tint(&dirs, &name) {
+                            Some(lut) => {
+                                eprintln!("  tint: {} ({} bytes)", name, lut.len());
+                                Some(lut)
                             }
-                            // Missing files are the norm for the overlay layers of
-                            // a layered CG (`v100200_bg.tga` etc. ship only inside
-                            // the base image), so say so once instead of silently
-                            // keeping the previous background.
-                            None => eprintln!("  bg: {} NOT FOUND", name),
+                            None => {
+                                eprintln!("  tint: {} NOT FOUND", name);
+                                None
+                            }
+                        }
+                    };
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
+                    win.present(&cur_surf);
+                }
+                vm::lscr::Event::BgScene { id, variant, frames } => {
+                    // ACT146/147: the real background op. 0 and -2 mean black.
+                    bg_id = if id == 0 || id == -2 { None } else { Some((id, variant)) };
+                    if id == 0 || id == -2 {
+                        eprintln!("  bg: <black> (id {})", id);
+                        bg = solid_bg(W, H, [0, 0, 0]);
+                    } else if let Some(name) = s.bg_index.resolve(id, variant) {
+                        if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                            eprintln!("  bg: {} (id {} var {} fade {}f)", name, id, variant, frames);
+                            bg = img;
                         }
                     } else {
-                        eprintln!("  bg: {} (effect, ignored)", name);
+                        eprintln!("  bg: id {} var {} has no file, keeping current", id, variant);
                     }
-                    cur_surf = draw_scene(&bg, "", font, &sprites, focus, W, H);
-                    // Show it immediately: a background change is a visible event
-                    // on its own (the original engine repaints here), and the next
-                    // script op may be a movie that takes over the screen.
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
                     win.present(&cur_surf);
+                }
+                vm::lscr::Event::Overlay { name, slot } => {
+                    // Items / effect plates / composite-CG layers. Layered
+                    // rendering is not implemented yet, so this only records it.
+                    eprintln!("  overlay: slot {} {}", slot, name);
+                }
+                vm::lscr::Event::WaitFrames(n) => {
+                    // Scripted pause (camera holds, fades). Skip mode does not
+                    // sit through it: a new scene often opens with one of
+                    // these, and the button would ignore clicks until it ended.
+                    if !cmd_skip {
+                        let total = std::time::Duration::from_secs_f64(n as f64 / 60.0);
+                        let t0 = std::time::Instant::now();
+                        while t0.elapsed() < total && !cmd_skip {
+                            match win.poll_input() {
+                                sdl2::Input::Quit => return Ok(None),
+                                sdl2::Input::Pointer { x, y, pressed: true } => {
+                                    let (sx, sy) = win.surface_pos(x, y, W, H);
+                                    if bar.hit(sx, sy) == Some(cmdbar::Cmd::Skip) {
+                                        cmd_skip = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            win.delay(16);
+                        }
+                    }
+                }
+                vm::lscr::Event::Sound { opcode, args } => {
+                    let arg = |i: usize| args.get(i).copied().unwrap_or(0);
+                    let root = s.script_dir.parent().unwrap_or(std::path::Path::new("."));
+                    let volume = |v: i32| v.clamp(0, 255) as f32 / 255.0;
+                    if let Some(mx) = mixer.as_ref() {
+                        match opcode {
+                            158 if args.len() >= 4 => {
+                                let id = arg(0);
+                                if id < 0 {
+                                    if let Some((_, slot)) = bgm_track.take() { mx.fade(slot, 0.0, arg(1), true); }
+                                } else if let Some((_, slot)) = bgm_track.filter(|(old, _)| *old == id) {
+                                    mx.fade(slot, volume(arg(3)), arg(1), false);
+                                } else {
+                                    if let Some(slot) = fading_bgm.take() { mx.stop(slot); }
+                                    if let Some((_, slot)) = bgm_track.take() {
+                                        mx.fade(slot, 0.0, if arg(1) == -2 { 15 } else { arg(1) }, true);
+                                        fading_bgm = Some(slot);
+                                    }
+                                    let dir = root.join("bgm");
+                                    let stem = format!("BGM_{:03}", id);
+                                    let path = [format!("{}.OGG", stem), format!("{}_{}.OGG", stem, if arg(4) != 0 { "B" } else { "A" })]
+                                        .into_iter().map(|name| dir.join(name)).find(|p| p.is_file());
+                                    if let Some(path) = path {
+                                        let slot = mx.play_cat(&path.to_string_lossy(), if arg(1) > 0 { 0.0 } else { volume(arg(3)) }, arg(2) != 0, crate::audio::mixer::CAT_BGM);
+                                        if slot != usize::MAX {
+                                            mx.fade(slot, volume(arg(3)), arg(1), false);
+                                            bgm_track = Some((id, slot));
+                                            eprintln!("  BGM: ACT158 track {} -> {}", id, path.display());
+                                        }
+                                    } else { eprintln!("  BGM: missing track {}", id); }
+                                }
+                            }
+                            159 => { if let Some((_, slot)) = bgm_track.take() { mx.fade(slot, 0.0, arg(0), true); } }
+                            161 => { if let Some((_, slot)) = bgm_track { mx.fade(slot, volume(arg(0)), arg(1), false); } }
+                            165 if arg(5) == 2 => {
+                                // Original 0x40f2d0 updates the existing decoder in mode 2.
+                                if let Some(&slot) = se_channels.get(&arg(0)) {
+                                    mx.fade(slot, volume(arg(4)), arg(2), false);
+                                }
+                            }
+                            164 | 165 => {
+                                let (channel, id, frames, looping, vol) = if opcode == 164 {
+                                    (None, arg(0), 0, false, arg(1))
+                                } else { (Some(arg(0)), arg(1), arg(2), arg(3) == 1, arg(4)) };
+                                if let Some(ch) = channel {
+                                    if let Some(slot) = se_channels.remove(&ch) { mx.stop(slot); }
+                                    // The channel may still be fading out from an ACT166.
+                                    if let Some(slot) = fading_se.remove(&ch) { mx.stop(slot); }
+                                }
+                                let dir = root.join("se");
+                                let stem = format!("SE_{:04}", id);
+                                let path = ["WAV", "OGG", "wav", "ogg"].into_iter()
+                                    .map(|ext| dir.join(format!("{}.{}", stem, ext))).find(|p| p.is_file());
+                                if let Some(path) = path {
+                                    let slot = mx.play_cat(&path.to_string_lossy(), if frames > 0 { 0.0 } else { volume(vol) }, looping, crate::audio::mixer::CAT_SE);
+                                    if slot != usize::MAX {
+                                        mx.fade(slot, volume(vol), frames, false);
+                                        if let Some(ch) = channel { se_channels.insert(ch, slot); }
+                                        eprintln!("  SE: ACT{} ch={:?} id={} -> {}", opcode, channel, id, path.display());
+                                    }
+                                } else { eprintln!("  SE: missing {}", id); }
+                            }
+                            166 => {
+                                if let Some(slot) = se_channels.remove(&arg(0)) {
+                                    mx.fade(slot, 0.0, arg(1), true);
+                                    // Keep tracking it until the fade finishes so a
+                                    // restart on this channel can stop it first.
+                                    fading_se.insert(arg(0), slot);
+                                }
+                            }
+                            167 => { if let Some(&slot) = se_channels.get(&arg(0)) { mx.fade(slot, volume(arg(1)), arg(2), false); } }
+                            162 | 163 | 169 => {
+                                let slot = if opcode == 169 { se_channels.get(&arg(0)).copied() }
+                                    else { bgm_track.map(|(_, slot)| slot).or(fading_bgm) };
+                                if let Some(slot) = slot {
+                                    while !cmd_skip && if opcode == 163 { !mx.finished(slot) } else { !mx.settled(slot) } {
+                                        match win.poll_input() {
+                                            sdl2::Input::Quit => return Ok(None),
+                                            sdl2::Input::Pointer { x, y, pressed: true } => {
+                                                let (sx, sy) = win.surface_pos(x, y, W, H);
+                                                if bar.hit(sx, sy) == Some(cmdbar::Cmd::Skip) {
+                                                    cmd_skip = true;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        win.delay(16);
+                                    }
+                                }
+                            }
+                            168 => {
+                                if let Some(&slot) = se_channels.get(&arg(0)) {
+                                    while !cmd_skip && !mx.finished(slot) {
+                                        match win.poll_input() {
+                                            sdl2::Input::Quit => return Ok(None),
+                                            sdl2::Input::Pointer { x, y, pressed: true } => {
+                                                let (sx, sy) = win.surface_pos(x, y, W, H);
+                                                if bar.hit(sx, sy) == Some(cmdbar::Cmd::Skip) {
+                                                    cmd_skip = true;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        win.delay(16);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 vm::lscr::Event::Movie { name } => {
                     eprintln!("  movie: {}", name);
@@ -836,14 +1340,23 @@ fn run_game(
                     // screen band is known and can be used for pointer hit testing.
                     // Render the plain frame once and copy it per frame - a full
                     // re-render is far too slow to repeat while the mouse moves.
-                    let cell = font.cell() as i32;
-                    let line_h = cell + 4;
-                    let box_h = (H / 4).max(140);
-                    let box_y = (H - box_h - 24) as i32;
-                    let opt_top = |i: usize| box_y + 18 + (i as i32 + 1) * line_h;
-                    let base = draw_scene(&bg, &body, font, &sprites, focus, W, H);
+                    let line_h = if msg_plate.is_some() {
+                        render::DIALOG_LINE
+                    } else {
+                        font.cell() as i32 + 4
+                    };
+                    // Same origin render_scene_ex uses once the game window is up.
+                    let text_y = if msg_plate.is_some() {
+                        render::DIALOG_TEXT_Y
+                    } else {
+                        let box_h = (H / 4).min(160).max(120);
+                        (H - box_h - 44) as i32 + 18
+                    };
+                    let opt_top = |i: usize| text_y + (i as i32 + 1) * line_h;
+                    let base = draw_scene(&bg, &body, None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
                     let mut hover: Option<usize> = None;
-                    cur_surf = draw_scene(&bg, &body, font, &sprites, focus, W, H);
+                    let mut bar_hover: Option<cmdbar::Cmd> = None;
+                    cur_surf = draw_scene(&bg, &body, None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
                     win.present(&cur_surf);
                     eprintln!(
                         "  choice: presenting {} options (click one, or press 1-{})",
@@ -862,26 +1375,97 @@ fn run_game(
                             };
                             if let Some(i) = hover {
                                 let y = opt_top(i) - 6;
-                                frame.fill_rect(40, y, W - 80, (line_h + 4) as u32, [130, 190, 255, 70]);
+                                let (hx, hw) = if msg_plate.is_some() {
+                                    (
+                                        render::DIALOG_TEXT_X - 16,
+                                        (render::DIALOG_TEXT_RIGHT - render::DIALOG_TEXT_X + 32) as u32,
+                                    )
+                                } else {
+                                    (40, W - 80)
+                                };
+                                frame.fill_rect(hx, y, hw, (line_h + 4) as u32, [130, 190, 255, 70]);
                             }
+                            let active = cmdbar::Active { auto: cmd_auto, skip: cmd_skip, hide: !window };
+                            bar.draw(&mut frame, bar_hover, active);
                             win.present(&frame);
                             match win.poll_input() {
-                                sdl2::Input::Quit => return Ok(()),
+                                sdl2::Input::Quit => return Ok(None),
                                 sdl2::Input::Choice(n) if (n as usize) <= opts.len() => {
                                     break n as u32
                                 }
                                 sdl2::Input::Pointer { x, y, pressed } => {
-                                    let (_, sy) = win.surface_pos(x, y, W, H);
-                                    let hit = (0..opts.len()).find(|i| {
-                                        sy >= opt_top(*i) - 6 && sy < opt_top(*i) + line_h
-                                    });
-                                    hover = hit;
-                                    if pressed {
-                                        if let Some(i) = hit {
-                                            break (i + 1) as u32;
+                                    let (sx, sy) = win.surface_pos(x, y, W, H);
+                                    // Command bar takes priority over the choices.
+                                    if let Some(cmd) = bar.hit(sx, sy) {
+                                        if pressed {
+                                            match cmd {
+                                                cmdbar::Cmd::Auto => cmd_auto = !cmd_auto,
+                                                cmdbar::Cmd::Skip => {
+                                                    cmd_skip = !cmd_skip;
+                                                    if let Some(mx) = mixer.as_ref() {
+                                                        if cmd_skip {
+                                                            stop_voice(mx, &mut voice_stream);
+                                                        } else if let (Some(cue), Some(vi)) = (skipped_voice.take(), voices.as_ref()) {
+                                                            play_voice(mx, vi, &settings, &mut voice_stream, cue);
+                                                        }
+                                                    }
+                                                },
+                                                cmdbar::Cmd::Hide => {
+                                                    window = !window;
+                                                    cur_surf = draw_scene(
+                                                        &bg,
+                                                        &last_text,
+                                                        last_speaker.as_deref(),
+                                                        font,
+                                                        &slots,
+                                                        focus,
+                                                        W,
+                                                        H,
+                                                        tint.as_deref(),
+                                                        window,
+                                                        msg_plate.as_ref(), msg_frame.as_ref(),
+                                                    );
+                                                }
+                                                other => match handle_cmd(
+                                                    other,
+                                                    win,
+                                                    font,
+                                                    s,
+                                                    &mut settings,
+                                                    mixer.as_ref(),
+                                                    &it,
+                                                    &current_id,
+                                                    bg_id,
+                                                    &tint_name,
+                                                    &slots,
+                                                    focus,
+                                                    &last_text,
+                                                    bgm_track.map(|(id, _)| id),
+                                                    &cur_surf,
+                                                    &backlog,
+                                                ) {
+                                                    CmdOutcome::Loaded(st) => return Ok(Some(st)),
+                                                    CmdOutcome::Quit => return Ok(None),
+                                                    CmdOutcome::Stay => {}
+                                                },
+                                            }
+                                        } else {
+                                            bar_hover = Some(cmd);
                                         }
+                                        win.delay(16);
+                                    } else {
+                                        let hit = (0..opts.len()).find(|i| {
+                                            sy >= opt_top(*i) - 6 && sy < opt_top(*i) + line_h
+                                        });
+                                        hover = hit;
+                                        bar_hover = None;
+                                        if pressed {
+                                            if let Some(i) = hit {
+                                                break (i + 1) as u32;
+                                            }
+                                        }
+                                        win.delay(16);
                                     }
-                                    win.delay(16);
                                 }
                                 _ => win.delay(16),
                             }
@@ -892,31 +1476,332 @@ fn run_game(
                 }
 
                 vm::lscr::Event::Wait => {
-                    win.present(&cur_surf);
-                    if auto_text {
-                        // auto-advance mode (demo / verification): keep stepping
-                        win.delay(40);
-                    } else {
-                        match wait_input(win) {
-                            sdl2::Input::Quit => return Ok(()),
-                            _ => {}
+                    // Always draw the command bar, even in auto-advance modes, so
+                    // the player can toggle auto/skip off or open save/load/config.
+                    let mut cmd_hover: Option<cmdbar::Cmd> = None;
+                    let mut dwell: u32 = 0;
+                    'wait: loop {
+                            let mut frame = render::Surface {
+                                width: cur_surf.width,
+                                height: cur_surf.height,
+                                pixels: cur_surf.pixels.clone(),
+                            };
+                            let active = cmdbar::Active {
+                                auto: cmd_auto,
+                                skip: cmd_skip,
+                                hide: !window,
+                            };
+                            bar.draw(&mut frame, cmd_hover, active);
+                            win.present(&frame);
+                            match win.poll_input() {
+                                sdl2::Input::Quit => return Ok(None),
+                                sdl2::Input::RightClick => {
+                                    match settings.r_click {
+                                        1 => {
+                                            let dirs = s.bg_dirs();
+                                            let mut st = menu::Settings::load();
+                                            menu::run(win, &dirs, &mut st, mixer.as_ref());
+                                            settings = menu::Settings::load();
+                                            menu::apply(&settings, mixer.as_ref());
+                                        }
+                                        2 => {
+                                            let st = make_save(
+                                                &it,
+                                                &current_id,
+                                                bg_id,
+                                                tint_name.clone(),
+                                                &slots,
+                                                focus,
+                                                &last_text,
+                                                bgm_track.map(|(id, _)| id),
+                                            );
+                                            saveload::run(
+                                                win,
+                                                &s.bg_dirs(),
+                                                saveload::Mode::Save,
+                                                Some(st),
+                                                Some(&cur_surf),
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                sdl2::Input::Pointer { x, y, pressed } => {
+                                    let (sx, sy) = win.surface_pos(x, y, W, H);
+                                    match bar.hit(sx, sy) {
+                                        Some(cmd) if pressed => match cmd {
+                                            cmdbar::Cmd::Auto => cmd_auto = !cmd_auto,
+                                            cmdbar::Cmd::Skip => {
+                                                cmd_skip = !cmd_skip;
+                                                if let Some(mx) = mixer.as_ref() {
+                                                    if cmd_skip {
+                                                        stop_voice(mx, &mut voice_stream);
+                                                    } else if let (Some(cue), Some(vi)) = (skipped_voice.take(), voices.as_ref()) {
+                                                        play_voice(mx, vi, &settings, &mut voice_stream, cue);
+                                                    }
+                                                }
+                                            },
+                                            cmdbar::Cmd::Hide => {
+                                                window = !window;
+                                                cur_surf = draw_scene(
+                                                    &bg,
+                                                    &last_text,
+                                                    last_speaker.as_deref(),
+                                                    font,
+                                                    &slots,
+                                                    focus,
+                                                    W,
+                                                    H,
+                                                    tint.as_deref(),
+                                                    window,
+                                                    msg_plate.as_ref(), msg_frame.as_ref(),
+                                                );
+                                            }
+                                            other => match handle_cmd(
+                                                other,
+                                                win,
+                                                font,
+                                                s,
+                                                &mut settings,
+                                                mixer.as_ref(),
+                                                &it,
+                                                &current_id,
+                                                bg_id,
+                                                &tint_name,
+                                                &slots,
+                                                focus,
+                                                &last_text,
+                                                bgm_track.map(|(id, _)| id),
+                                                &cur_surf,
+                                                &backlog,
+                                            ) {
+                                                CmdOutcome::Loaded(st) => return Ok(Some(st)),
+                                                CmdOutcome::Quit => return Ok(None),
+                                                CmdOutcome::Stay => {}
+                                            },
+                                        },
+                                        Some(c) => cmd_hover = Some(c),
+                                        None => {
+                                            cmd_hover = None;
+                                            if pressed {
+                                                break 'wait;
+                                            }
+                                        }
+                                    }
+                                },
+                                sdl2::Input::Advance => break 'wait,
+                                // No new event: keep the hover caption where it is.
+                                sdl2::Input::None => {}
+                                _ => cmd_hover = None,
+                            }
+                            if auto_text || cmd_auto || cmd_skip {
+                                dwell += 16;
+                                // Skip ignores the slider. Auto holds for the
+                                // menu's 「自动模式速度」, and a line that has
+                                // voice stays up until that voice finishes.
+                                let lim = if cmd_skip {
+                                    6
+                                } else {
+                                    menu::auto_hold_ms(settings.auto_speed, last_text.chars().count())
+                                };
+                                let voice_open = cmd_auto && !cmd_skip && voice_stream
+                                    .map(|slot| mixer.as_ref().is_some_and(|mx| !mx.finished(slot)))
+                                    .unwrap_or(false);
+                                if !voice_open && dwell >= lim {
+                                    break 'wait;
+                                }
+                            }
+                            win.delay(16);
                         }
                     }
-                }
                 vm::lscr::Event::Jump { target, kind } => {
                     eprintln!("  {} -> {}", kind, target);
+                    // The clip from the scene we just skipped must not keep
+                    // playing over the next one.
+                    if cmd_skip {
+                        skipped_voice = None;
+                        if let Some(mx) = mixer.as_ref() {
+                            stop_voice(mx, &mut voice_stream);
+                        }
+                    }
                     current_id = target;
                     // new scene: standing sprites do not carry over
-                    sprites.clear();
+                    slots = Default::default();
                     focus = None;
                     bank.as_mut().map(|b| b.cache.clear());
                     break;
                 }
                 vm::lscr::Event::End => {
                     eprintln!("scene {} ended", current_id);
-                    return Ok(());
+                    return Ok(None);
                 }
             }
+        }
+    }
+}
+
+/// Snapshot of the engine for a save slot, taken while it waits for input.
+///
+/// Only ids and names go in: the decoded background, the tint LUT, the sprite
+/// images and the mixer slots are all re-created on load.
+fn make_save(
+    it: &vm::lscr::Interp,
+    scene: &str,
+    bg: Option<(i64, u32)>,
+    tint: Option<String>,
+    slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
+    focus: Option<u32>,
+    text: &str,
+    bgm: Option<i32>,
+) -> save::SaveState {
+    save::SaveState {
+        scene: scene.to_string(),
+        vm: it.snapshot(),
+        bg,
+        tint,
+        slots: slots
+            .iter()
+            .map(|s| s.as_ref().map(|a| (a.char_id, a.name.clone())))
+            .collect(),
+        focus,
+        text: text.to_string(),
+        bgm,
+        time: save::now(),
+        flags: Vec::new(),
+    }
+}
+
+/// Result of handling a command-bar button that opens a modal screen.
+enum CmdOutcome {
+    /// Screen closed, keep waiting for input.
+    Stay,
+    /// A save slot was loaded: restart the run with it.
+    Loaded(save::SaveState),
+    /// Player chose to quit.
+    Quit,
+}
+
+/// Handle a command-bar button that opens a modal screen (保存/读档/设置/履历).
+/// The toggle buttons (自动/跳过/隐藏) are handled inline by the caller.
+fn handle_cmd(
+    cmd: cmdbar::Cmd,
+    win: &mut sdl2::Sdl,
+    font: &render::Font,
+    s: &Session,
+    settings: &mut menu::Settings,
+    mixer: Option<&audio::Mixer>,
+    it: &vm::lscr::Interp,
+    current_id: &str,
+    bg_id: Option<(i64, u32)>,
+    tint_name: &Option<String>,
+    slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
+    focus: Option<u32>,
+    last_text: &str,
+    bgm: Option<i32>,
+    frame: &render::Surface,
+    backlog: &[String],
+) -> CmdOutcome {
+    match cmd {
+        cmdbar::Cmd::QuickSave => {
+            let st = make_save(
+                it,
+                current_id,
+                bg_id,
+                tint_name.clone(),
+                slots,
+                focus,
+                last_text,
+                bgm,
+            );
+            if let Err(e) = st.save_to(&save::quick_path()) {
+                eprintln!("qsave: {}", e);
+            }
+            CmdOutcome::Stay
+        }
+        cmdbar::Cmd::QuickLoad => {
+            if let Some(st) = save::SaveState::load_from(&save::quick_path()) {
+                CmdOutcome::Loaded(st)
+            } else {
+                eprintln!("qload: no quick save");
+                CmdOutcome::Stay
+            }
+        }
+        cmdbar::Cmd::Save => {
+            let st = make_save(
+                it,
+                current_id,
+                bg_id,
+                tint_name.clone(),
+                slots,
+                focus,
+                last_text,
+                bgm,
+            );
+            saveload::run(win, &s.bg_dirs(), saveload::Mode::Save, Some(st), Some(frame));
+            CmdOutcome::Stay
+        }
+        cmdbar::Cmd::Load => {
+            if let Some(st) =
+                saveload::run(win, &s.bg_dirs(), saveload::Mode::Load, None, Some(frame))
+            {
+                CmdOutcome::Loaded(st)
+            } else {
+                CmdOutcome::Stay
+            }
+        }
+        cmdbar::Cmd::Config => {
+            let mut st = menu::Settings::load();
+            menu::run(win, &s.bg_dirs(), &mut st, mixer);
+            *settings = menu::Settings::load();
+            menu::apply(settings, mixer);
+            CmdOutcome::Stay
+        }
+        cmdbar::Cmd::Backlog => {
+            show_backlog(win, font, backlog);
+            CmdOutcome::Stay
+        }
+        // toggles are handled by the caller
+        _ => CmdOutcome::Stay,
+    }
+}
+
+/// 履历 (backlog) viewer: scroll through recently shown lines.
+fn show_backlog(win: &mut sdl2::Sdl, font: &render::Font, lines: &[String]) {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    if lines.is_empty() {
+        return;
+    }
+    let cell = font.cell() as i32;
+    let line_h = cell + 6;
+    let per_page = ((H as i32 - 80) / line_h) as usize;
+    let total = lines.len();
+    let mut top = total.saturating_sub(per_page).max(0);
+    loop {
+        let mut surf = render::Surface::new(W, H, [6, 8, 16, 245]);
+        surf.fill_rect(20, 16, W - 40, H - 32, [12, 16, 30, 235]);
+        surf.fill_rect(20, 16, W - 40, 2, [150, 180, 230, 255]);
+        let mut y = 40;
+        for i in top..total.min(top + per_page) {
+            font.draw(&mut surf, &lines[i], 40, y);
+            y += line_h;
+        }
+        font.draw(&mut surf, "↑/↓ 翻页 · Enter/Esc 关闭", 40, H as i32 - 36);
+        win.present(&surf);
+        match win.poll_input() {
+            sdl2::Input::Quit => return,
+            sdl2::Input::Up => {
+                if top > 0 {
+                    top -= 1;
+                }
+            }
+            sdl2::Input::Down => {
+                if top + per_page < total {
+                    top += 1;
+                }
+            }
+            sdl2::Input::Advance | sdl2::Input::Back | sdl2::Input::RightClick => return,
+            _ => win.delay(16),
         }
     }
 }
@@ -958,44 +1843,50 @@ fn find_sprite_dir(bg_dir: &std::path::Path, script_dir: &std::path::Path) -> Op
     cands.into_iter().find(|p| p.is_dir())
 }
 
-/// Character id -> candidate sprite name prefixes (romaji-first; refined from
-/// the shipped scripts). The first prefix that yields an existing char.pak
-/// entry wins.
+/// Character id -> sprite file prefix.
+///
+/// Taken from the game exe's own prefix table (the NUL-separated list at file
+/// offset 661252: `mas yan miy saw suz kiz mat ham yos ueh mhh mih aco say nak
+/// hon sat tom shi you oto mam pap chi ioo tak mar izu koh set kaz har tan`),
+/// cross-checked against every `(series, variant)` request in the shipped
+/// scripts: for ids 1,2,3,4,5,10,11,15,16,19,23,25,28 the file set matches
+/// exactly one prefix, and the rest follow the table order.
+///
+/// The previous hand-written table had 12 and 17 both pointing at `oto` (= 孝宏),
+/// which made those two characters render as the same person, and 18 at `kaz`.
 fn sprite_prefixes(cid: u32) -> &'static [&'static str] {
     match cid {
-        0 => &["har"],
-        1 => &["kaz"],
-        2 => &["set"],
-        3 => &["koh"],
-        4 => &["izu"],
-        5 => &["mar"],
-        10 => &["tak", "oto"],
-        11 => &["ioo", "tak"],
-        12 => &["oto"],
-        13 => &["pap"],
-        14 => &["oto", "mam"],
-        15 => &["tak", "oto"],
-        16 => &["you"],
-        17 => &["oto"],
-        18 => &["kaz"],
-        19 => &["tom"],
-        20 => &["Sat", "sat"],
-        21 => &["Sat"],
-        22 => &["nak"],
-        23 => &["say"],
-        24 => &["aco", "koh"],
-        25 => &["mih"],
-        27 => &["ueh", "mat"],
-        28 => &["kiz", "yos"],
-        29 => &["koh"],
-        30 => &["ham", "mat"],
-        31 => &["mat"],
-        32 => &["koh"],
-        33 => &["suz", "izu"],
+        0 => &["har"],  // 春希
+        1 => &["kaz"],  // 冬馬かずさ
+        2 => &["set"],  // 小木曽雪菜
+        3 => &["koh"],  // 杉浦小春
+        4 => &["izu"],  // 和泉千晶
+        5 => &["mar"],  // 風岡麻理
+        10 => &["tak"], // 飯塚武也
+        11 => &["ioo"], // 水沢依緒
+        12 => &["chi"], // 親志
+        13 => &["pap"], // 雪菜の父
+        14 => &["mam"], // 雪菜の母
+        15 => &["oto"], // 孝宏
+        16 => &["you"], // 冬馬曜子
+        17 => &["shi"], // 担任教師
+        19 => &["tom"], // 朋
+        20 => &["sat"], // 佐藤
+        21 => &["hon"], // 本田
+        22 => &["nak"], // 中川
+        23 => &["say"], // 早百合
+        24 => &["aco"], // 亜子
+        25 => &["mih"], // 美穂子
+        26 => &["mhh"],
+        27 => &["ueh"], // 上原
+        28 => &["yos"],
+        30 => &["ham"], // 浜田
+        31 => &["mat"], // 松岡
+        32 => &["kiz"], // 木崎
+        33 => &["suz"], // 鈴木
         34 => &["saw"],
-        35 => &["miy", "tom"],
-        36 => &["koh"],
-        37 => &["koh"],
+        35 => &["miy"],
+        36 => &["yan"],
         _ => &[],
     }
 }
@@ -1143,31 +2034,58 @@ fn sprite_x_for(idx: usize, count: usize, w: u32) -> i32 {
 fn draw_scene(
     bg: &codec::tga::TgaImage,
     text: &str,
+    speaker: Option<&str>,
     font: &render::Font,
-    sprites: &[ActiveSprite],
+    slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
     focus: Option<u32>,
     w: u32,
     h: u32,
+    tint: Option<&[u8]>,
+    // 「ウィンドウ一時消去」: false hides the dialog box and its text.
+    window: bool,
+    plate: Option<&codec::tga::TgaImage>,
+    frame: Option<&codec::tga::TgaImage>,
 ) -> render::Surface {
-    let count = sprites.len();
-    let draws: Vec<render::SpriteDraw> = sprites
+    let multi = slots.iter().filter(|s| s.is_some()).count() > 1;
+    let draws: Vec<render::SpriteDraw> = SPRITE_DRAW_ORDER
         .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let alpha = if count > 1 && focus.is_some() && focus != Some(s.char_id) {
+        .filter_map(|&i| {
+            let s = slots[i].as_ref()?;
+            // Dim the characters that are not speaking.
+            let alpha = if multi && focus.is_some() && focus != Some(s.char_id) {
                 170
             } else {
                 255
             };
-            render::SpriteDraw {
+            Some(render::SpriteDraw {
                 img: &s.img,
-                x: sprite_x_for(i, count, s.img.width),
+                x: SPRITE_ANCHORS[i] - s.img.width as i32 / 2,
                 y: (h as i32 - s.img.height as i32).max(0),
                 alpha,
-            }
+            })
         })
         .collect();
-    render::render_scene_ex(bg, text, font, w, h, &draws)
+    let mut s = render::render_scene_ex(bg, text, font, w, h, &draws, tint, window, plate, frame);
+    // The name sits on the upper rim of the oval, not inside 【】 in the line.
+    if window {
+        if let Some(name) = speaker {
+            if !name.is_empty() && plate.is_some() {
+                font.draw_pitch(&mut s, name, render::NAME_X, render::NAME_Y, render::DIALOG_PITCH);
+            }
+        }
+    }
+    s
+}
+
+/// Older saves stored the line as `【name】\nbody`. Split that so a loaded
+/// slot still puts the name on the rim.
+fn split_saved_line(text: &str) -> (Option<String>, String) {
+    if let Some(rest) = text.strip_prefix('【') {
+        if let Some((name, body)) = rest.split_once("】\n") {
+            return (Some(name.to_string()), body.to_string());
+        }
+    }
+    (None, text.to_string())
 }
 
 /// Clean scenario text for rendering: literal `\n` -> newline, `\k` removed,
@@ -1210,6 +2128,8 @@ fn clean_text(s: &str) -> String {
 /// What the title screen resolved to.
 enum TitleAction {
     Start,
+    /// Resume from a save slot picked on the load screen.
+    Load(save::SaveState),
     Quit,
 }
 
@@ -1263,6 +2183,14 @@ fn run_title(
     if menu.is_none() {
         eprintln!("title: T0100.tga not found, falling back to engine-drawn menu text");
     }
+
+    if std::env::var_os("WA2_DEBUG_INPUT").is_some() {
+        let (ww, wh) = win.window_size();
+        eprintln!("title: window_size = {}x{}", ww, wh);
+    }
+    // 「画面模式」 applies as soon as the option screen is left.
+    let startup = menu::Settings::load();
+    win.set_fullscreen(startup.win_disp == 1);
 
     let item_y = |i: usize| (Y0 + i as i32 * PITCH) as f32;
     let mut sel = 0usize;
@@ -1406,6 +2334,21 @@ fn run_title(
             }
             match sel {
                 0 => return TitleAction::Start,
+                // 「继续游戏」: the load screen. A picked slot resumes the game.
+                1 => {
+                    if let Some(snap) = saveload::run(win, bg_dirs, saveload::Mode::Load, None, None) {
+                        return TitleAction::Load(snap);
+                    }
+                    notice = None;
+                }
+                2 => {
+                    // 「系统设置」: the game's own option screen.
+                    let mut st = menu::Settings::load();
+                    menu::apply(&st, None);
+                    menu::run(win, bg_dirs, &mut st, None);
+                    win.set_fullscreen(st.win_disp == 1);
+                    notice = None;
+                }
                 4 => return TitleAction::Quit,
                 _ => notice = Some(notice_text),
             }
@@ -1451,7 +2394,7 @@ fn play_movie(win: &mut sdl2::Sdl, movie_dir: &std::path::Path, name: &str) -> O
         win.present_raw(&frame, movie.width, movie.height);
         std::thread::sleep(delay);
         match win.poll_input() {
-            sdl2::Input::None => {}
+            sdl2::Input::None | sdl2::Input::Pointer { pressed: false, .. } => {}
             _ => break,
         }
     }
@@ -1462,8 +2405,9 @@ fn play_movie(win: &mut sdl2::Sdl, movie_dir: &std::path::Path, name: &str) -> O
 fn wait_input(win: &mut sdl2::Sdl) -> sdl2::Input {
     loop {
         let ev = win.poll_input();
-        if ev != sdl2::Input::None {
-            return ev;
+        match ev {
+            sdl2::Input::None | sdl2::Input::Pointer { pressed: false, .. } => {}
+            other => return other,
         }
         win.delay(16);
     }
@@ -1485,7 +2429,7 @@ fn load_font_paths(
     cell_map: Option<&std::path::Path>,
     charset_path: Option<&std::path::Path>,
 ) -> Option<render::Font> {
-    let atlas = match std::fs::read(atlas_path).ok().and_then(|d| codec::tga::decode(&d).ok()) {
+    let atlas = match std::fs::read(atlas_path).ok().and_then(|d| codec::tga::decode_font(&d).ok()) {
         Some(i) => i,
         None => { eprintln!("error: could not decode font atlas {}", atlas_path.display()); return None; }
     };

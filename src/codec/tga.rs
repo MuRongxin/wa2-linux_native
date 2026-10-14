@@ -4,9 +4,8 @@
 //! indexed font sheets), uncompressed/RLE truecolor (CGs and sprites), and
 //! grayscale. Output is always 32-bit RGBA, top-down row order.
 //!
-//! NOTE: For White Album 2 font sheets the palette's stored alpha is not
-//! reliable (the white glyph entries have alpha 0); transparency is instead
-//! encoded as palette index 0 (fully transparent). We key on index 0.
+//! Font sheets use palette alpha for glyph coverage. Their transparent white
+//! entries must stay transparent; use `decode_font` for these masks.
 
 #[derive(Clone)]
 pub struct TgaImage {
@@ -16,6 +15,15 @@ pub struct TgaImage {
 }
 
 pub fn decode(data: &[u8]) -> Result<TgaImage, String> {
+    decode_impl(data, false)
+}
+
+/// Decode a glyph atlas with its original antialiased coverage mask.
+pub fn decode_font(data: &[u8]) -> Result<TgaImage, String> {
+    decode_impl(data, true)
+}
+
+fn decode_impl(data: &[u8], font_palette: bool) -> Result<TgaImage, String> {
     if data.len() < 18 {
         return Err("TGA too short".into());
     }
@@ -110,14 +118,12 @@ pub fn decode(data: &[u8]) -> Result<TgaImage, String> {
                     } else {
                         let entry = ci.saturating_sub(*cstart) * cb;
                         if entry + cb <= cmap.len() {
-                            // BGRA (cb==4) or BGR (cb==3) palette. Font atlases use a
-                            // black/transparent palette entry as the background (the
-                            // background index is 0 in some atlases and 2 in others),
-                            // and store glyphs as near-white entries whose palette ALPHA
-                            // is unreliable (often 0). So: black entry => transparent,
-                            // any non-black entry => opaque glyph pixel.
+                            // Glyph masks preserve palette coverage. Other indexed
+                            // game graphics keep the existing black color-key rule.
                             let (r, g, b) = (cmap[entry + 2], cmap[entry + 1], cmap[entry]);
-                            if r == 0 && g == 0 && b == 0 {
+                            if font_palette && cb == 4 {
+                                rgba.extend_from_slice(&[r, g, b, cmap[entry + 3]]);
+                            } else if r == 0 && g == 0 && b == 0 {
                                 rgba.extend_from_slice(&[0, 0, 0, 0]);
                             } else {
                                 rgba.extend_from_slice(&[r, g, b, 255]);
@@ -162,4 +168,26 @@ pub fn decode(data: &[u8]) -> Result<TgaImage, String> {
         height: height as u32,
         rgba,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn font_palette_preserves_transparent_white_and_antialiasing() {
+        let mut data = vec![0u8; 18];
+        data[1] = 1;
+        data[2] = 1;
+        data[5] = 4;
+        data[7] = 32;
+        data[12] = 3;
+        data[14] = 1;
+        data[16] = 8;
+        data[17] = 0x20;
+        data.extend_from_slice(&[0, 0, 0, 0, 255, 255, 255, 0,
+                                 255, 255, 255, 128, 255, 255, 255, 255]);
+        data.extend_from_slice(&[1, 2, 3]);
+        let font = super::decode_font(&data).unwrap();
+        assert_eq!(font.rgba, [255, 255, 255, 0, 255, 255, 255, 128,
+                               255, 255, 255, 255]);
+    }
 }

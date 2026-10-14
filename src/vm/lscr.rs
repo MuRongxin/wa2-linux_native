@@ -222,18 +222,46 @@ impl Program {
     }
 }
 
+/// Explicit voice-bank and clip identifiers carried by ACT137 / ACT138.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceCue {
+    pub scenario: u32,
+    pub line: u32,
+    pub char_id: u32,
+}
+
 /// Events raised by the interpreter; the frontend renders them.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// Display a text token (speaker name optional; voice token = speaker token).
-    Text { text: String, speaker: Option<String>, voice_tok: Option<u32> },
-    /// Set the background (empty name = clear/black).
-    Bg { name: String },
+    /// Display a text token (speaker name optional; voice identifiers from ACT138).
+    Text { text: String, speaker: Option<String>, voice: Option<VoiceCue> },
+    /// Scene background change (ACT146/ACT147).
+    ///
+    /// The record is `K30/K23 vals=(mode, id, variant, frames, 0, 0, 0,
+    /// 1280.0, 720.0)`; the image is `b{id:04}{variant:02}.tga` with a
+    /// `b{id:04}*` fallback. `id == 0` or `-2` means a black screen.
+    /// `frames` is the transition length at 60 fps.
+    BgScene { id: i64, variant: u32, frames: u32 },
+    /// Slot-based overlay graphic (ACT176): items, effect plates and layered-CG
+    /// pieces. This is *not* a background change.
+    Overlay { name: String, slot: u32 },
+    /// Timed pause (ACT194), in frames at 60 fps.
+    WaitFrames(u32),
+    /// Original executable audio commands, with their raw integer arguments.
+    Sound { opcode: u16, args: Vec<i32> },
+    /// Colour filter over the whole screen (`sepia.AMP`, `nega.amp`, or empty
+    /// to clear it). ACT172 only ever carries these - it is *not* a background
+    /// op, and treating its empty token as "clear the background" wiped the
+    /// background every time a scene dropped its tint.
+    Tint { name: String },
     /// Play a movie (token like `mv01`).
     Movie { name: String },
     /// Load/switch a character's standing sprite. The file name is
     /// `{prefix}{series:03}{variant:03}.tga` inside `char.pak`.
-    Sprite { char_id: u32, series: u32, variant: u32 },
+    Sprite { char_id: u32, series: u32, variant: u32, slot: u32 },
+    /// ACT156 `(char_id, 0, frames)`: that character leaves. `frames` is the
+    /// exit length at 60 fps.
+    SpriteExit { char_id: u32, frames: u32 },
     /// A character is now speaking (keep bright, dim the others).
     SpriteFocus { char_id: u32 },
     /// Present a choice; call `set_choice_result` with 1..=options.len().
@@ -253,7 +281,8 @@ pub struct Interp<'a> {
     ints: Vec<i32>,
     flts: Vec<f32>,
     speaker: Option<(String, u32)>,
-    voice_pending: bool,
+    pending_voice: Option<VoiceCue>,
+    voice_scenario: u32,
     options: Vec<String>,
     choice_result: u32,
     pending_b: Option<u32>,
@@ -270,6 +299,88 @@ pub struct Interp<'a> {
     /// and is followed by an empty token and the directory token, so the single
     /// `tok` field (which keeps the *last* token) is not enough.
     rec_toks: Vec<u32>,
+    /// `K30` record that selected a sprite face, waiting for the following
+    /// `K16` record (ACT154/155) to say *where* it goes on screen.
+    pending_sprite: Option<(u32, u32, u32)>,
+}
+
+/// Everything about an interpreter that has to survive a save/load round trip.
+///
+/// `Interp` also borrows the `Program`; that is reloaded from the script files
+/// when a save is loaded (`load_program`), so it is deliberately not part of
+/// this. Every field here is plain data, and `pc` is an index into
+/// `Program::ops`, which is rebuilt identically on every load.
+#[derive(Clone, Debug)]
+pub struct InterpState {
+    pub pc: usize,
+    pub tok: Option<u32>,
+    pub ints: Vec<i32>,
+    pub flts: Vec<f32>,
+    pub speaker: Option<(String, u32)>,
+    pub pending_voice: Option<VoiceCue>,
+    pub voice_scenario: u32,
+    pub options: Vec<String>,
+    /// The answer to the last choice. `Branch`/`Switch` fall through to option
+    /// 1 whenever this is 1, so losing it would silently reroute the scene.
+    pub choice_result: u32,
+    /// Merge target of the branch being executed. Saved verbatim: `Branch` is
+    /// written far more often than `CaseEnd` consumes it, so a stale value is
+    /// the normal state, not a bug.
+    pub pending_b: Option<u32>,
+    pub last_kind: String,
+    pub steps: u64,
+    pub rec_kind: u32,
+    pub rec_tok_hit: bool,
+    pub rec_act_hit: bool,
+    pub rec_toks: Vec<u32>,
+    pub pending_sprite: Option<(u32, u32, u32)>,
+}
+
+impl<'a> Interp<'a> {
+    pub fn snapshot(&self) -> InterpState {
+        InterpState {
+            pc: self.pc,
+            tok: self.tok,
+            ints: self.ints.clone(),
+            flts: self.flts.clone(),
+            speaker: self.speaker.clone(),
+            pending_voice: self.pending_voice,
+            voice_scenario: self.voice_scenario,
+            options: self.options.clone(),
+            choice_result: self.choice_result,
+            pending_b: self.pending_b,
+            last_kind: self.last_kind.clone(),
+            steps: self.steps,
+            rec_kind: self.rec_kind,
+            rec_tok_hit: self.rec_tok_hit,
+            rec_act_hit: self.rec_act_hit,
+            rec_toks: self.rec_toks.clone(),
+            pending_sprite: self.pending_sprite,
+        }
+    }
+
+    /// Put the interpreter back where a save left it. The caller is responsible
+    /// for handing back a `Program` for the same script, since the ops behind
+    /// `pc` come from there.
+    pub fn restore(&mut self, s: InterpState) {
+        self.pc = s.pc;
+        self.tok = s.tok;
+        self.ints = s.ints;
+        self.flts = s.flts;
+        self.speaker = s.speaker;
+        self.pending_voice = s.pending_voice;
+        self.voice_scenario = s.voice_scenario;
+        self.options = s.options;
+        self.choice_result = s.choice_result;
+        self.pending_b = s.pending_b;
+        self.last_kind = s.last_kind;
+        self.steps = s.steps;
+        self.rec_kind = s.rec_kind;
+        self.rec_tok_hit = s.rec_tok_hit;
+        self.rec_act_hit = s.rec_act_hit;
+        self.rec_toks = s.rec_toks;
+        self.pending_sprite = s.pending_sprite;
+    }
 }
 
 impl<'a> Interp<'a> {
@@ -282,7 +393,8 @@ impl<'a> Interp<'a> {
             ints: Vec::new(),
             flts: Vec::new(),
             speaker: None,
-            voice_pending: false,
+            pending_voice: None,
+            voice_scenario: 0,
             options: Vec::new(),
             choice_result: 1,
             pending_b: None,
@@ -292,6 +404,7 @@ impl<'a> Interp<'a> {
             rec_tok_hit: false,
             rec_act_hit: false,
             rec_toks: Vec::new(),
+            pending_sprite: None,
         }
     }
 
@@ -453,11 +566,10 @@ impl<'a> Interp<'a> {
         if !ok {
             return None;
         }
-        Some(Event::Sprite {
-            char_id: cid as u32,
-            series: (flag / 1000) as u32,
-            variant: variant as u32,
-        })
+        // Hold it: the K16 record that follows carries the screen slot, and the
+        // sprite must be placed there (slots move around during a scene).
+        self.pending_sprite = Some(((cid as u32), (flag / 1000) as u32, variant as u32));
+        None
     }
 
     fn act(&mut self, id: u32) -> Option<Event> {
@@ -467,19 +579,15 @@ impl<'a> Interp<'a> {
                 // display the current token as dialogue/narration
                 let n = tok?;
                 let text = self.p.token(n)?.to_string();
-                let (speaker, voice_tok) = match (&self.speaker, self.voice_pending) {
-                    (Some((name, st)), true) => (Some(name.clone()), Some(*st)),
-                    (Some((name, _)), false) => (Some(name.clone()), None),
-                    _ => (None, None),
-                };
+                let speaker = self.speaker.as_ref().map(|(name, _)| name.clone());
+                let voice = self.pending_voice.take();
                 self.speaker = None;
-                self.voice_pending = false;
-                Some(Event::Text { text, speaker, voice_tok })
+                Some(Event::Text { text, speaker, voice })
             }
             172 => {
-                // set background
+                // colour filter (sepia / nega / none), never a background image
                 let name = tok.and_then(|n| self.p.token(n)).unwrap_or("").to_string();
-                Some(Event::Bg { name })
+                Some(Event::Tint { name })
             }
             193 => {
                 // play movie
@@ -497,23 +605,35 @@ impl<'a> Interp<'a> {
                         if let Some(name) = self.p.token(n) {
                             if !name.is_empty() {
                                 self.speaker = Some((name.to_string(), n));
-                                self.voice_pending = false;
+                                self.pending_voice = None;
                             }
                         }
                     }
                     None => {
                         self.speaker = None;
-                        self.voice_pending = false;
+                        self.pending_voice = None;
                     }
+                }
+                None
+            }
+            137 => {
+                // Select the scenario's voice bank, also used by sub-scripts.
+                if self.ints.len() >= 2 && self.ints[1] >= 0 {
+                    self.voice_scenario = self.ints[1] as u32;
                 }
                 None
             }
             138 => {
                 // character focus for the current line (dim the others) +
                 // voice parameters for the following display
-                self.voice_pending = true;
                 if self.ints.len() >= 5 {
                     let cid = self.ints[self.ints.len() - 5];
+                    let line = *self.ints.last().unwrap();
+                    self.pending_voice = if cid >= 0 && line >= 0 {
+                        Some(VoiceCue { scenario: self.voice_scenario, line: line as u32, char_id: cid as u32 })
+                    } else {
+                        None
+                    };
                     if (0..40).contains(&cid) {
                         return Some(Event::SpriteFocus { char_id: cid as u32 });
                     }
@@ -529,26 +649,61 @@ impl<'a> Interp<'a> {
                 }
                 None
             }
-            176 => {
-                // Load a graphic from a source directory (`grp`), e.g.
-                //   Val(slot) Tok("v100200.tga") Val(x) Val(y) Tok("") Val(a)
-                //   Tok("grp") Val(flag) Act176
-                // Only the base layer of a layered CG ships as a real file
-                // (`v100200_bg/_chr/_chreff/_eff.tga` do not exist), so the
-                // first existing token wins and becomes the displayed image.
-                for t in &self.rec_toks {
-                    let name = match self.p.token(*t) {
-                        Some(n) => n,
-                        None => continue,
-                    };
-                    let lower = name.to_ascii_lowercase();
-                    if !lower.ends_with(".tga") || lower.starts_with("sys_") {
-                        continue;
-                    }
-                    return Some(Event::Bg { name: name.to_string() });
+            146 | 147 => {
+                // Scene background: (mode, id, variant, frames, 0, 0, 0, w, h).
+                // 146 and 147 differ only in transition style.
+                if self.ints.len() >= 4 {
+                    let id = self.ints[1] as i64;
+                    let variant = self.ints[2].max(0) as u32;
+                    let frames = self.ints[3].max(0) as u32;
+                    return Some(Event::BgScene { id, variant, frames });
                 }
                 None
             }
+            176 => {
+                // Slot-based overlay graphic: (slot, ?, 2, 256, flag) with
+                // tokens [name, "", dir]. Items (a guitar), effect plates and
+                // the layers of a composite CG come through here - it is NOT a
+                // background change.
+                if let Some(n) = self.rec_toks.first().and_then(|t| self.p.token(*t)) {
+                    let slot = self.ints.first().copied().unwrap_or(0).max(0) as u32;
+                    return Some(Event::Overlay { name: n.to_string(), slot });
+                }
+                None
+            }
+            154 | 155 => {
+                // Sprite on screen; the K16 record's first value is the slot.
+                // 155 is the entrance `(slot, 0, 256, 128)`, 154 the in-place
+                // expression change `(slot, 0, 0, frames, 256, 128)`. Both
+                // leave the character standing in that slot.
+                if let Some((char_id, series, variant)) = self.pending_sprite.take() {
+                    let slot = self.ints.first().copied().unwrap_or(0).max(0) as u32;
+                    return Some(Event::Sprite { char_id, series, variant, slot });
+                }
+                None
+            }
+            156 => {
+                // Leave. The first int is the character id, not a slot — the
+                // same id K30 used when the face was chosen. Scenes dismiss
+                // someone with this and keep talking; without it they stand
+                // there until a later placement overwrites their slot.
+                let char_id = self.ints.first().copied().unwrap_or(-1);
+                if char_id < 0 {
+                    return None;
+                }
+                let frames = self.ints.get(2).copied().unwrap_or(0).max(0) as u32;
+                Some(Event::SpriteExit { char_id: char_id as u32, frames })
+            }
+            194 => {
+                // Timed pause: (frames, 0, 0) at 60 fps.
+                if let Some(f) = self.ints.first() {
+                    if *f > 0 {
+                        return Some(Event::WaitFrames(*f as u32));
+                    }
+                }
+                None
+            }
+            158..=169 => Some(Event::Sound { opcode: id as u16, args: self.ints.clone() }),
             132 => Some(Event::Wait),
             1 => {
                 // CATCH / CATCH2 / CATCH3 marker

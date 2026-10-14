@@ -152,7 +152,61 @@ impl Surface {
         }
     }
 
+    /// Apply one of the game's `.AMP` colour curves to every pixel.
+    ///
+    /// The files are plain LUTs: 256 bytes = one curve used for R, G and B
+    /// (`nega.AMP` = inversion), 768 bytes = R, G, B curves (`evening.AMP`),
+    /// 1280 bytes = five curves of which the first three are R, G and B.
+    pub fn apply_lut(&mut self, lut: &[u8]) {
+        if lut.len() < 256 {
+            return;
+        }
+        let (r, g, b) = if lut.len() >= 768 {
+            (&lut[0..256], &lut[256..512], &lut[512..768])
+        } else {
+            (&lut[0..256], &lut[0..256], &lut[0..256])
+        };
+        for px in self.pixels.chunks_exact_mut(4) {
+            px[0] = r[px[0] as usize];
+            px[1] = g[px[1] as usize];
+            px[2] = b[px[2] as usize];
+        }
+    }
+
     /// Write the surface as an uncompressed 32-bit TGA (top-down, BGRA on disk).
+    /// Box-filtered shrink of this surface, for save-slot thumbnails.
+    ///
+    /// The screen is 1280x720 and a slot shows it at ~242x136, i.e. every
+    /// destination pixel covers about 5x5 source pixels; averaging them beats
+    /// nearest-neighbour sampling, which aliases text into mush.
+    pub fn thumbnail(&self, w: u32, h: u32) -> TgaImage {
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            let sy0 = (y as u64 * self.height as u64 / h as u64) as u32;
+            let sy1 = (((y + 1) as u64 * self.height as u64 / h as u64) as u32).max(sy0 + 1);
+            for x in 0..w {
+                let sx0 = (x as u64 * self.width as u64 / w as u64) as u32;
+                let sx1 = (((x + 1) as u64 * self.width as u64 / w as u64) as u32).max(sx0 + 1);
+                let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+                for sy in sy0..sy1.min(self.height) {
+                    for sx in sx0..sx1.min(self.width) {
+                        let i = ((sy * self.width + sx) as usize) * 4;
+                        r += self.pixels[i] as u64;
+                        g += self.pixels[i + 1] as u64;
+                        b += self.pixels[i + 2] as u64;
+                        n += 1;
+                    }
+                }
+                if n == 0 {
+                    rgba.extend_from_slice(&[0, 0, 0, 255]);
+                } else {
+                    rgba.extend_from_slice(&[(r / n) as u8, (g / n) as u8, (b / n) as u8, 255]);
+                }
+            }
+        }
+        TgaImage { width: w, height: h, rgba }
+    }
+
     pub fn save_tga(&self, path: &str) -> io::Result<()> {
         let mut f = File::create(path)?;
         let w = self.width as u16;
@@ -189,8 +243,28 @@ pub struct SpriteDraw<'a> {
 /// box, and the given text rendered with `font` (one line per wrapped logical
 /// line).
 pub fn render_scene(bg: &TgaImage, text: &str, font: &Font, w: u32, h: u32) -> Surface {
-    render_scene_ex(bg, text, font, w, h, &[])
+    render_scene_ex(bg, text, font, w, h, &[], None, true, None, None)
 }
+
+/// `sys_00000` / `sys_00001` are blitted here. The oval's stroke runs from
+/// about y=525 to y=666; glyphs start below the top glow and clear of the
+/// snowflakes on either side.
+pub const WINDOW_X: i32 = 16;
+pub const WINDOW_Y: i32 = 496;
+/// Speaker name, on the upper rim. The atlas ink starts ~7px into the cell,
+/// so the cell origin sits that far above the white strokes.
+pub const NAME_X: i32 = 245;
+pub const NAME_Y: i32 = 505;
+/// Dialogue line under the top glow. Measured off the original window:
+/// white ink at game (270, 553), cell padding (6, 7), pitch 28.
+pub const DIALOG_TEXT_X: i32 = 264;
+pub const DIALOG_TEXT_Y: i32 = 546;
+pub const DIALOG_TEXT_RIGHT: i32 = 1080;
+/// Full-width advance. The 40px cell's ink is only ~25px, and the original
+/// steps 28px between characters.
+pub const DIALOG_PITCH: i32 = 28;
+/// Baseline-to-baseline for a wrapped line.
+pub const DIALOG_LINE: i32 = 36;
 
 /// Like [`render_scene`] but composites the supplied character sprites between
 /// the background and the dialog box.
@@ -201,6 +275,14 @@ pub fn render_scene_ex(
     w: u32,
     h: u32,
     sprites: &[SpriteDraw],
+    // Optional `.AMP` colour curve applied to the scene art (background and
+    // sprites) but *not* to the dialog box or the text.
+    lut: Option<&[u8]>,
+    // 「ウィンドウ一時消去」: hide the dialog box and its text.
+    window: bool,
+    // Filled message window (`sys_00001`) and its oval frame (`sys_00000`).
+    plate: Option<&TgaImage>,
+    frame: Option<&TgaImage>,
 ) -> Surface {
     let mut s = Surface::new(w, h, [0, 0, 0, 255]);
     // Background, scaled to fit (nearest-neighbour stretch).
@@ -221,12 +303,35 @@ pub fn render_scene_ex(
         s.blit_region_alpha(sp.img, 0, 0, sp.img.width, sp.img.height, sp.x, sp.y, sp.alpha);
     }
 
-    // Dialog box near the bottom.
-    let box_h = (h / 4).max(140);
-    let box_y = (h - box_h - 24) as i32;
-    s.fill_rect(30, box_y, w - 60, box_h, [10, 10, 24, 200]);
-    s.fill_rect(30, box_y, w - 60, 2, [180, 200, 255, 220]);
-    s.fill_rect(30, box_y + box_h as i32 - 2, w - 60, 2, [180, 200, 255, 220]);
+    // Colour filter (sepia / nega / ...) over the scene art.
+    if let Some(lut) = lut {
+        s.apply_lut(lut);
+    }
+
+    // Dialog box near the bottom. The lowest 44 px of the screen are left free
+    // for the command button row, so the box is shorter than it used to be.
+    let box_h = (h / 4).min(160).max(120);
+    let box_y = (h - box_h - 44) as i32;
+    // 「ウィンドウ一時消去」: the scene stays, the box and its text do not.
+    if !window {
+        return s;
+    }
+    // Game window: the feathered plate, then the oval, then the glyphs.
+    // Without those assets, fall back to the flat plate the tools use.
+    let (x0, x_max, mut y, y_limit) = if plate.is_some() {
+        if let Some(pl) = plate {
+            s.blit(pl, WINDOW_X, WINDOW_Y);
+        }
+        if let Some(fr) = frame {
+            s.blit(fr, WINDOW_X, WINDOW_Y);
+        }
+        (DIALOG_TEXT_X, DIALOG_TEXT_RIGHT, DIALOG_TEXT_Y, DIALOG_TEXT_Y + DIALOG_LINE * 3)
+    } else {
+        s.fill_rect(30, box_y, w - 60, box_h, [10, 10, 24, 200]);
+        s.fill_rect(30, box_y, w - 60, 2, [180, 200, 255, 220]);
+        s.fill_rect(30, box_y + box_h as i32 - 2, w - 60, 2, [180, 200, 255, 220]);
+        (50, (w as i32) - 60, box_y + 18, box_y + box_h as i32)
+    };
 
     // Prepare text: strip region tags, turn literal \n into newlines.
     let cleaned: String = text.chars().filter(|&c| c != '\r').collect();
@@ -239,27 +344,31 @@ pub fn render_scene_ex(
     let cleaned = cleaned.replace("\n", "
 ");
 
-    let cell = font.cell() as i32;
-    let x0 = 50i32;
-    let x_max = (w as i32) - 60;
-    let mut y = box_y + 18;
+    let full = font.cell() as i32;
+    let step = if plate.is_some() { DIALOG_PITCH } else { full };
+    let line_h = if plate.is_some() { DIALOG_LINE } else { full + 4 };
     for line in cleaned.lines() {
         let mut x = x0;
         let mut buf = String::new();
         for ch in line.chars() {
-            if x + cell > x_max {
+            let adv = if plate.is_some() && (ch as u32) < 128 { step / 2 } else { step };
+            if x + adv > x_max {
                 break;
             }
             buf.push(ch);
-            x += cell;
+            x += adv;
         }
         // Use `draw` (not `draw_with_fallback`) so unmapped characters leave a
         // gap instead of a magenta placeholder box: the text area then shows
         // only the glyphs that actually exist in the atlas, which reads much
         // cleaner than rows of placeholder bars.
-        font.draw(&mut s, &buf, x0, y);
-        y += cell + 4;
-        if y > box_y + box_h as i32 - cell {
+        if plate.is_some() {
+            font.draw_pitch(&mut s, &buf, x0, y, DIALOG_PITCH);
+        } else {
+            font.draw(&mut s, &buf, x0, y);
+        }
+        y += line_h;
+        if y > y_limit - line_h {
             break;
         }
     }
