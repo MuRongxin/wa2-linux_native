@@ -49,6 +49,64 @@ impl Surface {
         }
     }
 
+    /// Resize into `dw`×`dh`. An integer multiple is copied pixel for pixel.
+    /// Anything else uses bilinear, so a fullscreen stretch of the scene does
+    /// not have to filter text that will be drawn afterwards at window size.
+    pub fn scaled_to(&self, dw: u32, dh: u32) -> Surface {
+        if dw == 0 || dh == 0 || self.width == 0 || self.height == 0 {
+            return Surface::new(dw.max(1), dh.max(1), [0, 0, 0, 255]);
+        }
+        if dw == self.width && dh == self.height {
+            return Surface { width: dw, height: dh, pixels: self.pixels.clone() };
+        }
+        let mut pixels = vec![0u8; (dw as usize) * (dh as usize) * 4];
+        if dw % self.width == 0 && dh % self.height == 0 && dw / self.width == dh / self.height {
+            let s = (dw / self.width) as usize;
+            let sw = self.width as usize;
+            for y in 0..self.height as usize {
+                for x in 0..sw {
+                    let si = (y * sw + x) * 4;
+                    let px = &self.pixels[si..si + 4];
+                    for dy in 0..s {
+                        let row = ((y * s + dy) * dw as usize) * 4;
+                        for dx in 0..s {
+                            let di = row + (x * s + dx) * 4;
+                            pixels[di..di + 4].copy_from_slice(px);
+                        }
+                    }
+                }
+            }
+            return Surface { width: dw, height: dh, pixels };
+        }
+        let sw = self.width as f32;
+        let sh = self.height as f32;
+        for y in 0..dh {
+            let fy = (y as f32 + 0.5) * sh / dh as f32 - 0.5;
+            let y0 = fy.floor().clamp(0.0, sh - 1.0) as u32;
+            let y1 = (y0 + 1).min(self.height - 1);
+            let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+            for x in 0..dw {
+                let fx = (x as f32 + 0.5) * sw / dw as f32 - 0.5;
+                let x0 = fx.floor().clamp(0.0, sw - 1.0) as u32;
+                let x1 = (x0 + 1).min(self.width - 1);
+                let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+                let mut out = [0u8; 4];
+                for c in 0..4u32 {
+                    let p00 = self.pixels[((y0 * self.width + x0) * 4 + c) as usize] as f32;
+                    let p10 = self.pixels[((y0 * self.width + x1) * 4 + c) as usize] as f32;
+                    let p01 = self.pixels[((y1 * self.width + x0) * 4 + c) as usize] as f32;
+                    let p11 = self.pixels[((y1 * self.width + x1) * 4 + c) as usize] as f32;
+                    let top = p00 + (p10 - p00) * tx;
+                    let bot = p01 + (p11 - p01) * tx;
+                    out[c as usize] = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u8;
+                }
+                let di = ((y * dw + x) * 4) as usize;
+                pixels[di..di + 4].copy_from_slice(&out);
+            }
+        }
+        Surface { width: dw, height: dh, pixels }
+    }
+
     fn put(&mut self, x: i32, y: i32, c: [u8; 4]) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
@@ -99,6 +157,21 @@ impl Surface {
         self.put(x, y, c);
     }
 
+    /// Darken the whole buffer. `amount` 0 leaves it alone; 255 turns it black.
+    /// Used for the novel-mode backdrop opacity, which is a mild dim of the
+    /// scene art behind the window rather than a second plate.
+    pub fn dim(&mut self, amount: u8) {
+        if amount == 0 {
+            return;
+        }
+        let keep = 255 - amount as u32;
+        for px in self.pixels.chunks_exact_mut(4) {
+            px[0] = (px[0] as u32 * keep / 255) as u8;
+            px[1] = (px[1] as u32 * keep / 255) as u8;
+            px[2] = (px[2] as u32 * keep / 255) as u8;
+        }
+    }
+
     /// Like `blit_region` but scales the source alpha by `alpha` (0..=255),
     /// used to dim non-speaking characters.
     pub fn blit_region_alpha(
@@ -143,8 +216,139 @@ impl Surface {
         }
     }
 
+    /// Copy a window of `src` into this surface, starting at source row `sy`.
+    /// Used for the title background, which is a tall plate panned vertically.
+    pub fn copy_rows_from(&mut self, src: &Surface, sy: i32) {
+        if self.width == 0 || self.height == 0 || src.width == 0 {
+            return;
+        }
+        let sy = sy.max(0) as u32;
+        if sy >= src.height {
+            return;
+        }
+        let rows = self.height.min(src.height - sy);
+        let cols = self.width.min(src.width) as usize;
+        let dst_stride = self.width as usize * 4;
+        let src_stride = src.width as usize * 4;
+        let nbytes = cols * 4;
+        for row in 0..rows {
+            let s = (sy + row) as usize * src_stride;
+            let d = row as usize * dst_stride;
+            self.pixels[d..d + nbytes].copy_from_slice(&src.pixels[s..s + nbytes]);
+        }
+    }
+
+    /// Alpha-blit `src` onto this surface. Clear pixels are skipped.
+    /// `alpha` scales the source coverage (255 leaves it unchanged).
+    pub fn blit_surface_alpha(&mut self, src: &Surface, dx: i32, dy: i32, alpha: u8) {
+        if alpha == 0 {
+            return;
+        }
+        let x0 = dx.max(0);
+        let y0 = dy.max(0);
+        let x1 = (dx + src.width as i32).min(self.width as i32);
+        let y1 = (dy + src.height as i32).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let n = (x1 - x0) as usize;
+        let mul = alpha as u32;
+        for y in y0..y1 {
+            let sy = (y - dy) as u32;
+            let sx = (x0 - dx) as u32;
+            let s0 = (sy * src.width + sx) as usize * 4;
+            let d0 = (y as u32 * self.width + x0 as u32) as usize * 4;
+            for i in 0..n {
+                let s = s0 + i * 4;
+                let a = src.pixels[s + 3] as u32 * mul / 255;
+                if a == 0 {
+                    continue;
+                }
+                let d = d0 + i * 4;
+                let blended = blend(
+                    &[
+                        self.pixels[d],
+                        self.pixels[d + 1],
+                        self.pixels[d + 2],
+                        self.pixels[d + 3],
+                    ],
+                    &[src.pixels[s], src.pixels[s + 1], src.pixels[s + 2], a as u8],
+                );
+                self.pixels[d..d + 4].copy_from_slice(&blended);
+            }
+        }
+    }
+
+    /// Alpha-blit `src` onto this surface. Clear pixels are skipped.
+    pub fn blit_surface(&mut self, src: &Surface, dx: i32, dy: i32) {
+        let x0 = dx.max(0);
+        let y0 = dy.max(0);
+        let x1 = (dx + src.width as i32).min(self.width as i32);
+        let y1 = (dy + src.height as i32).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let n = (x1 - x0) as usize;
+        for y in y0..y1 {
+            let sy = (y - dy) as u32;
+            let sx = (x0 - dx) as u32;
+            let s0 = (sy * src.width + sx) as usize * 4;
+            let d0 = (y as u32 * self.width + x0 as u32) as usize * 4;
+            for i in 0..n {
+                let s = s0 + i * 4;
+                let a = src.pixels[s + 3];
+                if a == 0 {
+                    continue;
+                }
+                let d = d0 + i * 4;
+                if a == 255 {
+                    self.pixels[d..d + 4].copy_from_slice(&src.pixels[s..s + 4]);
+                } else {
+                    let blended = blend(
+                        &[
+                            self.pixels[d],
+                            self.pixels[d + 1],
+                            self.pixels[d + 2],
+                            self.pixels[d + 3],
+                        ],
+                        &[
+                            src.pixels[s],
+                            src.pixels[s + 1],
+                            src.pixels[s + 2],
+                            src.pixels[s + 3],
+                        ],
+                    );
+                    self.pixels[d..d + 4].copy_from_slice(&blended);
+                }
+            }
+        }
+    }
+
     /// Fill a rectangle (with alpha) - used for the dialog box.
     pub fn fill_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: [u8; 4]) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        // Opaque covers are a straight copy. The blend path calls `put` per
+        // pixel, which is too slow for a full chart redraw every frame.
+        if color[3] == 255 {
+            let x0 = x.max(0);
+            let y0 = y.max(0);
+            let x1 = x.saturating_add(w as i32).min(self.width as i32);
+            let y1 = y.saturating_add(h as i32).min(self.height as i32);
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
+            let stride = self.width as usize * 4;
+            let row_bytes = (x1 - x0) as usize * 4;
+            for row in y0..y1 {
+                let start = row as usize * stride + x0 as usize * 4;
+                for px in self.pixels[start..start + row_bytes].chunks_exact_mut(4) {
+                    px.copy_from_slice(&color);
+                }
+            }
+            return;
+        }
         for row in 0..h as i32 {
             for col in 0..w as i32 {
                 self.put(x + col, y + row, color);
@@ -243,7 +447,56 @@ pub struct SpriteDraw<'a> {
 /// box, and the given text rendered with `font` (one line per wrapped logical
 /// line).
 pub fn render_scene(bg: &TgaImage, text: &str, font: &Font, w: u32, h: u32) -> Surface {
-    render_scene_ex(bg, text, font, w, h, &[], None, true, None, None)
+    render_scene_ex(bg, text, font, w, h, &[], None, true, None, None, 255, 0, &[])
+}
+
+/// One channel of the screen flash. 128 leaves the pixel alone, 255 pushes
+/// it to white, 0 pushes it to black. `remain == frames` is the solid colour;
+/// `remain == 0` is the picture.
+fn flash_tone(pixel: u8, level: u32) -> u8 {
+    if level >= 128 {
+        let t = (level - 128) * 255 / 127;
+        (pixel as u32 + (255 - pixel as u32) * t / 255) as u8
+    } else {
+        (pixel as u32 * level / 128) as u8
+    }
+}
+
+/// ACT152. `remain` runs from `frames` (solid `rgb`) down to 0 (the picture).
+/// Alpha is left as it was, so the window does not turn transparent.
+pub fn apply_flash(dst: &mut [u8], src: &[u8], r: u8, g: u8, b: u8, remain: u32, frames: u32) {
+    let n = dst.len().min(src.len());
+    if frames == 0 || remain == 0 {
+        dst[..n].copy_from_slice(&src[..n]);
+        return;
+    }
+    let level = |c: u8| (remain * c as u32 + (frames - remain) * 128) / frames;
+    let lr = level(r);
+    let lg = level(g);
+    let lb = level(b);
+    let mut i = 0;
+    while i + 3 < n {
+        dst[i] = flash_tone(src[i], lr);
+        dst[i + 1] = flash_tone(src[i + 1], lg);
+        dst[i + 2] = flash_tone(src[i + 2], lb);
+        dst[i + 3] = src[i + 3];
+        i += 4;
+    }
+}
+
+/// Linear blend of two equal-sized RGBA buffers. `step` runs from 1 to `frames`.
+pub fn lerp_pixels(dst: &mut [u8], from: &[u8], to: &[u8], step: u32, frames: u32) {
+    let n = dst.len().min(from.len()).min(to.len());
+    if frames == 0 {
+        dst[..n].copy_from_slice(&to[..n]);
+        return;
+    }
+    let inv = frames.saturating_sub(step);
+    let mut i = 0;
+    while i < n {
+        dst[i] = ((from[i] as u32 * inv + to[i] as u32 * step) / frames) as u8;
+        i += 1;
+    }
 }
 
 /// `sys_00000` / `sys_00001` are blitted here. The oval's stroke runs from
@@ -283,6 +536,14 @@ pub fn render_scene_ex(
     // Filled message window (`sys_00001`) and its oval frame (`sys_00000`).
     plate: Option<&TgaImage>,
     frame: Option<&TgaImage>,
+    // 0..=255 scale applied on top of the plate's own alpha.
+    window_alpha: u8,
+    // 0..=255 darken of the scene art (background, sprites, overlays) before
+    // the dialog box is drawn.
+    shade: u8,
+    // Extra plates (ACT176): items, effect layers, composite CG pieces.
+    // Already positioned in surface space, drawn under the dialog box.
+    overlays: &[(&TgaImage, i32, i32)],
 ) -> Surface {
     let mut s = Surface::new(w, h, [0, 0, 0, 255]);
     // Background, scaled to fit (nearest-neighbour stretch).
@@ -302,11 +563,15 @@ pub fn render_scene_ex(
     for sp in sprites {
         s.blit_region_alpha(sp.img, 0, 0, sp.img.width, sp.img.height, sp.x, sp.y, sp.alpha);
     }
+    for (img, x, y) in overlays {
+        s.blit(img, *x, *y);
+    }
 
     // Colour filter (sepia / nega / ...) over the scene art.
     if let Some(lut) = lut {
         s.apply_lut(lut);
     }
+    s.dim(shade);
 
     // Dialog box near the bottom. The lowest 44 px of the screen are left free
     // for the command button row, so the box is shorter than it used to be.
@@ -318,40 +583,63 @@ pub fn render_scene_ex(
     }
     // Game window: the feathered plate, then the oval, then the glyphs.
     // Without those assets, fall back to the flat plate the tools use.
-    let (x0, x_max, mut y, y_limit) = if plate.is_some() {
+    if plate.is_some() {
         if let Some(pl) = plate {
-            s.blit(pl, WINDOW_X, WINDOW_Y);
+            s.blit_region_alpha(pl, 0, 0, pl.width, pl.height, WINDOW_X, WINDOW_Y, window_alpha);
         }
         if let Some(fr) = frame {
-            s.blit(fr, WINDOW_X, WINDOW_Y);
+            s.blit_region_alpha(fr, 0, 0, fr.width, fr.height, WINDOW_X, WINDOW_Y, window_alpha);
         }
-        (DIALOG_TEXT_X, DIALOG_TEXT_RIGHT, DIALOG_TEXT_Y, DIALOG_TEXT_Y + DIALOG_LINE * 3)
     } else {
         s.fill_rect(30, box_y, w - 60, box_h, [10, 10, 24, 200]);
         s.fill_rect(30, box_y, w - 60, 2, [180, 200, 255, 220]);
         s.fill_rect(30, box_y + box_h as i32 - 2, w - 60, 2, [180, 200, 255, 220]);
+    }
+    draw_dialog_text(&mut s, font, text, plate.is_some(), w, h, usize::MAX);
+    s
+}
+
+/// Draw the dialogue body into an already-composited frame.
+///
+/// `limit` is how many characters of `text` to reveal. The typewriter paints
+/// onto a frame that already has the background, the window and the name, so
+/// a character tick does not rebuild the scene.
+pub fn draw_dialog_text(
+    s: &mut Surface,
+    font: &Font,
+    text: &str,
+    plate: bool,
+    w: u32,
+    h: u32,
+    limit: usize,
+) {
+    let shown: String = text.chars().take(limit).collect();
+    let box_h = (h / 4).min(160).max(120);
+    let box_y = (h - box_h - 44) as i32;
+    let (x0, x_max, mut y, y_limit) = if plate {
+        (DIALOG_TEXT_X, DIALOG_TEXT_RIGHT, DIALOG_TEXT_Y, DIALOG_TEXT_Y + DIALOG_LINE * 3)
+    } else {
         (50, (w as i32) - 60, box_y + 18, box_y + box_h as i32)
     };
 
     // Prepare text: strip region tags, turn literal \n into newlines.
-    let cleaned: String = text.chars().filter(|&c| c != '\r').collect();
-    let cleaned = cleaned.replace("<R", "").replace('>', "");
+    let cleaned: String = shown.chars().filter(|&c| c != '\r').collect();
+    let cleaned = cleaned.replace("<R", "\u{1}").replace('>', "\u{1}");
     let cleaned: String = cleaned
-        .split('')
+        .split('\u{1}')
         .enumerate()
-        .map(|(i, s)| if i % 2 == 0 { s } else { "" })
+        .map(|(i, part)| if i % 2 == 0 { part } else { "" })
         .collect();
-    let cleaned = cleaned.replace("\n", "
-");
+    let cleaned = cleaned.replace("\\n", "\n");
 
     let full = font.cell() as i32;
-    let step = if plate.is_some() { DIALOG_PITCH } else { full };
-    let line_h = if plate.is_some() { DIALOG_LINE } else { full + 4 };
+    let step = if plate { DIALOG_PITCH } else { full };
+    let line_h = if plate { DIALOG_LINE } else { full + 4 };
     for line in cleaned.lines() {
         let mut x = x0;
         let mut buf = String::new();
         for ch in line.chars() {
-            let adv = if plate.is_some() && (ch as u32) < 128 { step / 2 } else { step };
+            let adv = if plate && (ch as u32) < 128 { step / 2 } else { step };
             if x + adv > x_max {
                 break;
             }
@@ -362,17 +650,16 @@ pub fn render_scene_ex(
         // gap instead of a magenta placeholder box: the text area then shows
         // only the glyphs that actually exist in the atlas, which reads much
         // cleaner than rows of placeholder bars.
-        if plate.is_some() {
-            font.draw_pitch(&mut s, &buf, x0, y, DIALOG_PITCH);
+        if plate {
+            font.draw_pitch(s, &buf, x0, y, DIALOG_PITCH);
         } else {
-            font.draw(&mut s, &buf, x0, y);
+            font.draw(s, &buf, x0, y);
         }
         y += line_h;
         if y > y_limit - line_h {
             break;
         }
     }
-    s
 }
 
 /// Build a sample scene: background, optional character sprite, dialog box, and a
@@ -456,4 +743,53 @@ pub fn render_scene_sysfont(
         s.blit_rgba(&rgba, rw, rh, 50, box_y + 16);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_flash, lerp_pixels, Surface};
+
+    #[test]
+    fn flash_peaks_at_white_and_returns() {
+        let src = [10u8, 20, 30, 255];
+        let mut dst = [0u8; 4];
+        apply_flash(&mut dst, &src, 255, 255, 255, 15, 15);
+        assert_eq!(dst, [255, 255, 255, 255]);
+        apply_flash(&mut dst, &src, 255, 255, 255, 0, 15);
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn lerp_hits_the_midpoint() {
+        let from = [0u8, 10, 20, 255];
+        let to = [100, 10, 0, 255];
+        let mut dst = [0u8; 4];
+        lerp_pixels(&mut dst, &from, &to, 1, 2);
+        assert_eq!(dst, [50, 10, 10, 255]);
+        lerp_pixels(&mut dst, &from, &to, 2, 2);
+        assert_eq!(dst, to);
+    }
+
+    #[test]
+    fn integer_scale_copies_pixels() {
+        let mut s = Surface::new(2, 1, [0, 0, 0, 255]);
+        s.pixels[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        s.pixels[4..8].copy_from_slice(&[255, 255, 255, 255]);
+        let up = s.scaled_to(4, 2);
+        assert_eq!(&up.pixels[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&up.pixels[4..8], &[0, 0, 0, 255]);
+        assert_eq!(&up.pixels[8..12], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn bilinear_scale_blends_an_edge() {
+        let mut s = Surface::new(2, 1, [0, 0, 0, 255]);
+        s.pixels[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        s.pixels[4..8].copy_from_slice(&[255, 255, 255, 255]);
+        let up = s.scaled_to(4, 1);
+        let mid = up.pixels[4];
+        assert!(mid > 40 && mid < 220, "mid {mid}");
+        assert_eq!(up.pixels[0], 0);
+        assert_eq!(up.pixels[12], 255);
+    }
 }

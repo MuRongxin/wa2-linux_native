@@ -9,7 +9,7 @@
 use crate::render::Surface;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
@@ -23,6 +23,10 @@ const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
 const SDL_WINDOW_RESIZABLE: u32 = 0x0000_0020;
+/// Borderless window the size of the desktop. Exclusive fullscreen (flag 1)
+/// asks the display to switch to 1280×720, which the compositor ignores, so
+/// the 「全屏」 setting never changed the window.
+const SDL_WINDOW_FULLSCREEN_DESKTOP: u32 = 0x0000_1001;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000u32 as i32;
 const SDL_RENDERER_ACCELERATED: u32 = 0x0000_0002;
 const SDL_RENDERER_SOFTWARE: u32 = 0x0000_0001;
@@ -36,6 +40,8 @@ const SDL_QUIT: u32 = 0x100;
 const SDL_KEYDOWN: u32 = 0x300;
 const SDL_MOUSEMOTION: u32 = 0x400;
 const SDL_MOUSEBUTTONDOWN: u32 = 0x401;
+const SDL_MOUSEBUTTONUP: u32 = 0x402;
+const SDL_MOUSEWHEEL: u32 = 0x403;
 const SDLK_ESCAPE: i32 = 41;
 const SDLK_q: i32 = 20;
 const SDLK_SPACE: i32 = 44;
@@ -44,6 +50,7 @@ const SDLK_RIGHT: i32 = 79;
 const SDLK_DOWN: i32 = 81;
 const SDLK_LEFT: i32 = 80;
 const SDLK_UP: i32 = 82;
+const SDLK_PAGEUP: i32 = 75;
 const SDLK_F11: i32 = 95;
 const SDLK_1: i32 = 30;
 const SDLK_2: i32 = 31;
@@ -99,6 +106,12 @@ pub enum Input {
     RightClick,
     /// Pointer moved with the left button held (dragging).
     Drag { x: i32, y: i32 },
+    /// Left button released. A click is a press followed by this, without a drag.
+    Release { x: i32, y: i32 },
+    /// Mouse wheel. Positive `y` is scroll up (away from the user).
+    Wheel { y: i32 },
+    /// Page Up: cruise backward through lines already shown.
+    Rewind,
 }
 
 unsafe fn sym(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
@@ -290,6 +303,7 @@ impl Sdl {
                         SDLK_F11 => out = Input::Fullscreen,
                         SDLK_LEFT => out = Input::Back,
                         SDLK_UP => out = Input::Up,
+                        SDLK_PAGEUP => out = Input::Rewind,
                         SDLK_SPACE | SDLK_RETURN | SDLK_RIGHT => out = Input::Advance,
                         SDLK_DOWN => out = Input::Down,
                         SDLK_1 => out = Input::Choice(1),
@@ -319,6 +333,21 @@ impl Sdl {
                             Input::Pointer { x, y, pressed: false }
                         };
                     }
+                } else if etype == SDL_MOUSEWHEEL {
+                    // SDL_MouseWheelEvent: x at 16, y at 20. Positive y is
+                    // scroll up. `direction` (2.0.4+) at 24 is 1 when the
+                    // platform reports flipped axes.
+                    let mut wy = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
+                    if ev[24] == 1 {
+                        wy = -wy;
+                    }
+                    if wy != 0 && matches!(out, Input::None | Input::Pointer { pressed: false, .. } | Input::Drag { .. } | Input::Wheel { .. }) {
+                        let prev = match out {
+                            Input::Wheel { y } => y,
+                            _ => 0,
+                        };
+                        out = Input::Wheel { y: prev + wy };
+                    }
                 } else if etype == SDL_MOUSEBUTTONDOWN {
                     // SDL_MouseButtonEvent: type..which (16), button,state,clicks,
                     // padding (4), then Sint32 x, y.
@@ -330,6 +359,23 @@ impl Sdl {
                     } else {
                         Input::Pointer { x, y, pressed: true }
                     };
+                } else if etype == SDL_MOUSEBUTTONUP {
+                    // Same layout as the button-down event. A click is this
+                    // release without a drag in between.
+                    let button = ev[16];
+                    if button == 1
+                        && matches!(
+                            out,
+                            Input::None
+                                | Input::Pointer { .. }
+                                | Input::Drag { .. }
+                                | Input::Release { .. }
+                        )
+                    {
+                        let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
+                        let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
+                        out = Input::Release { x, y };
+                    }
                 }
             }
         }
@@ -339,13 +385,175 @@ impl Sdl {
         out
     }
 
-    /// Switch the window between windowed and fullscreen (the 「画面模式」
-    /// setting). SDL keeps the renderer/texture alive across the switch.
-    pub fn set_fullscreen(&self, on: bool) {
-        if let Some(f) = FULLSCREEN.get() {
-            unsafe { (f)(self.window, if on { 1 } else { 0 }); }
+/// Switch the window between windowed and fullscreen (the 「画面模式」
+/// setting). Fullscreen covers the display the window is on.
+///
+/// `SDL_SetWindowFullscreen` updates SDL's own size immediately, but without
+/// a window manager the real X window stays 1280×720, so the picture and the
+/// pointer never change. After the request we move that window ourselves.
+pub fn set_fullscreen(&self, on: bool) {
+    let Some(f) = FULLSCREEN.get() else { return };
+    if on {
+        self.remember_windowed();
+        let rc = unsafe { (f)(self.window, SDL_WINDOW_FULLSCREEN_DESKTOP) };
+        if rc != 0 {
+            eprintln!("sdl: set fullscreen failed");
+        }
+        if let Some((x, y, w, h)) = self.display_bounds() {
+            self.set_bordered(false);
+            self.x11_move_resize(x, y, w as u32, h as u32);
+            self.sdl_set_pos(x, y);
+            self.sdl_set_size(w, h);
+        }
+    } else {
+        let rc = unsafe { (f)(self.window, 0) };
+        if rc != 0 {
+            eprintln!("sdl: leave fullscreen failed");
+        }
+        self.set_bordered(true);
+        if let Some((x, y, w, h)) = take_windowed() {
+            self.x11_move_resize(x, y, w as u32, h as u32);
+            self.sdl_set_size(w, h);
+            self.sdl_set_pos(x, y);
         }
     }
+    self.pump();
+    if std::env::var_os("WA2_DEBUG_INPUT").is_some() {
+        let (w, h) = self.window_size();
+        eprintln!("sdl: fullscreen {} -> {}x{}", on, w, h);
+    }
+}
+
+fn remember_windowed(&self) {
+    let mut slot = match WINDOWED_GEOM.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if slot.is_some() {
+        return;
+    }
+    let (x, y) = self.window_pos();
+    let (w, h) = self.window_size();
+    *slot = Some((x, y, w, h));
+}
+
+fn window_pos(&self) -> (i32, i32) {
+    let Some(f) = self.fn_ptr::<unsafe extern "C" fn(*mut c_void, *mut i32, *mut i32)>(
+        "SDL_GetWindowPosition",
+    ) else {
+        return (0, 0);
+    };
+    let (mut x, mut y) = (0i32, 0i32);
+    unsafe { f(self.window, &mut x, &mut y) };
+    (x, y)
+}
+
+fn display_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+    let index = self.fn_ptr::<unsafe extern "C" fn(*mut c_void) -> i32>("SDL_GetWindowDisplayIndex")?;
+    let bounds = self.fn_ptr::<unsafe extern "C" fn(i32, *mut i32) -> i32>("SDL_GetDisplayBounds")?;
+    let idx = unsafe { index(self.window) };
+    if idx < 0 {
+        return None;
+    }
+    let mut rect = [0i32; 4];
+    if unsafe { bounds(idx, rect.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    if rect[2] <= 0 || rect[3] <= 0 {
+        return None;
+    }
+    Some((rect[0], rect[1], rect[2], rect[3]))
+}
+
+fn set_bordered(&self, on: bool) {
+    let Some(f) = self.fn_ptr::<unsafe extern "C" fn(*mut c_void, i32)>("SDL_SetWindowBordered") else {
+        return;
+    };
+    unsafe { f(self.window, if on { 1 } else { 0 }) };
+}
+
+fn sdl_set_size(&self, w: i32, h: i32) {
+    let Some(f) = self.fn_ptr::<unsafe extern "C" fn(*mut c_void, i32, i32)>("SDL_SetWindowSize") else {
+        return;
+    };
+    unsafe { f(self.window, w, h) };
+}
+
+fn sdl_set_pos(&self, x: i32, y: i32) {
+    let Some(f) = self.fn_ptr::<unsafe extern "C" fn(*mut c_void, i32, i32)>("SDL_SetWindowPosition") else {
+        return;
+    };
+    unsafe { f(self.window, x, y) };
+}
+
+fn pump(&self) {
+    let Some(f) = self.fn_ptr::<unsafe extern "C" fn()>("SDL_PumpEvents") else { return };
+    unsafe { f() };
+}
+
+fn fn_ptr<T>(&self, name: &str) -> Option<T> {
+    let c = CString::new(name).ok()?;
+    let p = unsafe { dlsym(self._lib, c.as_ptr()) };
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute_copy(&p) })
+    }
+}
+
+/// SDL's window id on X11, then move that window. `SDL_GetWindowWMInfo` needs
+/// the library version filled in or it refuses.
+fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
+    let Some(get_ver) = self.fn_ptr::<unsafe extern "C" fn(*mut u8)>("SDL_GetVersion") else { return };
+    let Some(get_info) =
+        self.fn_ptr::<unsafe extern "C" fn(*mut c_void, *mut u8) -> i32>("SDL_GetWindowWMInfo")
+    else {
+        return;
+    };
+    let mut info = [0u8; 128];
+    unsafe { get_ver(info.as_mut_ptr()) };
+    if unsafe { get_info(self.window, info.as_mut_ptr()) } != 1 {
+        return;
+    }
+    // subsystem sits after the 3-byte version, aligned to 4. X11 is 2.
+    let subsystem = i32::from_ne_bytes([info[4], info[5], info[6], info[7]]);
+    if subsystem != 2 {
+        return;
+    }
+    let display = usize::from_ne_bytes(info[8..16].try_into().unwrap()) as *mut c_void;
+    let xwin = u64::from_ne_bytes(info[16..24].try_into().unwrap());
+    if display.is_null() || xwin == 0 {
+        return;
+    }
+    unsafe {
+        let c = CString::new("libX11.so.6").unwrap();
+        let lib = dlopen(c.as_ptr(), RTLD_NOW);
+        if lib.is_null() {
+            return;
+        }
+        let lock = dlsym(lib, CString::new("XLockDisplay").unwrap().as_ptr());
+        let unlock = dlsym(lib, CString::new("XUnlockDisplay").unwrap().as_ptr());
+        let mv = dlsym(lib, CString::new("XMoveResizeWindow").unwrap().as_ptr());
+        let fl = dlsym(lib, CString::new("XFlush").unwrap().as_ptr());
+        if !lock.is_null() {
+            let lock: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(lock);
+            lock(display);
+        }
+        if !mv.is_null() {
+            let mv: unsafe extern "C" fn(*mut c_void, u64, i32, i32, u32, u32) -> i32 =
+                std::mem::transmute(mv);
+            mv(display, xwin, x, y, w, h);
+        }
+        if !fl.is_null() {
+            let fl: unsafe extern "C" fn(*mut c_void) -> i32 = std::mem::transmute(fl);
+            fl(display);
+        }
+        if !unlock.is_null() {
+            let unlock: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(unlock);
+            unlock(display);
+        }
+    }
+}
 
     /// Current window size in pixels (the surface is stretched to it).
     pub fn window_size(&self) -> (i32, i32) {
@@ -429,6 +637,12 @@ struct AudioFns {
 
 static AUDIO: OnceLock<AudioFns> = OnceLock::new();
 static FULLSCREEN: OnceLock<unsafe extern "C" fn(*mut c_void, u32) -> c_int> = OnceLock::new();
+/// Position and size to restore when leaving fullscreen. Absent while windowed.
+static WINDOWED_GEOM: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+
+fn take_windowed() -> Option<(i32, i32, i32, i32)> {
+    WINDOWED_GEOM.lock().ok().and_then(|mut g| g.take())
+}
 
 /// Open a playback device (48kHz stereo, 1024-frame buffer). 0 on failure.
 pub fn sdl_open_audio(rate: u32, ch: u16) -> u32 {

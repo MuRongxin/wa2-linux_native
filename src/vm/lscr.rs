@@ -242,6 +242,17 @@ pub enum Event {
     /// `b{id:04}*` fallback. `id == 0` or `-2` means a black screen.
     /// `frames` is the transition length at 60 fps.
     BgScene { id: i64, variant: u32, frames: u32 },
+    /// Event CG (ACT148), and a layer of one (ACT201 with the layer turned on).
+    ///
+    /// Same record shape as a background, but the exe's mode-1 path formats
+    /// `v%06d.tga` from `id * 10 + variant` (10170, variant 0 → `v101700.tga`).
+    /// It replaces the standing shot. `frames` is the crossfade at 60 fps;
+    /// a layer switch passes 0.
+    EventCg { id: i64, variant: u32, frames: u32 },
+    /// ACT152 `(subtype, frames, r, g, b)`. The screen snaps to that colour
+    /// and fades back to the picture over `frames` at 60 fps. White is the
+    /// climax flash; the subtype is unused (the snap itself is instant).
+    Flash { frames: u32, r: u8, g: u8, b: u8 },
     /// Slot-based overlay graphic (ACT176): items, effect plates and layered-CG
     /// pieces. This is *not* a background change.
     Overlay { name: String, slot: u32 },
@@ -258,12 +269,18 @@ pub enum Event {
     Movie { name: String },
     /// Load/switch a character's standing sprite. The file name is
     /// `{prefix}{series:03}{variant:03}.tga` inside `char.pak`.
-    Sprite { char_id: u32, series: u32, variant: u32, slot: u32 },
+    ///
+    /// `frames` is the crossfade length at 60 fps. ACT154 carries it in the
+    /// record; ACT155 (the entrance) has none, so it uses 15.
+    Sprite { char_id: u32, series: u32, variant: u32, slot: u32, frames: u32 },
     /// ACT156 `(char_id, 0, frames)`: that character leaves. `frames` is the
     /// exit length at 60 fps.
     SpriteExit { char_id: u32, frames: u32 },
     /// A character is now speaking (keep bright, dim the others).
     SpriteFocus { char_id: u32 },
+    /// ACT170. 0 hides the message window (scene change), 1 opens it again.
+    /// 2 and 3 show up around BGM changes and are left alone.
+    Window { mode: i32 },
     /// Present a choice; call `set_choice_result` with 1..=options.len().
     Choice { options: Vec<String> },
     /// Wait for the player to advance.
@@ -660,6 +677,50 @@ impl<'a> Interp<'a> {
                 }
                 None
             }
+            148 => {
+                // Event CG. The exe loads `v{id * 10 + variant:06}.tga`
+                // (mode 1, `v%06d.tga`) and puts it up instead of the
+                // standing characters. 1012_030's bed shot is id 10170
+                // variant 0 → v101700.tga, which lives in IC/grp.pak.
+                if self.ints.len() >= 4 && self.ints[1] > 0 {
+                    let id = self.ints[1] as i64;
+                    let variant = self.ints[2].max(0) as u32;
+                    let frames = self.ints[3].max(0) as u32;
+                    return Some(Event::EventCg { id, variant, frames });
+                }
+                None
+            }
+            152 => {
+                // White flash. Args are (subtype, frames, r, g, b). The
+                // original snaps to the colour, then lerps back to neutral
+                // over `frames`. 1012_030's climax is two 15-frame blinks
+                // and one 60-frame blink, all (255, 255, 255).
+                if self.ints.len() >= 5 {
+                    let frames = self.ints[1].max(0) as u32;
+                    let ch = |i: usize| self.ints[i].clamp(0, 255) as u8;
+                    return Some(Event::Flash {
+                        frames,
+                        r: ch(2),
+                        g: ch(3),
+                        b: ch(4),
+                    });
+                }
+                None
+            }
+            201 => {
+                // (cg_id, layer, visible). Layer N is `v{id*10+layer}`.
+                // The scripts turn one layer on and the other off; the one
+                // turned on replaces the picture. Turning a layer off leaves
+                // whatever is already showing.
+                if self.ints.len() >= 3 && self.ints[0] > 0 && self.ints[2] != 0 {
+                    return Some(Event::EventCg {
+                        id: self.ints[0] as i64,
+                        variant: self.ints[1].max(0) as u32,
+                        frames: 0,
+                    });
+                }
+                None
+            }
             176 => {
                 // Slot-based overlay graphic: (slot, ?, 2, 256, flag) with
                 // tokens [name, "", dir]. Items (a guitar), effect plates and
@@ -678,9 +739,18 @@ impl<'a> Interp<'a> {
                 // leave the character standing in that slot.
                 if let Some((char_id, series, variant)) = self.pending_sprite.take() {
                     let slot = self.ints.first().copied().unwrap_or(0).max(0) as u32;
-                    return Some(Event::Sprite { char_id, series, variant, slot });
+                    let frames = if id == 155 {
+                        15
+                    } else {
+                        self.ints.get(3).copied().unwrap_or(0).max(0) as u32
+                    };
+                    return Some(Event::Sprite { char_id, series, variant, slot, frames });
                 }
                 None
+            }
+            170 => {
+                let mode = self.ints.first().copied().unwrap_or(1);
+                Some(Event::Window { mode })
             }
             156 => {
                 // Leave. The first int is the character id, not a slot — the

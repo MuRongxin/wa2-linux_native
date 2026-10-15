@@ -11,7 +11,9 @@ What it does (all steps are no-ops when the target already exists):
 
     data/script      <- script.pak            (.bnr bytecode + .txt token pool)
     data/script_cn   <- ck-gal.pak            (CK-GAL Chinese patch text)
-    data/bg          <- grp.pak + bak.pak     (backgrounds, incl. *.amp LUTs)
+    data/bg          <- grp.pak + bak.pak + IC/grp.pak + IC/bak.pak
+                         (backgrounds, event CGs, *.amp LUTs; IC fills files
+                          the base archives omit, e.g. v101700.tga)
     data/bg_cn       <- <game>/grp/*.tga      (31 Chinese UI override images;
                                                the loose dir wins over grp.pak)
     data/sprite      <- char.pak + IC/char.pak  (both sets merged: their file
@@ -108,11 +110,12 @@ def main():
     unpack(args.bin, os.path.join(g, "script.pak"), os.path.join(out, "script"))
     unpack(args.bin, os.path.join(g, "ck-gal.pak"), os.path.join(out, "script_cn"))
 
-    print("[4/6] grp.pak + bak.pak -> bg")
-    for pak in ("grp.pak", "bak.pak"):
-        t = os.path.join(tmp, pak.split(".")[0])
+    print("[4/6] grp.pak + bak.pak + IC/grp.pak + IC/bak.pak -> bg")
+    for pak in ("grp.pak", "bak.pak", "IC/grp.pak", "IC/bak.pak"):
+        t = os.path.join(tmp, pak.replace("/", "_").split(".")[0])
         if unpack(args.bin, os.path.join(g, pak), t):
-            merge(t, os.path.join(out, "bg"))
+            n = merge(t, os.path.join(out, "bg"))
+            print(f"    {pak}: {n} new files")
             shutil.rmtree(t, ignore_errors=True)
     print("   ", len(os.listdir(os.path.join(out, "bg"))), "backgrounds")
 

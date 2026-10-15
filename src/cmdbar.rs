@@ -29,6 +29,9 @@ pub enum Cmd {
     Backlog,
     Auto,
     Skip,
+    /// Fast rewind. Not an original button: it sits in the empty cell and
+    /// uses the skip icon mirrored, so it reads as the opposite of 快进.
+    Rewind,
     Hide,
 }
 
@@ -37,6 +40,7 @@ impl Cmd {
         match self {
             Cmd::Auto => active.auto,
             Cmd::Skip => active.skip,
+            Cmd::Rewind => active.rewind,
             Cmd::Hide => active.hide,
             _ => false,
         }
@@ -46,28 +50,36 @@ impl Cmd {
 struct Btn {
     cmd: Cmd,
     x: i32,
+    /// Column in `sys_00010`. Rewind has none; it is the skip column, mirrored.
+    sheet: Option<i32>,
     /// `sys_00012` row while the toggle is off. Non-toggles use one row.
     label_off: i32,
     /// Row while the toggle is on (`AUTO … ON` / `SKIP … ON`).
     label_on: i32,
 }
 
-/// Same order as the source cells and the executable's position table.
-const BTNS: [Btn; 9] = [
-    Btn { cmd: Cmd::QuickSave, x: 808, label_off: 0, label_on: 0 },
-    Btn { cmd: Cmd::QuickLoad, x: 848, label_off: 1, label_on: 1 },
-    Btn { cmd: Cmd::Config, x: 928, label_off: 2, label_on: 2 },
-    Btn { cmd: Cmd::Save, x: 968, label_off: 3, label_on: 3 },
-    Btn { cmd: Cmd::Load, x: 1008, label_off: 4, label_on: 4 },
-    Btn { cmd: Cmd::Backlog, x: 1048, label_off: 5, label_on: 5 },
-    Btn { cmd: Cmd::Auto, x: 1088, label_off: 7, label_on: 6 },
-    Btn { cmd: Cmd::Skip, x: 1128, label_off: 9, label_on: 8 },
-    Btn { cmd: Cmd::Hide, x: 1168, label_off: 10, label_on: 10 },
+/// Same order as the executable's position table. Rewind occupies the empty
+/// cell the original left between quick-load and config.
+const BTNS: [Btn; 10] = [
+    Btn { cmd: Cmd::QuickSave, x: 808, sheet: Some(0), label_off: 0, label_on: 0 },
+    Btn { cmd: Cmd::QuickLoad, x: 848, sheet: Some(1), label_off: 1, label_on: 1 },
+    Btn { cmd: Cmd::Rewind, x: 888, sheet: None, label_off: 0, label_on: 0 },
+    Btn { cmd: Cmd::Config, x: 928, sheet: Some(2), label_off: 2, label_on: 2 },
+    Btn { cmd: Cmd::Save, x: 968, sheet: Some(3), label_off: 3, label_on: 3 },
+    Btn { cmd: Cmd::Load, x: 1008, sheet: Some(4), label_off: 4, label_on: 4 },
+    Btn { cmd: Cmd::Backlog, x: 1048, sheet: Some(5), label_off: 5, label_on: 5 },
+    Btn { cmd: Cmd::Auto, x: 1088, sheet: Some(6), label_off: 7, label_on: 6 },
+    Btn { cmd: Cmd::Skip, x: 1128, sheet: Some(7), label_off: 9, label_on: 8 },
+    Btn { cmd: Cmd::Hide, x: 1168, sheet: Some(8), label_off: 10, label_on: 10 },
 ];
 
 pub struct CmdBar {
     icons: Option<TgaImage>,
     labels: Option<TgaImage>,
+    /// Skip column flipped left-to-right, three rows of 40×40.
+    rewind: Option<TgaImage>,
+    /// Hover caption. The label sheet has no 快退 row.
+    rewind_label: Option<(u32, u32, Vec<u8>)>,
 }
 
 fn load_img(dirs: &[&Path], name: &str) -> Option<TgaImage> {
@@ -88,9 +100,12 @@ impl CmdBar {
         if icons.is_none() {
             eprintln!("cmdbar: sys_00010.tga not found");
         }
+        let rewind = icons.as_ref().map(|img| flip_column(img, 7));
         CmdBar {
             icons,
             labels: load_img(dirs, "sys_00012.tga"),
+            rewind,
+            rewind_label: crate::render::text::line_rgba("快退", 16),
         }
     }
 
@@ -103,11 +118,14 @@ impl CmdBar {
     }
 
     /// Draw the icons, and the hovered button's caption just above it.
-    pub fn draw(&self, surf: &mut Surface, hover: Option<Cmd>, active: Active) {
+    ///
+    /// `idle_alpha` is how faint the resting icons are (the original sits
+    /// near 100). Hover and the toggled-on state stay at full strength.
+    pub fn draw(&self, surf: &mut Surface, hover: Option<Cmd>, active: Active, idle_alpha: u8) {
         let Some(icons) = self.icons.as_ref() else {
             return;
         };
-        for (i, b) in BTNS.iter().enumerate() {
+        for b in &BTNS {
             let on = b.cmd.is_on(active);
             let row = if on {
                 2
@@ -118,27 +136,77 @@ impl CmdBar {
             };
             // Idle icons sit faint on the window, the way the original draws
             // them. Hover and the toggled-on state come up to full strength.
-            let alpha = if on || hover == Some(b.cmd) { 255 } else { 100 };
-            surf.blit_region_alpha(
-                icons,
-                (i as i32) * CELL,
-                row * CELL,
-                CELL as u32,
-                CELL as u32,
-                b.x,
-                ROW_Y,
-                alpha,
-            );
-        }
-        if let (Some(cmd), Some(labels)) = (hover, self.labels.as_ref()) {
-            if let Some(b) = BTNS.iter().find(|b| b.cmd == cmd) {
-                let row = if b.cmd.is_on(active) { b.label_on } else { b.label_off };
-                // Captions are right-aligned in the 208px strip, so the text
-                // ends just above the icon and the empty left side stays clear.
-                let x = b.x + CELL - LABEL_W;
-                let y = ROW_Y - LABEL_H - 2;
-                surf.blit_region(labels, 0, row * LABEL_H, LABEL_W as u32, LABEL_H as u32, x, y);
+            let alpha = if on || hover == Some(b.cmd) { 255 } else { idle_alpha };
+            if b.cmd == Cmd::Rewind {
+                if let Some(rew) = self.rewind.as_ref() {
+                    surf.blit_region_alpha(
+                        rew, 0, row * CELL, CELL as u32, CELL as u32, b.x, ROW_Y, alpha,
+                    );
+                }
+            } else if let Some(col) = b.sheet {
+                surf.blit_region_alpha(
+                    icons,
+                    col * CELL,
+                    row * CELL,
+                    CELL as u32,
+                    CELL as u32,
+                    b.x,
+                    ROW_Y,
+                    alpha,
+                );
             }
+        }
+        if let Some(cmd) = hover {
+            if cmd == Cmd::Rewind {
+                if let Some((w, h, rgba)) = self.rewind_label.as_ref() {
+                    let b = BTNS.iter().find(|b| b.cmd == Cmd::Rewind).unwrap();
+                    blit_gold(surf, rgba, *w, *h, b.x + CELL - *w as i32, ROW_Y - *h as i32 + 6);
+                }
+            } else if let Some(labels) = self.labels.as_ref() {
+                if let Some(b) = BTNS.iter().find(|b| b.cmd == cmd) {
+                    let row = if b.cmd.is_on(active) { b.label_on } else { b.label_off };
+                    // Captions are right-aligned in the 208px strip, so the text
+                    // ends just above the icon and the empty left side stays clear.
+                    let x = b.x + CELL - LABEL_W;
+                    let y = ROW_Y - LABEL_H - 2;
+                    surf.blit_region(labels, 0, row * LABEL_H, LABEL_W as u32, LABEL_H as u32, x, y);
+                }
+            }
+        }
+    }
+}
+
+/// Skip's column, mirrored, so the double arrow points backward.
+fn flip_column(icons: &TgaImage, col: i32) -> TgaImage {
+    let mut rgba = vec![0u8; (CELL * CELL * 3 * 4) as usize];
+    for row in 0..3 {
+        for y in 0..CELL {
+            for x in 0..CELL {
+                let sx = col * CELL + x;
+                let sy = row * CELL + y;
+                if sx < 0 || sy < 0 || sx >= icons.width as i32 || sy >= icons.height as i32 {
+                    continue;
+                }
+                let si = ((sy as u32 * icons.width + sx as u32) * 4) as usize;
+                let di = (((row * CELL + y) * CELL + (CELL - 1 - x)) * 4) as usize;
+                if si + 3 < icons.rgba.len() && di + 3 < rgba.len() {
+                    rgba[di..di + 4].copy_from_slice(&icons.rgba[si..si + 4]);
+                }
+            }
+        }
+    }
+    TgaImage { width: CELL as u32, height: (CELL * 3) as u32, rgba }
+}
+
+fn blit_gold(surf: &mut Surface, rgba: &[u8], w: u32, h: u32, x: i32, y: i32) {
+    for row in 0..h as i32 {
+        for col in 0..w as i32 {
+            let i = ((row as u32 * w + col as u32) * 4) as usize;
+            let a = rgba[i + 3];
+            if a == 0 {
+                continue;
+            }
+            surf.blend_pixel(x + col, y + row, [255, 214, 64, a]);
         }
     }
 }
@@ -148,6 +216,7 @@ impl CmdBar {
 pub struct Active {
     pub auto: bool,
     pub skip: bool,
+    pub rewind: bool,
     pub hide: bool,
 }
 
@@ -168,16 +237,18 @@ mod integration {
 
         assert_eq!(bar.hit(808, 690), Some(Cmd::QuickSave));
         assert_eq!(bar.hit(847, 719), Some(Cmd::QuickSave));
-        // The executable leaves one empty cell between quick-load and config.
-        assert_eq!(bar.hit(900, 700), None);
+        // The empty cell between quick-load and config is the rewind button.
+        assert_eq!(bar.hit(888, 700), Some(Cmd::Rewind));
+        assert_eq!(bar.hit(900, 700), Some(Cmd::Rewind));
+        assert_eq!(bar.hit(927, 700), Some(Cmd::Rewind));
         assert_eq!(bar.hit(928, 680), Some(Cmd::Config));
         assert_eq!(bar.hit(1168, 700), Some(Cmd::Hide));
         assert_eq!(bar.hit(1208, 700), None);
         assert_eq!(bar.hit(1000, 679), None);
 
         let mut surf = Surface::new(1280, 720, [8, 12, 24, 255]);
-        let active = Active { auto: true, skip: false, hide: false };
-        bar.draw(&mut surf, Some(Cmd::Save), active);
+        let active = Active { auto: true, skip: false, rewind: false, hide: false };
+        bar.draw(&mut surf, Some(Cmd::Save), active, 100);
 
         // Idle quick-save icon is the cyan row.
         let mut cyan = 0u32;
@@ -215,6 +286,36 @@ mod integration {
             }
         }
         assert!(cap > 20, "expected the hover caption, pixels {cap}");
+
+        let mut rew = 0u32;
+        for y in 684..716 {
+            for x in 892..924 {
+                let i = ((y * 1280 + x) * 4) as usize;
+                if surf.pixels[i] != 8 || surf.pixels[i + 1] != 12 || surf.pixels[i + 2] != 24 {
+                    rew += 1;
+                }
+            }
+        }
+        assert!(rew > 20, "expected the rewind icon, pixels {rew}");
+
+        let mut hover_rew = Surface::new(1280, 720, [8, 12, 24, 255]);
+        bar.draw(
+            &mut hover_rew,
+            Some(Cmd::Rewind),
+            Active { auto: false, skip: false, rewind: true, hide: false },
+            100,
+        );
+        let mut cap_rew = 0u32;
+        for y in 640..678 {
+            for x in 820..928 {
+                let i = ((y * 1280 + x) * 4) as usize;
+                if hover_rew.pixels[i] > 180 && hover_rew.pixels[i + 1] > 140 && hover_rew.pixels[i + 3] > 180 {
+                    cap_rew += 1;
+                }
+            }
+        }
+        assert!(cap_rew > 10, "expected the 快退 caption, pixels {cap_rew}");
+        let _ = hover_rew.save_tga("/tmp/wa2btn/rewind_hover.tga");
 
         let _ = std::fs::create_dir_all("/tmp/wa2btn");
         let _ = surf.save_tga("/tmp/wa2btn/cmdbar_preview.tga");
@@ -256,6 +357,9 @@ mod integration {
             true,
             Some(&plate),
             Some(&frame),
+            255,
+            0,
+            &[],
         );
         font.draw_pitch(&mut surf, "春希", crate::render::NAME_X, crate::render::NAME_Y, crate::render::DIALOG_PITCH);
         let dirs = [
@@ -263,7 +367,7 @@ mod integration {
             Path::new("/home/lrxin/wa2-native/data/bg"),
         ];
         let bar = CmdBar::load(&dirs);
-        bar.draw(&mut surf, Some(Cmd::Save), Active { auto: true, skip: false, hide: false });
+        bar.draw(&mut surf, Some(Cmd::Save), Active { auto: true, skip: false, rewind: false, hide: false }, 100);
         // A glyph of the line must land inside the oval, not on the bare background.
         let i = ((600 * 1280 + 700) * 4) as usize;
         assert!(
@@ -275,5 +379,62 @@ mod integration {
         );
         let _ = std::fs::create_dir_all("/tmp/wa2btn");
         let _ = surf.save_tga("/tmp/wa2btn/window_preview.tga");
+    }
+
+    #[test]
+    fn typewriter_and_window_alpha_change_the_frame() {
+        let atlas = crate::codec::tga::decode_font(
+            &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
+        )
+        .unwrap();
+        let font = crate::render::Font::from_cell_map(
+            atlas,
+            40,
+            std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
+        )
+        .unwrap();
+        let plate = crate::codec::tga::decode(
+            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00001.tga").unwrap(),
+        )
+        .unwrap();
+        let frame = crate::codec::tga::decode(
+            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00000.tga").unwrap(),
+        )
+        .unwrap();
+        let bg = crate::codec::tga::TgaImage {
+            width: 1280,
+            height: 720,
+            rgba: vec![70u8, 110, 150, 255].repeat(1280 * 720),
+        };
+        let line = "春希不我";
+        let mut partial = crate::render::render_scene_ex(
+            &bg, "", &font, 1280, 720, &[], None, true, Some(&plate), Some(&frame), 255, 0, &[],
+        );
+        crate::render::draw_dialog_text(&mut partial, &font, line, true, 1280, 720, 1);
+        let full = crate::render::render_scene_ex(
+            &bg, line, &font, 1280, 720, &[], None, true, Some(&plate), Some(&frame), 255, 0, &[],
+        );
+        let bare = crate::render::render_scene_ex(
+            &bg, line, &font, 1280, 720, &[], None, true, Some(&plate), Some(&frame), 0, 0, &[],
+        );
+        let ink = |img: &crate::render::Surface| {
+            let mut n = 0u32;
+            for y in 546..580 {
+                for x in 264..1080 {
+                    let i = ((y * 1280 + x) * 4) as usize;
+                    if img.pixels[i] > 180 && img.pixels[i + 1] > 180 && img.pixels[i + 2] > 180 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let one = ink(&partial);
+        let all = ink(&full);
+        assert!(one > 0, "the first character should leave ink");
+        assert!(all > one, "the rest of the line should add ink, {} vs {}", all, one);
+        // Alpha 0 leaves the flat backdrop; alpha 255 composites the dark plate.
+        let i = ((600 * 1280 + 700) * 4) as usize;
+        assert!(full.pixels[i] < bare.pixels[i], "the plate should darken that pixel");
     }
 }

@@ -8,6 +8,7 @@ mod render;
 mod save;
 mod saveload;
 mod sdl2;
+mod timeline;
 mod video;
 mod vm;
 
@@ -107,7 +108,7 @@ fn main() {
                 Some(d)
             });
             let surf =
-                render::render_scene_ex(&bg, &page.text(), &font, 1280, 720, &[], lut.as_deref(), true, None, None);
+                render::render_scene_ex(&bg, &page.text(), &font, 1280, 720, &[], lut.as_deref(), true, None, None, 255, 0, &[]);
             if let Err(e) = surf.save_tga(&args[6]) { eprintln!("error writing {}: {}", args[6], e); std::process::exit(1); }
             println!("scene {} (voice={:?} bg={:?} next={:?}): {} lines, {} chars -> {}",
                 args[2], page.voice, page.background, page.next, page.lines.len(), page.text().chars().count(), args[6]);
@@ -245,7 +246,10 @@ fn main() {
                         sdl2::Input::Drag { .. } => {}
                         sdl2::Input::None => win.delay(16),
                         sdl2::Input::Choice(_) => win.delay(16),
-                        sdl2::Input::Pointer { .. } => win.delay(16),
+                        sdl2::Input::Pointer { .. } | sdl2::Input::Release { .. } => win.delay(16),
+                        sdl2::Input::Wheel { y } if y < 0 => { if idx < n - 1 { idx += 1; } break; }
+                        sdl2::Input::Wheel { .. } => win.delay(16),
+                        sdl2::Input::Rewind => win.delay(16),
                     }
                 }
             }
@@ -350,7 +354,11 @@ fn main() {
                         sdl2::Input::Drag { .. } => {}
                         sdl2::Input::Choice(_) => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Pointer { pressed, .. } => { if pressed && idx < n - 1 { idx += 1; break; } win.delay(16); }
+                        sdl2::Input::Release { .. } => win.delay(16),
                         sdl2::Input::None => { win.delay(16); }
+                        sdl2::Input::Wheel { y } if y < 0 => { if idx < n - 1 { idx += 1; } break; }
+                        sdl2::Input::Wheel { .. } => win.delay(16),
+                        sdl2::Input::Rewind => win.delay(16),
                     }
                 }
             }
@@ -368,7 +376,7 @@ fn main() {
                 let start_id = args.get(2).cloned().unwrap_or_else(|| "1001".to_string());
                 let font = match load_font(&d) { Some(f) => f, None => return };
                 eprintln!(
-                    "wa2-native run: data={} start={} (Space/Click=next, Left=back, 1-9=choice, Esc/q=quit)",
+                    "wa2-native run: data={} start={} (Space/Click=next, Up/Wheel=rewind, PageUp=fast rewind, 1-9=choice, Esc/q=quit)",
                     d.describe(), start_id
                 );
                 let session = Session::from_data(&d, None);
@@ -431,10 +439,16 @@ fn main() {
                 eprintln!("wa2-native title: data={}", d.describe());
                 (font, session, start_id, bg_dir)
             };
-            match run_title(&mut win, &font, &session.bg_dirs(), session.bg_cn.is_some()) {
+            match run_title(&mut win, &font, &session.bg_dirs(), &session.script_dir, session.bg_cn.is_some()) {
                 TitleAction::Start => {
                     eprintln!("title: starting scene {}", start_id);
                     if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
+                        eprintln!("run error: {}", e);
+                    }
+                }
+                TitleAction::Jump(id) => {
+                    eprintln!("title: timeline jump {}", id);
+                    if let Err(e) = run_game(&mut win, &font, &session, &id) {
                         eprintln!("run error: {}", e);
                     }
                 }
@@ -497,17 +511,22 @@ fn main() {
                         }
                         vm::lscr::Event::BgScene { id, variant, frames } =>
                             println!("  [bg  ] id={} var={} frames={}", id, variant, frames),
+                        vm::lscr::Event::EventCg { id, variant, frames } =>
+                            println!("  [cg  ] id={} var={} frames={}", id, variant, frames),
+                        vm::lscr::Event::Flash { frames, r, g, b } =>
+                            println!("  [flash] {},{},{} {}f", r, g, b, frames),
                         vm::lscr::Event::Overlay { name, slot } => println!("  [ovl ] slot={} {}", slot, name),
                         vm::lscr::Event::WaitFrames(n) => println!("  [wait] {} frames", n),
                         vm::lscr::Event::Sound { opcode, args } =>
                             println!("  [sound] ACT{} {:?}", opcode, args),
                         vm::lscr::Event::Tint { name } => println!("  [tint] {}", if name.is_empty() { "<none>" } else { &name }),
                         vm::lscr::Event::Movie { name } => println!("  [mv  ] {}", name),
-                        vm::lscr::Event::Sprite { char_id, series, variant, slot } =>
-                            println!("  [spr ] char={} series={} variant={} slot={}", char_id, series, variant, slot),
+                        vm::lscr::Event::Sprite { char_id, series, variant, slot, frames } =>
+                            println!("  [spr ] char={} series={} variant={} slot={} frames={}", char_id, series, variant, slot, frames),
                         vm::lscr::Event::SpriteExit { char_id, frames } =>
                             println!("  [spr-] char={} frames={}", char_id, frames),
                         vm::lscr::Event::SpriteFocus { char_id } => println!("  [fo-c] {}", char_id),
+                        vm::lscr::Event::Window { mode } => println!("  [win ] mode={}", mode),
                         vm::lscr::Event::Choice { options } => {
                             let pick = seq.get(seq_i).copied().unwrap_or(1);
                             seq_i += 1;
@@ -593,6 +612,12 @@ fn load_scenario(script_dir: &std::path::Path, id: &str) -> Option<Vec<u8>> {
 /// WA2 scripts sometimes reference a suffixed variant (e.g. `v100200_bg.tga`)
 /// while the archive contains the base name (`v100200.tga`). We try the exact
 /// name first, then strip common suffixes.
+/// ACT148 / ACT201 file. The exe's mode-1 sprintf is `v%06d.tga` of
+/// `id * 10 + variant`: 10170 variant 0 is `v101700.tga`.
+fn event_cg_name(id: i64, variant: u32) -> String {
+    format!("v{:06}.tga", id * 10 + variant as i64)
+}
+
 fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::TgaImage> {
     // Build candidate names: exact, then with suffixes stripped.
     let mut candidates = vec![name.to_string()];
@@ -761,7 +786,9 @@ impl BgIndex {
                     Err(_) => continue,
                 };
                 let lower = name.to_ascii_lowercase();
-                if !lower.starts_with('b') || !lower.ends_with(".tga") {
+                let picture = (lower.starts_with('b') || lower.starts_with('v'))
+                    && lower.ends_with(".tga");
+                if !picture {
                     continue;
                 }
                 let digits = lower[1..lower.len() - 4].to_string();
@@ -769,13 +796,23 @@ impl BgIndex {
                     continue;
                 }
                 let id: u32 = digits[..4].parse().unwrap_or(0);
+                let incoming_b = lower.starts_with('b');
                 by_name.entry(lower).or_insert_with(|| name.clone());
                 match by_id.entry(id) {
                     Entry::Vacant(v) => {
                         v.insert(name.clone());
                     }
                     Entry::Occupied(mut o) => {
-                        if digits.ends_with("00") {
+                        let held_b = o
+                            .get()
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|c| *c == b'b' || *c == b'B');
+                        // `b*` is the background. A `v*` CG fills the id only
+                        // when no background file was shipped for it.
+                        if incoming_b && (digits.ends_with("00") || !held_b) {
+                            o.insert(name.clone());
+                        } else if !incoming_b && !held_b && digits.ends_with("00") {
                             o.insert(name.clone());
                         }
                     }
@@ -785,14 +822,19 @@ impl BgIndex {
         BgIndex { by_name, by_id }
     }
 
-    /// `b{id:04}{variant:02}.tga`, else any file of that id.
+    /// `b{id:04}{variant:02}.tga`, then the same number as a CG (`v*`),
+    /// else any file of that id.
+    ///
+    /// Event CGs (ACT148) do not use this. Their file is `v{id*10+variant:06}`.
     fn resolve(&self, id: i64, variant: u32) -> Option<String> {
         if id <= 0 {
             return None;
         }
-        let exact = format!("b{:04}{:02}.tga", id, variant);
-        if let Some(n) = self.by_name.get(&exact) {
-            return Some(n.clone());
+        for prefix in ["b", "v"] {
+            let exact = format!("{}{:04}{:02}.tga", prefix, id, variant);
+            if let Some(n) = self.by_name.get(&exact) {
+                return Some(n.clone());
+            }
         }
         self.by_id.get(&(id as u32)).cloned()
     }
@@ -905,6 +947,15 @@ fn run_game_at(
     let mut cmd_skip = false;
     // Lines already shown, for the 履历 (backlog) screen.
     let mut backlog: Vec<String> = Vec::new();
+    // One snapshot per line the player has been shown, newest last. Rewind
+    // pops the line on screen and puts the previous one back, picture included.
+    let mut history: Vec<LineSnap> = Vec::new();
+    let mut rewind_left: i32 = 0;
+    let mut cmd_rewind = false;
+    let mut line_voice: Option<vm::lscr::VoiceCue> = None;
+    // Set when rewind restored a line whose script is not the one loaded now.
+    let mut park_wait = false;
+    let mut rewind_vm: Option<vm::lscr::InterpState> = None;
     let mut current_id = start_id.to_string();
     // Black until the script sets one: WA2 opens on a black screen (the IC
     // prologue's "sepia.AMP" is a color-filter LUT, not a background image).
@@ -965,9 +1016,26 @@ fn run_game_at(
     // Active `.AMP` colour curve (sepia flashbacks, negative, ...).
     let mut tint: Option<Vec<u8>> = None;
     let mut focus: Option<u32> = None;
-    // 「ウィンドウ一時消去」: when false, the dialog box and its text are hidden
-    // (the scene art stays). Toggled by the bottom command bar.
+    // 「ウィンドウ一時消去」. The button and the script (ACT170) are separate:
+    // fast-forward must not light the button or fold the box the player left open.
+    let mut user_hide = false;
+    let mut script_open = true;
     let mut window = true;
+    let mut line_no: u32 = 0;
+    // ACT176 plates living on top of the background until the next scene.
+    let mut plates: Vec<Plate> = Vec::new();
+    // True when the current background is a CG (`v*`), which picks the CG
+    // window opacity and skips the novel-mode dim.
+    let mut bg_cg = false;
+    // Lines this install has already shown. Skip mode consults it when
+    // 「未读文本」 is selected.
+    let mut seen = load_seen();
+    // Typewriter: `line_base` is the frame with the window and the name but
+    // no body. Each tick paints a longer prefix onto a copy of it.
+    let mut line_base: Option<render::Surface> = None;
+    let mut line_done = true;
+    let mut reveal: usize = 0;
+    let mut type_tick: u32 = 0;
     // Only these three are extra bookkeeping for save/load. The dialog box is
     // not state - `cur_surf` holds the composited pixels but not the string -
     // and the decoded background/tint cannot be stored, so their ids and names
@@ -976,6 +1044,9 @@ fn run_game_at(
     let mut last_speaker: Option<String> = None;
     let mut tint_name: Option<String> = None;
     let mut bg_id: Option<(i64, u32)> = None;
+    // What the screen is actually showing. Printed with every line so a black
+    // frame can be told apart from a missing file.
+    let mut bg_label = String::from("BLACK");
     // ---- resume from a save slot ----------------------------------------
     if let Some(snap) = resume.as_ref() {
         current_id = snap.scene.clone();
@@ -983,8 +1054,28 @@ fn run_game_at(
         if let Some((id, variant)) = snap.bg {
             if let Some(name) = s.bg_index.resolve(id, variant) {
                 if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                    bg_cg = name.starts_with('v') || name.starts_with('V');
+                    bg_label = name.clone();
+                    eprintln!("scene {} | bg {} id={} var={}", current_id, name, id, variant);
                     bg = img;
+                } else {
+                    eprintln!(
+                        "scene {} | bg id={} var={} file {} FAILED to decode, screen stays {}",
+                        current_id, id, variant, name, bg_label
+                    );
                 }
+            } else if let Some(img) = load_background(&s.bg_dirs(), &event_cg_name(id, variant)) {
+                // A save made on an event CG stores the script id (10170),
+                // which is not a `b{id:04}{var:02}` background.
+                bg_cg = true;
+                bg_label = event_cg_name(id, variant);
+                eprintln!("scene {} | cg {} id={} var={}", current_id, bg_label, id, variant);
+                bg = img;
+            } else {
+                eprintln!(
+                    "scene {} | bg MISSING id={} var={}, screen stays {}",
+                    current_id, id, variant, bg_label
+                );
             }
         }
         tint_name = snap.tint.clone();
@@ -1029,9 +1120,28 @@ fn run_game_at(
                 }
             }
         }
-        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
+        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
         win.present(&cur_surf);
         eprintln!("load: scene {} at pc {}", current_id, snap.vm.pc);
+        remember(
+            &mut history,
+            capture_line(
+                &current_id,
+                snap.vm.clone(),
+                bg_id,
+                bg_cg,
+                &bg_label,
+                &tint_name,
+                &slots,
+                focus,
+                &last_text,
+                &last_speaker,
+                bgm_track.map(|(id, _)| id),
+                script_open,
+                &plates,
+                None,
+            ),
+        );
         // The save was taken while the engine waited for input, and `pc` is
         // already past that wait, so the saved line has to be shown and waited
         // on here - otherwise the interpreter would run straight into the next
@@ -1063,18 +1173,36 @@ fn run_game_at(
         let mut it = vm::lscr::Interp::new(&prog);
         // The saved position belongs to the first scene only; a later scene
         // change means the player moved on, so it starts from its entry point.
-        if let Some(snap) = resume.take() {
+        if let Some(vm) = rewind_vm.take() {
+            it.restore(vm);
+        } else if let Some(snap) = resume.take() {
             it.restore(snap.vm);
         }
-        loop {
-            match it.next_event() {
+        'events: loop {
+            let event = if park_wait {
+                park_wait = false;
+                vm::lscr::Event::Wait
+            } else {
+                it.next_event()
+            };
+            match event {
                 vm::lscr::Event::Text { text, speaker, voice } => {
                     let body = clean_text(&text);
+                    let voice_id = match voice {
+                        Some(v) => format!("{}_{:04}_{:02}", v.scenario, v.line, v.char_id),
+                        None => "-".to_string(),
+                    };
                     let muted = voice
                         .and_then(|c| menu::char_row_of(c.char_id))
                         .map(|row| settings.char_voice[row] == 0)
                         .unwrap_or(false);
                     let cue = voice.filter(|_| !muted);
+                    line_voice = cue;
+                    // 「未读文本」: an unseen line drops out of skip and is shown.
+                    let seen_key = format!("{}\t{}", current_id, body.replace('\n', " "));
+                    if cmd_skip && settings.text_skip == 1 && !seen.contains(&seen_key) {
+                        cmd_skip = false;
+                    }
                     if cmd_skip {
                         // Starting a clip per skipped line piles ffmpeg jobs up
                         // across a scene change, and the one still audible is
@@ -1083,20 +1211,116 @@ fn run_game_at(
                         if let Some(mx) = mixer.as_ref() {
                             stop_voice(mx, &mut voice_stream);
                         }
-                    } else if let (Some(mx), Some(vi), Some(cue)) = (mixer.as_ref(), voices.as_ref(), cue) {
-                        skipped_voice = None;
-                        play_voice(mx, vi, &settings, &mut voice_stream, cue);
-                    } else if settings.page_voice == 1 {
-                        skipped_voice = None;
-                        if let Some(mx) = mixer.as_ref() {
-                            stop_voice(mx, &mut voice_stream);
-                        }
                     }
-                    cur_surf = draw_scene(&bg, &body, speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
-                    win.present(&cur_surf);
-                    // Remember the current line for save (last_text) and backlog.
                     last_speaker = speaker.clone();
                     last_text = body.clone();
+                    // A spoken line opens the box again. ACT170(0) only hides
+                    // it across the scene change that came before this line.
+                    if !user_hide {
+                        script_open = true;
+                    }
+                    window = dialog_open(user_hide, script_open, cmd_skip);
+                    line_no += 1;
+                    let cast = slots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| {
+                            s.as_ref().map(|a| {
+                                format!("{}:{}", i, a.name.trim_end_matches(".tga"))
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let cast = if cast.is_empty() {
+                        "-".to_string()
+                    } else {
+                        cast
+                    };
+                    let focus_id = focus
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    // The Chinese patch stores text as Shift-JIS code points and
+                    // paints the real glyphs into the font. Those code points are
+                    // not the characters on screen, so the log keeps the voice
+                    // id instead of printing them.
+                    let cn = s.script_dir.file_name().and_then(|n| n.to_str()) == Some("script_cn");
+                    if cn {
+                        eprintln!(
+                            "scene {} | line {} | bg {} | sprites {} | focus {} | window {} | voice {}",
+                            current_id,
+                            line_no,
+                            bg_label,
+                            cast,
+                            focus_id,
+                            if window { "open" } else { "hidden" },
+                            voice_id
+                        );
+                    } else {
+                        let who = speaker.as_deref().unwrap_or("-");
+                        let preview = body.replace('\n', " / ");
+                        let preview: String = preview.chars().take(42).collect();
+                        eprintln!(
+                            "scene {} | line {} | bg {} | sprites {} | focus {} | window {} | voice {} | {} | {}",
+                            current_id,
+                            line_no,
+                            bg_label,
+                            cast,
+                            focus_id,
+                            if window { "open" } else { "hidden" },
+                            voice_id,
+                            who,
+                            preview
+                        );
+                    }
+                    // Speed 0, skip, and the headless auto run reveal the line at
+                    // once. Otherwise the wait loop types it onto `line_base`.
+                    let instant = cmd_skip
+                        || auto_text
+                        || settings.text_speed == 0
+                        || !window
+                        || body.is_empty();
+                    if instant {
+                        line_base = None;
+                        line_done = true;
+                        reveal = body.chars().count();
+                        cur_surf = draw_scene(&bg, &body, speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                        win.present(&cur_surf);
+                    } else {
+                        line_base = Some(draw_scene(&bg, "", speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg)));
+                        reveal = 0;
+                        line_done = false;
+                        type_tick = 0;
+                        // The name is on screen before the voice starts. Drawing
+                        // the line takes long enough that starting the clip
+                        // first played the next sentence over the previous one.
+                        if let Some(base) = line_base.as_ref() {
+                            let mut frame = clone_surf(base);
+                            let active = cmdbar::Active {
+                                auto: cmd_auto,
+                                skip: cmd_skip,
+                                rewind: cmd_rewind,
+                                hide: user_hide,
+                            };
+                            bar.draw(&mut frame, None, active, cmd_idle(&settings));
+                            cur_surf = frame;
+                            win.present(&cur_surf);
+                        }
+                    }
+                    // The picture for this line is up. Start its clip now, so
+                    // the `voice:` line in the log belongs to the scene line
+                    // just printed and not to the one still on screen.
+                    if !cmd_skip {
+                        if let (Some(mx), Some(vi), Some(cue)) = (mixer.as_ref(), voices.as_ref(), cue) {
+                            skipped_voice = None;
+                            play_voice(mx, vi, &settings, &mut voice_stream, cue);
+                        } else if settings.page_voice == 1 {
+                            skipped_voice = None;
+                            if let Some(mx) = mixer.as_ref() {
+                                stop_voice(mx, &mut voice_stream);
+                            }
+                        }
+                    }
+                    // Remember the current line for save (last_text) and backlog.
                     let logged = match &speaker {
                         Some(sp) => format!("{}：{}", sp, body),
                         None => body.clone(),
@@ -1104,7 +1328,9 @@ fn run_game_at(
                     backlog.push(logged);
                     if backlog.len() > 200 { backlog.remove(0); }
                 }
-                vm::lscr::Event::Sprite { char_id, series, variant, slot } => {
+                vm::lscr::Event::Sprite { char_id, series, variant, slot, frames } => {
+                    let old = clone_surf(&cur_surf);
+                    let mut changed = false;
                     if let Some(bank) = bank.as_mut() {
                         if let Some(name) = bank.resolve(char_id, series, variant) {
                             if let Some(img) = bank.get(&name) {
@@ -1119,8 +1345,9 @@ fn run_game_at(
                                     }
                                 }
                                 if let Some(dst) = slots.get_mut(idx) {
-                                    eprintln!("  sprite: {} (char {}, slot {})", name, char_id, idx);
+                                    eprintln!("  sprite: {} (char {}, slot {}, {}f)", name, char_id, idx, frames);
                                     *dst = Some(ActiveSprite { char_id, name, img });
+                                    changed = true;
                                 } else {
                                     eprintln!("  sprite: slot {} out of range", idx);
                                 }
@@ -1129,8 +1356,20 @@ fn run_game_at(
                             eprintln!("  sprite: char {} series {:03} variant {:03} not found", char_id, series, variant);
                         }
                     }
+                    if changed {
+                        line_base = None;
+                        line_done = true;
+                        // The previous line has already been advanced past. Leave
+                        // the box empty until the next line, so the old speaker's
+                        // words are not left sitting on the new face.
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                        if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
+                            return Ok(None);
+                        }
+                    }
                 }
                 vm::lscr::Event::SpriteExit { char_id, frames } => {
+                    let old = clone_surf(&cur_surf);
                     let before = slots.iter().flatten().filter(|a| a.char_id == char_id).count();
                     for s in slots.iter_mut() {
                         if s.as_ref().is_some_and(|a| a.char_id == char_id) {
@@ -1138,6 +1377,14 @@ fn run_game_at(
                         }
                     }
                     eprintln!("  sprite exit: char {} ({}f, removed {})", char_id, frames, before);
+                    if before > 0 {
+                        line_base = None;
+                        line_done = true;
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                        if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
+                            return Ok(None);
+                        }
+                    }
                 }
                 vm::lscr::Event::SpriteFocus { char_id } => {
                     focus = Some(char_id);
@@ -1161,30 +1408,141 @@ fn run_game_at(
                             }
                         }
                     };
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::BgScene { id, variant, frames } => {
-                    // ACT146/147: the real background op. 0 and -2 mean black.
-                    bg_id = if id == 0 || id == -2 { None } else { Some((id, variant)) };
+                    // ACT146/147. id 0 and -2 are a scripted black screen.
+                    // A missing file keeps the picture already on screen.
+                    let old = clone_surf(&cur_surf);
                     if id == 0 || id == -2 {
-                        eprintln!("  bg: <black> (id {})", id);
+                        plates.clear();
+                        bg_cg = false;
+                        bg_id = None;
+                        bg_label = "BLACK".to_string();
                         bg = solid_bg(W, H, [0, 0, 0]);
+                        // id 0 is a fade-out: the shot is over, so the people
+                        // from it must leave. id -2 keeps whoever is standing
+                        // (the cut to black in 1010 still has them in frame).
+                        // Without this, 依緒 and 雪菜 stay on screen through the
+                        // whole rest of 1012_030, including the park and the
+                        // narration that is only about かずさ.
+                        if id == 0 {
+                            slots = Default::default();
+                        }
+                        eprintln!(
+                            "scene {} | bg BLACK (script id {} fade {}f)",
+                            current_id, id, frames
+                        );
                     } else if let Some(name) = s.bg_index.resolve(id, variant) {
                         if let Some(img) = load_background(&s.bg_dirs(), &name) {
-                            eprintln!("  bg: {} (id {} var {} fade {}f)", name, id, variant, frames);
+                            plates.clear();
+                            bg_cg = name.starts_with('v') || name.starts_with('V');
+                            bg_id = Some((id, variant));
+                            bg_label = name.clone();
                             bg = img;
+                            eprintln!(
+                                "scene {} | bg {} id={} var={} fade={}f",
+                                current_id, name, id, variant, frames
+                            );
+                        } else {
+                            eprintln!(
+                                "scene {} | bg id={} var={} file {} FAILED to decode, screen stays {}",
+                                current_id, id, variant, name, bg_label
+                            );
                         }
                     } else {
-                        eprintln!("  bg: id {} var {} has no file, keeping current", id, variant);
+                        eprintln!(
+                            "scene {} | bg MISSING id={} var={}, screen stays {}",
+                            current_id, id, variant, bg_label
+                        );
                     }
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
-                    win.present(&cur_surf);
+                    line_base = None;
+                    line_done = true;
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                    if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
+                        return Ok(None);
+                    }
+                }
+                vm::lscr::Event::EventCg { id, variant, frames } => {
+                    // ACT148 replaces the standing shot with one picture.
+                    // ACT201 turning a layer on comes through as the same
+                    // event (frames 0) and swaps that layer in.
+                    let old = clone_surf(&cur_surf);
+                    let name = event_cg_name(id, variant);
+                    if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                        plates.clear();
+                        slots = Default::default();
+                        bg_cg = true;
+                        bg_id = Some((id, variant));
+                        bg_label = name.clone();
+                        bg = img;
+                        eprintln!(
+                            "scene {} | cg {} id={} var={} fade={}f",
+                            current_id, name, id, variant, frames
+                        );
+                    } else {
+                        eprintln!(
+                            "scene {} | cg MISSING {} id={} var={}, screen stays {}",
+                            current_id, name, id, variant, bg_label
+                        );
+                    }
+                    line_base = None;
+                    line_done = true;
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                    if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
+                        return Ok(None);
+                    }
+                }
+                vm::lscr::Event::Flash { frames, r, g, b } => {
+                    // ACT152. The picture snaps to the colour and eases back.
+                    // Skip and "effects off" drop it; a click cuts it short.
+                    eprintln!(
+                        "scene {} | flash {},{},{} {}f",
+                        current_id, r, g, b, frames
+                    );
+                    let play = !cmd_skip && settings.effect != 0 && frames > 0;
+                    if play && present_flash(win, &cur_surf, frames, r, g, b) {
+                        return Ok(None);
+                    }
                 }
                 vm::lscr::Event::Overlay { name, slot } => {
-                    // Items / effect plates / composite-CG layers. Layered
-                    // rendering is not implemented yet, so this only records it.
-                    eprintln!("  overlay: slot {} {}", slot, name);
+                    if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                        plates.retain(|p| p.slot != slot);
+                        eprintln!("  overlay: slot {} {} ({}x{})", slot, name, img.width, img.height);
+                        plates.push(Plate { slot, name, img });
+                        line_base = None;
+                        line_done = true;
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                        win.present(&cur_surf);
+                    } else {
+                        eprintln!("  overlay: slot {} {} NOT FOUND", slot, name);
+                    }
+                }
+                vm::lscr::Event::Window { mode } => {
+                    // 0 closes the box for a scene change, 1 opens it again.
+                    // Skip is reading the lines, so a scene-change close must
+                    // not fold the box or light the hide button.
+                    if mode == 0 || mode == 1 {
+                        if cmd_skip {
+                            eprintln!(
+                                "scene {} | window mode {} ignored while skipping",
+                                current_id, mode
+                            );
+                        } else {
+                            script_open = mode == 1;
+                            window = dialog_open(user_hide, script_open, false);
+                            eprintln!(
+                                "scene {} | window {}",
+                                current_id,
+                                if script_open { "open" } else { "closed by script" }
+                            );
+                            line_base = None;
+                            line_done = true;
+                            cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                            win.present(&cur_surf);
+                        }
+                    }
                 }
                 vm::lscr::Event::WaitFrames(n) => {
                     // Scripted pause (camera holds, fades). Skip mode does not
@@ -1200,6 +1558,7 @@ fn run_game_at(
                                     let (sx, sy) = win.surface_pos(x, y, W, H);
                                     if bar.hit(sx, sy) == Some(cmdbar::Cmd::Skip) {
                                         cmd_skip = true;
+                                        window = dialog_open(user_hide, script_open, true);
                                     }
                                 }
                                 _ => {}
@@ -1325,38 +1684,37 @@ fn run_game_at(
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::Choice { options } => {
-                    let opts: Vec<String> = options
-                        .iter()
-                        .map(|o| {
-                            let c = clean_text(o);
-                            vm::strip_choice_prefix(&c).unwrap_or(c)
-                        })
-                        .collect();
-                    let mut body = String::from("\u{2014}\u{2014} \u{9009}\u{62e9} \u{2014}\u{2014}\n");
-                    for (i, o) in opts.iter().enumerate() {
-                        body.push_str(&format!("{}. {}\n", i + 1, o));
-                    }
-                    // Option i sits on text line i+1 (line 0 is the header), so its
-                    // screen band is known and can be used for pointer hit testing.
-                    // Render the plain frame once and copy it per frame - a full
-                    // re-render is far too slow to repeat while the mouse moves.
+                    // The script's own lines already carry 「１．」「２．」. A made-up
+                    // header would push a third option out of the three-line window.
+                    let opts: Vec<String> = options.iter().map(|o| clean_text(o)).collect();
+                    let body = opts.join("\n");
+                    // The choice often arrives while ACT170 has the window closed.
+                    // Drawing with that flag drops the text entirely, so the
+                    // picture freezes with nothing to pick. The options open it.
                     let line_h = if msg_plate.is_some() {
                         render::DIALOG_LINE
                     } else {
                         font.cell() as i32 + 4
                     };
-                    // Same origin render_scene_ex uses once the game window is up.
                     let text_y = if msg_plate.is_some() {
                         render::DIALOG_TEXT_Y
                     } else {
                         let box_h = (H / 4).min(160).max(120);
                         (H - box_h - 44) as i32 + 18
                     };
-                    let opt_top = |i: usize| text_y + (i as i32 + 1) * line_h;
-                    let base = draw_scene(&bg, &body, None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
+                    let opt_top = |i: usize| text_y + i as i32 * line_h;
+                    // Plate only. The highlight is painted under the glyphs, and
+                    // the glyphs are redrawn each frame — a full scene rebuild
+                    // is far too slow to repeat while the mouse moves.
+                    let base = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), true, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
                     let mut hover: Option<usize> = None;
                     let mut bar_hover: Option<cmdbar::Cmd> = None;
-                    cur_surf = draw_scene(&bg, &body, None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref());
+                    cur_surf = render::Surface {
+                        width: base.width,
+                        height: base.height,
+                        pixels: base.pixels.clone(),
+                    };
+                    render::draw_dialog_text(&mut cur_surf, font, &body, msg_plate.is_some(), W, H, usize::MAX);
                     win.present(&cur_surf);
                     eprintln!(
                         "  choice: presenting {} options (click one, or press 1-{})",
@@ -1368,6 +1726,108 @@ fn run_game_at(
                         1u32
                     } else {
                         loop {
+                            if cmd_rewind || rewind_left > 0 {
+                                let announce = !cmd_rewind && rewind_left <= 1;
+                                let cruising = cmd_rewind || rewind_left > 1;
+                                match take_rewind(&mut history, false) {
+                                    None => {
+                                        cmd_rewind = false;
+                                        rewind_left = 0;
+                                    }
+                                    Some(dest) => {
+                                        if rewind_left > 0 {
+                                            rewind_left -= 1;
+                                        }
+                                        let step = rewind_step(
+                                            &dest,
+                                            &mut it,
+                                            &mut current_id,
+                                            &mut rewind_vm,
+                                            s,
+                                            font,
+                                            win,
+                                            &mut bg,
+                                            &mut bg_cg,
+                                            &mut bg_label,
+                                            &mut bg_id,
+                                            &mut tint,
+                                            &mut tint_name,
+                                            &mut slots,
+                                            &mut bank,
+                                            &mut focus,
+                                            &mut plates,
+                                            &mut last_text,
+                                            &mut last_speaker,
+                                            &mut script_open,
+                                            user_hide,
+                                            &mut window,
+                                            &settings,
+                                            msg_plate.as_ref(),
+                                            msg_frame.as_ref(),
+                                            &mut cur_surf,
+                                            &mut line_base,
+                                            &mut line_done,
+                                            &mut reveal,
+                                            mixer.as_ref(),
+                                            &mut bgm_track,
+                                            &mut fading_bgm,
+                                            &mut voice_stream,
+                                            voices.as_ref(),
+                                            &mut line_voice,
+                                            announce,
+                                        );
+                                        match step {
+                                            RewindStep::Shown => {
+                                                present_rewind_frame(
+                                                    win,
+                                                    &cur_surf,
+                                                    &bar,
+                                                    bar_hover,
+                                                    cmdbar::Active {
+                                                        auto: cmd_auto,
+                                                        skip: false,
+                                                        rewind: cmd_rewind,
+                                                        hide: user_hide,
+                                                    },
+                                                    cmd_idle(&settings),
+                                                );
+                                                if cruising {
+                                                    match rewind_cruise_stop(win, &bar, &mut bar_hover) {
+                                                        Cruise::Quit => return Ok(None),
+                                                        Cruise::Keep => {
+                                                            win.delay(16);
+                                                            continue;
+                                                        }
+                                                        Cruise::Stop => {}
+                                                    }
+                                                }
+                                                cmd_rewind = false;
+                                                rewind_left = 0;
+                                                park_wait = true;
+                                                continue 'events;
+                                            }
+                                            RewindStep::Reload => {
+                                                present_rewind_frame(
+                                                    win,
+                                                    &cur_surf,
+                                                    &bar,
+                                                    bar_hover,
+                                                    cmdbar::Active {
+                                                        auto: cmd_auto,
+                                                        skip: false,
+                                                        rewind: cmd_rewind,
+                                                        hide: user_hide,
+                                                    },
+                                                    cmd_idle(&settings),
+                                                );
+                                                park_wait = true;
+                                                break 'events;
+                                            }
+                                            RewindStep::Stuck => {}
+                                        }
+                                    }
+                                }
+                            }
                             let mut frame = render::Surface {
                                 width: base.width,
                                 height: base.height,
@@ -1383,10 +1843,16 @@ fn run_game_at(
                                 } else {
                                     (40, W - 80)
                                 };
-                                frame.fill_rect(hx, y, hw, (line_h + 4) as u32, [130, 190, 255, 70]);
+                                frame.fill_rect(hx, y, hw, (line_h + 4) as u32, [40, 70, 120, 255]);
                             }
-                            let active = cmdbar::Active { auto: cmd_auto, skip: cmd_skip, hide: !window };
-                            bar.draw(&mut frame, bar_hover, active);
+                            render::draw_dialog_text(&mut frame, font, &body, msg_plate.is_some(), W, H, usize::MAX);
+                            let active = cmdbar::Active {
+                                auto: cmd_auto,
+                                skip: cmd_skip,
+                                rewind: cmd_rewind,
+                                hide: user_hide,
+                            };
+                            bar.draw(&mut frame, bar_hover, active, cmd_idle(&settings));
                             win.present(&frame);
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
@@ -1399,9 +1865,29 @@ fn run_game_at(
                                     if let Some(cmd) = bar.hit(sx, sy) {
                                         if pressed {
                                             match cmd {
-                                                cmdbar::Cmd::Auto => cmd_auto = !cmd_auto,
+                                                cmdbar::Cmd::Auto => {
+                                                    cmd_auto = !cmd_auto;
+                                                    if cmd_auto {
+                                                        cmd_rewind = false;
+                                                        rewind_left = 0;
+                                                    }
+                                                }
+                                                cmdbar::Cmd::Rewind => {
+                                                    cmd_rewind = !cmd_rewind;
+                                                    if cmd_rewind {
+                                                        cmd_skip = false;
+                                                        cmd_auto = false;
+                                                    } else {
+                                                        rewind_left = 0;
+                                                    }
+                                                }
                                                 cmdbar::Cmd::Skip => {
                                                     cmd_skip = !cmd_skip;
+                                                    if cmd_skip {
+                                                        cmd_rewind = false;
+                                                        rewind_left = 0;
+                                                    }
+                                                    window = dialog_open(user_hide, script_open, cmd_skip);
                                                     if let Some(mx) = mixer.as_ref() {
                                                         if cmd_skip {
                                                             stop_voice(mx, &mut voice_stream);
@@ -1411,7 +1897,10 @@ fn run_game_at(
                                                     }
                                                 },
                                                 cmdbar::Cmd::Hide => {
-                                                    window = !window;
+                                                    user_hide = !user_hide;
+                                                    window = dialog_open(user_hide, script_open, cmd_skip);
+                                                    line_base = None;
+                                                    line_done = true;
                                                     cur_surf = draw_scene(
                                                         &bg,
                                                         &last_text,
@@ -1423,7 +1912,10 @@ fn run_game_at(
                                                         H,
                                                         tint.as_deref(),
                                                         window,
-                                                        msg_plate.as_ref(), msg_frame.as_ref(),
+                                                        msg_plate.as_ref(),
+                                                        msg_frame.as_ref(),
+                                                        &plates,
+                                                        scene_look(&settings, bg_cg),
                                                     );
                                                 }
                                                 other => match handle_cmd(
@@ -1467,6 +1959,25 @@ fn run_game_at(
                                         win.delay(16);
                                     }
                                 }
+                                sdl2::Input::Wheel { y } if y > 0 => {
+                                    cmd_skip = false;
+                                    cmd_auto = false;
+                                    rewind_left += y.max(1);
+                                }
+                                sdl2::Input::Up => {
+                                    cmd_skip = false;
+                                    cmd_auto = false;
+                                    rewind_left += 1;
+                                }
+                                sdl2::Input::Rewind => {
+                                    cmd_rewind = !cmd_rewind;
+                                    if cmd_rewind {
+                                        cmd_skip = false;
+                                        cmd_auto = false;
+                                    } else {
+                                        rewind_left = 0;
+                                    }
+                                }
                                 _ => win.delay(16),
                             }
                         }
@@ -1478,20 +1989,195 @@ fn run_game_at(
                 vm::lscr::Event::Wait => {
                     // Always draw the command bar, even in auto-advance modes, so
                     // the player can toggle auto/skip off or open save/load/config.
+                    remember(
+                        &mut history,
+                        capture_line(
+                            &current_id,
+                            it.snapshot(),
+                            bg_id,
+                            bg_cg,
+                            &bg_label,
+                            &tint_name,
+                            &slots,
+                            focus,
+                            &last_text,
+                            &last_speaker,
+                            bgm_track.map(|(id, _)| id),
+                            script_open,
+                            &plates,
+                            line_voice,
+                        ),
+                    );
                     let mut cmd_hover: Option<cmdbar::Cmd> = None;
                     let mut dwell: u32 = 0;
                     'wait: loop {
-                            let mut frame = render::Surface {
-                                width: cur_surf.width,
-                                height: cur_surf.height,
-                                pixels: cur_surf.pixels.clone(),
+                            if cmd_rewind || rewind_left > 0 {
+                                let announce = !cmd_rewind && rewind_left <= 1;
+                                let cruising = cmd_rewind || rewind_left > 1;
+                                match take_rewind(&mut history, true) {
+                                    None => {
+                                        cmd_rewind = false;
+                                        rewind_left = 0;
+                                    }
+                                    Some(dest) => {
+                                        if rewind_left > 0 {
+                                            rewind_left -= 1;
+                                        }
+                                        backlog.pop();
+                                        let step = rewind_step(
+                                            &dest,
+                                            &mut it,
+                                            &mut current_id,
+                                            &mut rewind_vm,
+                                            s,
+                                            font,
+                                            win,
+                                            &mut bg,
+                                            &mut bg_cg,
+                                            &mut bg_label,
+                                            &mut bg_id,
+                                            &mut tint,
+                                            &mut tint_name,
+                                            &mut slots,
+                                            &mut bank,
+                                            &mut focus,
+                                            &mut plates,
+                                            &mut last_text,
+                                            &mut last_speaker,
+                                            &mut script_open,
+                                            user_hide,
+                                            &mut window,
+                                            &settings,
+                                            msg_plate.as_ref(),
+                                            msg_frame.as_ref(),
+                                            &mut cur_surf,
+                                            &mut line_base,
+                                            &mut line_done,
+                                            &mut reveal,
+                                            mixer.as_ref(),
+                                            &mut bgm_track,
+                                            &mut fading_bgm,
+                                            &mut voice_stream,
+                                            voices.as_ref(),
+                                            &mut line_voice,
+                                            announce,
+                                        );
+                                        match step {
+                                            RewindStep::Stuck => {}
+                                            RewindStep::Shown => {
+                                                present_rewind_frame(
+                                                    win,
+                                                    &cur_surf,
+                                                    &bar,
+                                                    cmd_hover,
+                                                    cmdbar::Active {
+                                                        auto: false,
+                                                        skip: false,
+                                                        rewind: cruising,
+                                                        hide: user_hide,
+                                                    },
+                                                    cmd_idle(&settings),
+                                                );
+                                                if cruising {
+                                                    match rewind_cruise_stop(win, &bar, &mut cmd_hover) {
+                                                        Cruise::Quit => return Ok(None),
+                                                        Cruise::Keep => {
+                                                            win.delay(16);
+                                                            continue 'wait;
+                                                        }
+                                                        Cruise::Stop => {}
+                                                    }
+                                                }
+                                                cmd_rewind = false;
+                                                rewind_left = 0;
+                                                continue 'wait;
+                                            }
+                                            RewindStep::Reload => {
+                                                present_rewind_frame(
+                                                    win,
+                                                    &cur_surf,
+                                                    &bar,
+                                                    cmd_hover,
+                                                    cmdbar::Active {
+                                                        auto: false,
+                                                        skip: false,
+                                                        rewind: cmd_rewind,
+                                                        hide: user_hide,
+                                                    },
+                                                    cmd_idle(&settings),
+                                                );
+                                                park_wait = true;
+                                                break 'events;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !line_done {
+                                if cmd_skip {
+                                    reveal = last_text.chars().count();
+                                } else {
+                                    type_tick += 1;
+                                    let (step, every) = match settings.text_speed {
+                                        1 => (2usize, 1u32),
+                                        2 => (1, 2),
+                                        _ => (1, 3),
+                                    };
+                                    if type_tick >= every {
+                                        type_tick = 0;
+                                        reveal = reveal.saturating_add(step);
+                                    }
+                                }
+                                if reveal >= last_text.chars().count() {
+                                    reveal = last_text.chars().count();
+                                    line_done = true;
+                                    dwell = 0;
+                                }
+                            }
+                            if line_done {
+                                if let Some(base) = line_base.take() {
+                                    let mut full = clone_surf(&base);
+                                    render::draw_dialog_text(
+                                        &mut full,
+                                        font,
+                                        &last_text,
+                                        msg_plate.is_some(),
+                                        W,
+                                        H,
+                                        usize::MAX,
+                                    );
+                                    cur_surf = full;
+                                }
+                            }
+                            let mut frame = if !line_done {
+                                if let Some(base) = line_base.as_ref() {
+                                    let mut partial = clone_surf(base);
+                                    render::draw_dialog_text(
+                                        &mut partial,
+                                        font,
+                                        &last_text,
+                                        msg_plate.is_some(),
+                                        W,
+                                        H,
+                                        reveal,
+                                    );
+                                    // Saves and the hide button read `cur_surf`, so it
+                                    // has to be the text actually on screen.
+                                    cur_surf = clone_surf(&partial);
+                                    partial
+                                } else {
+                                    clone_surf(&cur_surf)
+                                }
+                            } else {
+                                clone_surf(&cur_surf)
                             };
                             let active = cmdbar::Active {
                                 auto: cmd_auto,
                                 skip: cmd_skip,
-                                hide: !window,
+                                rewind: cmd_rewind,
+                                hide: user_hide,
                             };
-                            bar.draw(&mut frame, cmd_hover, active);
+                            bar.draw(&mut frame, cmd_hover, active, cmd_idle(&settings));
                             win.present(&frame);
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
@@ -1530,9 +2216,30 @@ fn run_game_at(
                                     let (sx, sy) = win.surface_pos(x, y, W, H);
                                     match bar.hit(sx, sy) {
                                         Some(cmd) if pressed => match cmd {
-                                            cmdbar::Cmd::Auto => cmd_auto = !cmd_auto,
+                                            cmdbar::Cmd::Auto => {
+                                                cmd_auto = !cmd_auto;
+                                                if cmd_auto {
+                                                    cmd_rewind = false;
+                                                    rewind_left = 0;
+                                                }
+                                            }
+                                            cmdbar::Cmd::Rewind => {
+                                                cmd_rewind = !cmd_rewind;
+                                                if cmd_rewind {
+                                                    cmd_skip = false;
+                                                    cmd_auto = false;
+                                                    window = dialog_open(user_hide, script_open, false);
+                                                    continue 'wait;
+                                                }
+                                                rewind_left = 0;
+                                            }
                                             cmdbar::Cmd::Skip => {
                                                 cmd_skip = !cmd_skip;
+                                                if cmd_skip {
+                                                    cmd_rewind = false;
+                                                    rewind_left = 0;
+                                                }
+                                                window = dialog_open(user_hide, script_open, cmd_skip);
                                                 if let Some(mx) = mixer.as_ref() {
                                                     if cmd_skip {
                                                         stop_voice(mx, &mut voice_stream);
@@ -1542,7 +2249,10 @@ fn run_game_at(
                                                 }
                                             },
                                             cmdbar::Cmd::Hide => {
-                                                window = !window;
+                                                user_hide = !user_hide;
+                                                window = dialog_open(user_hide, script_open, cmd_skip);
+                                                line_base = None;
+                                                line_done = true;
                                                 cur_surf = draw_scene(
                                                     &bg,
                                                     &last_text,
@@ -1554,7 +2264,10 @@ fn run_game_at(
                                                     H,
                                                     tint.as_deref(),
                                                     window,
-                                                    msg_plate.as_ref(), msg_frame.as_ref(),
+                                                    msg_plate.as_ref(),
+                                                    msg_frame.as_ref(),
+                                                    &plates,
+                                                    scene_look(&settings, bg_cg),
                                                 );
                                             }
                                             other => match handle_cmd(
@@ -1584,17 +2297,71 @@ fn run_game_at(
                                         None => {
                                             cmd_hover = None;
                                             if pressed {
-                                                break 'wait;
+                                                if cmd_rewind || rewind_left > 0 {
+                                                    cmd_rewind = false;
+                                                    rewind_left = 0;
+                                                } else if !line_done {
+                                                    reveal = last_text.chars().count();
+                                                    line_done = true;
+                                                    dwell = 0;
+                                                } else {
+                                                    break 'wait;
+                                                }
                                             }
                                         }
                                     }
                                 },
-                                sdl2::Input::Advance => break 'wait,
+                                sdl2::Input::Advance => {
+                                    if cmd_rewind || rewind_left > 0 {
+                                        cmd_rewind = false;
+                                        rewind_left = 0;
+                                    } else if !line_done {
+                                        reveal = last_text.chars().count();
+                                        line_done = true;
+                                        dwell = 0;
+                                    } else {
+                                        break 'wait;
+                                    }
+                                }
+                                // Wheel down is the next line. Wheel up rewinds.
+                                sdl2::Input::Wheel { y } if y < 0 => {
+                                    if cmd_rewind || rewind_left > 0 {
+                                        cmd_rewind = false;
+                                        rewind_left = 0;
+                                    } else {
+                                        if !line_done {
+                                            reveal = last_text.chars().count();
+                                            line_done = true;
+                                        }
+                                        break 'wait;
+                                    }
+                                }
+                                sdl2::Input::Wheel { y } if y > 0 => {
+                                    cmd_skip = false;
+                                    cmd_auto = false;
+                                    rewind_left += y.max(1);
+                                    continue 'wait;
+                                }
+                                sdl2::Input::Up => {
+                                    cmd_skip = false;
+                                    cmd_auto = false;
+                                    rewind_left += 1;
+                                    continue 'wait;
+                                }
+                                sdl2::Input::Rewind => {
+                                    cmd_rewind = !cmd_rewind;
+                                    if cmd_rewind {
+                                        cmd_skip = false;
+                                        cmd_auto = false;
+                                        continue 'wait;
+                                    }
+                                    rewind_left = 0;
+                                }
                                 // No new event: keep the hover caption where it is.
                                 sdl2::Input::None => {}
                                 _ => cmd_hover = None,
                             }
-                            if auto_text || cmd_auto || cmd_skip {
+                            if line_done && (auto_text || cmd_auto || cmd_skip) {
                                 dwell += 16;
                                 // Skip ignores the slider. Auto holds for the
                                 // menu's 「自动模式速度」, and a line that has
@@ -1613,6 +2380,7 @@ fn run_game_at(
                             }
                             win.delay(16);
                         }
+                        note_seen(&mut seen, &current_id, &last_text);
                     }
                 vm::lscr::Event::Jump { target, kind } => {
                     eprintln!("  {} -> {}", kind, target);
@@ -1625,8 +2393,12 @@ fn run_game_at(
                         }
                     }
                     current_id = target;
+                    line_no = 0;
                     // new scene: standing sprites do not carry over
                     slots = Default::default();
+                    plates.clear();
+                    line_base = None;
+                    line_done = true;
                     focus = None;
                     bank.as_mut().map(|b| b.cache.clear());
                     break;
@@ -1637,6 +2409,254 @@ fn run_game_at(
                 }
             }
         }
+    }
+}
+
+/// One line the player already stood on. Rewind restores this instead of
+/// replaying the script backwards.
+#[derive(Clone)]
+struct LineSnap {
+    scene: String,
+    vm: vm::lscr::InterpState,
+    bg: Option<(i64, u32)>,
+    bg_cg: bool,
+    bg_label: String,
+    tint_name: Option<String>,
+    slots: Vec<Option<(u32, String)>>,
+    focus: Option<u32>,
+    text: String,
+    speaker: Option<String>,
+    bgm: Option<i32>,
+    script_open: bool,
+    plates: Vec<(u32, String)>,
+    voice: Option<vm::lscr::VoiceCue>,
+}
+
+const HISTORY_MAX: usize = 400;
+
+fn slot_keys(slots: &[Option<ActiveSprite>; SPRITE_SLOTS]) -> Vec<Option<(u32, String)>> {
+    slots.iter().map(|s| s.as_ref().map(|a| (a.char_id, a.name.clone()))).collect()
+}
+
+fn plate_keys(plates: &[Plate]) -> Vec<(u32, String)> {
+    plates.iter().map(|p| (p.slot, p.name.clone())).collect()
+}
+
+fn capture_line(
+    scene: &str,
+    vm: vm::lscr::InterpState,
+    bg: Option<(i64, u32)>,
+    bg_cg: bool,
+    bg_label: &str,
+    tint_name: &Option<String>,
+    slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
+    focus: Option<u32>,
+    text: &str,
+    speaker: &Option<String>,
+    bgm: Option<i32>,
+    script_open: bool,
+    plates: &[Plate],
+    voice: Option<vm::lscr::VoiceCue>,
+) -> LineSnap {
+    LineSnap {
+        scene: scene.to_string(),
+        vm,
+        bg,
+        bg_cg,
+        bg_label: bg_label.to_string(),
+        tint_name: tint_name.clone(),
+        slots: slot_keys(slots),
+        focus,
+        text: text.to_string(),
+        speaker: speaker.clone(),
+        bgm,
+        script_open,
+        plates: plate_keys(plates),
+        voice,
+    }
+}
+
+fn remember(history: &mut Vec<LineSnap>, snap: LineSnap) {
+    let same = history.last().is_some_and(|h| {
+        h.scene == snap.scene && h.vm.pc == snap.vm.pc && h.text == snap.text
+    });
+    if same {
+        return;
+    }
+    history.push(snap);
+    if history.len() > HISTORY_MAX {
+        history.remove(0);
+    }
+}
+
+/// `pop_current` drops the line on screen (a text wait). A choice has not
+/// pushed its own snapshot, so rewind restores the line already at the top.
+fn take_rewind<T: Clone>(history: &mut Vec<T>, pop_current: bool) -> Option<T> {
+    if pop_current {
+        if history.len() < 2 {
+            return None;
+        }
+        history.pop();
+    } else if history.is_empty() {
+        return None;
+    }
+    history.last().cloned()
+}
+
+enum RewindStep {
+    /// Nothing earlier than the line on screen.
+    Stuck,
+    /// Picture and interpreter are back on an earlier line of this script.
+    Shown,
+    /// The earlier line belongs to another script. `rewind_vm` is set.
+    Reload,
+}
+
+/// Put `dest` on screen and arm the interpreter when the script matches.
+fn rewind_step(
+    dest: &LineSnap,
+    it: &mut vm::lscr::Interp,
+    current_id: &mut String,
+    rewind_vm: &mut Option<vm::lscr::InterpState>,
+    s: &Session,
+    font: &render::Font,
+    win: &mut sdl2::Sdl,
+    bg: &mut codec::tga::TgaImage,
+    bg_cg: &mut bool,
+    bg_label: &mut String,
+    bg_id: &mut Option<(i64, u32)>,
+    tint: &mut Option<Vec<u8>>,
+    tint_name: &mut Option<String>,
+    slots: &mut [Option<ActiveSprite>; SPRITE_SLOTS],
+    bank: &mut Option<SpriteBank>,
+    focus: &mut Option<u32>,
+    plates: &mut Vec<Plate>,
+    last_text: &mut String,
+    last_speaker: &mut Option<String>,
+    script_open: &mut bool,
+    user_hide: bool,
+    window: &mut bool,
+    settings: &menu::Settings,
+    msg_plate: Option<&codec::tga::TgaImage>,
+    msg_frame: Option<&codec::tga::TgaImage>,
+    cur_surf: &mut render::Surface,
+    line_base: &mut Option<render::Surface>,
+    line_done: &mut bool,
+    reveal: &mut usize,
+    mixer: Option<&audio::Mixer>,
+    bgm_track: &mut Option<(i32, usize)>,
+    fading_bgm: &mut Option<usize>,
+    voice_stream: &mut Option<usize>,
+    voices: Option<&VoiceIndex>,
+    line_voice: &mut Option<vm::lscr::VoiceCue>,
+    announce: bool,
+) -> RewindStep {
+    if mixer.is_some() {
+        stop_voice(mixer.unwrap(), voice_stream);
+    }
+    if bg_id != &dest.bg || bg_label != &dest.bg_label {
+        if let Some((id, variant)) = dest.bg {
+            let name = if dest.bg_cg {
+                event_cg_name(id, variant)
+            } else {
+                s.bg_index.resolve(id, variant).unwrap_or_else(|| dest.bg_label.clone())
+            };
+            if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                *bg = img;
+            }
+        } else {
+            *bg = solid_bg(1280, 720, [0, 0, 0]);
+        }
+        *bg_id = dest.bg;
+        *bg_cg = dest.bg_cg;
+        *bg_label = dest.bg_label.clone();
+    }
+    if tint_name != &dest.tint_name {
+        *tint_name = dest.tint_name.clone();
+        *tint = dest.tint_name.as_deref().and_then(|n| load_tint(&s.bg_dirs(), n));
+    }
+    if slot_keys(slots) != dest.slots {
+        *slots = Default::default();
+        for (i, entry) in dest.slots.iter().enumerate() {
+            let Some((char_id, name)) = entry else { continue };
+            let Some(img) = bank.as_mut().and_then(|b| b.get(name)).cloned() else { continue };
+            if let Some(dst) = slots.get_mut(i) {
+                *dst = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img });
+            }
+        }
+    }
+    if plate_keys(plates) != dest.plates {
+        plates.clear();
+        for (slot, name) in &dest.plates {
+            if let Some(img) = load_background(&s.bg_dirs(), name) {
+                plates.push(Plate { slot: *slot, name: name.clone(), img });
+            }
+        }
+    }
+    *focus = dest.focus;
+    *last_text = dest.text.clone();
+    *last_speaker = dest.speaker.clone();
+    *script_open = dest.script_open;
+    // Keep the message box up, the way skip does, so the function buttons
+    // stay on the window instead of vanishing into the picture.
+    *window = dialog_open(user_hide, *script_open, true);
+    *line_voice = dest.voice;
+    *line_base = None;
+    *line_done = true;
+    *reveal = last_text.chars().count();
+    if let Some(mx) = mixer {
+        if bgm_track.map(|(id, _)| id) != dest.bgm {
+            if let Some(slot) = fading_bgm.take() {
+                mx.stop(slot);
+            }
+            if let Some((_, slot)) = bgm_track.take() {
+                mx.stop(slot);
+            }
+            if let Some(id) = dest.bgm {
+                let dir = s.script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
+                let stem = format!("BGM_{:03}", id);
+                let path = [format!("{}.OGG", stem), format!("{}_A.OGG", stem)]
+                    .into_iter()
+                    .map(|n| dir.join(n))
+                    .find(|p| p.is_file());
+                if let Some(path) = path {
+                    let slot = mx.play_cat(&path.to_string_lossy(), 1.0, true, audio::mixer::CAT_BGM);
+                    if slot != usize::MAX {
+                        *bgm_track = Some((id, slot));
+                    }
+                }
+            }
+        }
+    }
+    *cur_surf = draw_scene(
+        bg,
+        last_text,
+        last_speaker.as_deref(),
+        font,
+        slots,
+        *focus,
+        1280,
+        720,
+        tint.as_deref(),
+        *window,
+        msg_plate,
+        msg_frame,
+        plates,
+        scene_look(settings, *bg_cg),
+    );
+    if announce {
+        if let (Some(mx), Some(vi), Some(cue)) = (mixer, voices, dest.voice) {
+            play_voice(mx, vi, settings, voice_stream, cue);
+        }
+    }
+    eprintln!("rewind: scene {} pc {}", dest.scene, dest.vm.pc);
+    if dest.scene == *current_id {
+        it.restore(dest.vm.clone());
+        RewindStep::Shown
+    } else {
+        *current_id = dest.scene.clone();
+        *rewind_vm = Some(dest.vm.clone());
+        RewindStep::Reload
     }
 }
 
@@ -1681,6 +2701,160 @@ enum CmdOutcome {
     Quit,
 }
 
+fn centered_plate(w: i32, h: i32) -> (i32, i32) {
+    ((1280 - w) / 2, (720 - h) / 2)
+}
+
+fn in_box(sx: i32, sy: i32, b: (i32, i32, i32, i32)) -> bool {
+    sx >= b.0 && sx < b.0 + b.2 && sy >= b.1 && sy < b.1 + b.3
+}
+
+/// Yes on the left, no on the right, along the bottom of the confirm plate.
+fn ask_buttons(px: i32, py: i32, pw: i32, ph: i32) -> [(i32, i32, i32, i32); 2] {
+    let bw = 160;
+    let bh = 40;
+    let x = px + (pw - bw * 2) / 2;
+    let y = py + ph - bh - 28;
+    [(x, y, bw, bh), (x + bw, y, bw, bh)]
+}
+
+fn blit_line(surf: &mut render::Surface, text: Option<&(u32, u32, Vec<u8>)>, px: i32, py: i32, pw: i32, ph: i32) {
+    if let Some((tw, th, rgba)) = text {
+        let x = px + (pw - *tw as i32) / 2;
+        let y = py + (ph - *th as i32) / 2 - 8;
+        surf.blit_rgba(rgba, *tw, *th, x.max(px + 8), y.max(py + 8));
+    }
+}
+
+fn paint_toast(
+    frame: &render::Surface,
+    plate: Option<&codec::tga::TgaImage>,
+    text: Option<&(u32, u32, Vec<u8>)>,
+) -> render::Surface {
+    let mut s = clone_surf(frame);
+    s.dim(110);
+    let (pw, ph) = plate
+        .map(|p| (p.width as i32, p.height as i32))
+        .unwrap_or((480, 112));
+    let (px, py) = centered_plate(pw, ph);
+    if let Some(p) = plate {
+        s.blit(p, px, py);
+    } else {
+        s.fill_rect(px, py, pw as u32, ph as u32, [16, 90, 104, 255]);
+    }
+    blit_line(&mut s, text, px, py, pw, ph);
+    s
+}
+
+fn paint_confirm(
+    frame: &render::Surface,
+    plate: Option<&codec::tga::TgaImage>,
+    buttons: Option<&codec::tga::TgaImage>,
+    text: Option<&(u32, u32, Vec<u8>)>,
+    hover: Option<bool>,
+) -> render::Surface {
+    let mut s = clone_surf(frame);
+    s.dim(140);
+    let (pw, ph) = plate
+        .map(|p| (p.width as i32, p.height as i32))
+        .unwrap_or((544, 216));
+    let (px, py) = centered_plate(pw, ph);
+    if let Some(p) = plate {
+        s.blit(p, px, py);
+    } else {
+        s.fill_rect(px, py, pw as u32, ph as u32, [16, 90, 104, 255]);
+    }
+    // The prompt sits in the upper half; the 是/否 row owns the bottom.
+    if let Some((tw, th, rgba)) = text {
+        let x = px + (pw - *tw as i32) / 2;
+        s.blit_rgba(rgba, *tw, *th, x.max(px + 16), py + 48);
+    }
+    if let Some(img) = buttons {
+        let boxes = ask_buttons(px, py, pw, ph);
+        for (i, rect) in boxes.iter().enumerate() {
+            let hot = hover == Some(i == 0);
+            let row = if hot { 1 } else { 0 };
+            s.blit_region(img, (i as i32) * 160, row * 40, 160, 40, rect.0, rect.1);
+        }
+    }
+    s
+}
+
+/// Short confirmation that a quick save landed. A click dismisses it early.
+/// `false` means the player closed the window.
+fn show_toast(
+    win: &mut sdl2::Sdl,
+    frame: &render::Surface,
+    dirs: &[&std::path::Path],
+    message: &str,
+) -> bool {
+    let plate = load_background(dirs, "sys_00110.tga");
+    let text = render::text::line_rgba(message, 22);
+    let surf = paint_toast(frame, plate.as_ref(), text.as_ref());
+    win.present(&surf);
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_millis(900) {
+        match win.poll_input() {
+            sdl2::Input::Quit => return false,
+            sdl2::Input::Pointer { pressed: true, .. }
+            | sdl2::Input::Advance
+            | sdl2::Input::Back => return true,
+            _ => win.delay(16),
+        }
+    }
+    true
+}
+
+/// Yes / no over `sys_00100` + `sys_00101`. `None` is the window being closed.
+fn ask_yes_no(
+    win: &mut sdl2::Sdl,
+    frame: &render::Surface,
+    dirs: &[&std::path::Path],
+    message: &str,
+) -> Option<bool> {
+    let plate = load_background(dirs, "sys_00100.tga");
+    let buttons = load_background(dirs, "sys_00101.tga");
+    let text = render::text::line_rgba(message, 22);
+    let (pw, ph) = plate
+        .as_ref()
+        .map(|p| (p.width as i32, p.height as i32))
+        .unwrap_or((544, 216));
+    let (px, py) = centered_plate(pw, ph);
+    let boxes = ask_buttons(px, py, pw, ph);
+    let mut mx = -1i32;
+    let mut my = -1i32;
+    loop {
+        let hover = if in_box(mx, my, boxes[0]) {
+            Some(true)
+        } else if in_box(mx, my, boxes[1]) {
+            Some(false)
+        } else {
+            None
+        };
+        let surf = paint_confirm(frame, plate.as_ref(), buttons.as_ref(), text.as_ref(), hover);
+        win.present(&surf);
+        match win.poll_input() {
+            sdl2::Input::Quit => return None,
+            sdl2::Input::Back | sdl2::Input::RightClick => return Some(false),
+            sdl2::Input::Pointer { x, y, pressed } => {
+                let (sx, sy) = win.surface_pos(x, y, 1280, 720);
+                mx = sx;
+                my = sy;
+                if pressed {
+                    if in_box(sx, sy, boxes[0]) {
+                        return Some(true);
+                    }
+                    if in_box(sx, sy, boxes[1]) {
+                        return Some(false);
+                    }
+                }
+            }
+            _ => {}
+        }
+        win.delay(16);
+    }
+}
+
 /// Handle a command-bar button that opens a modal screen (保存/读档/设置/履历).
 /// The toggle buttons (自动/跳过/隐藏) are handled inline by the caller.
 fn handle_cmd(
@@ -1703,6 +2877,7 @@ fn handle_cmd(
 ) -> CmdOutcome {
     match cmd {
         cmdbar::Cmd::QuickSave => {
+            let cn = s.script_dir.file_name().and_then(|n| n.to_str()) == Some("script_cn");
             let st = make_save(
                 it,
                 current_id,
@@ -1713,17 +2888,39 @@ fn handle_cmd(
                 last_text,
                 bgm,
             );
-            if let Err(e) = st.save_to(&save::quick_path()) {
-                eprintln!("qsave: {}", e);
+            let ok = st.save_to(&save::quick_path()).is_ok();
+            let message = match (cn, ok) {
+                (true, true) => "已快速保存",
+                (true, false) => "快速保存失败",
+                (false, true) => "クイックセーブしました",
+                (false, false) => "クイックセーブに失敗しました",
+            };
+            eprintln!("scene {} | quick save {}", current_id, if ok { "ok" } else { "FAILED" });
+            if show_toast(win, frame, &s.bg_dirs(), message) {
+                CmdOutcome::Stay
+            } else {
+                CmdOutcome::Quit
             }
-            CmdOutcome::Stay
         }
         cmdbar::Cmd::QuickLoad => {
-            if let Some(st) = save::SaveState::load_from(&save::quick_path()) {
-                CmdOutcome::Loaded(st)
-            } else {
-                eprintln!("qload: no quick save");
-                CmdOutcome::Stay
+            let cn = s.script_dir.file_name().and_then(|n| n.to_str()) == Some("script_cn");
+            let Some(st) = save::SaveState::load_from(&save::quick_path()) else {
+                let message = if cn { "没有快速存档" } else { "クイックセーブがありません" };
+                eprintln!("scene {} | quick load: no file", current_id);
+                return if show_toast(win, frame, &s.bg_dirs(), message) {
+                    CmdOutcome::Stay
+                } else {
+                    CmdOutcome::Quit
+                };
+            };
+            let message = if cn { "要读取快速存档吗？" } else { "クイックロードしますか？" };
+            match ask_yes_no(win, frame, &s.bg_dirs(), message) {
+                Some(true) => {
+                    eprintln!("scene {} | quick load confirmed", current_id);
+                    CmdOutcome::Loaded(st)
+                }
+                Some(false) => CmdOutcome::Stay,
+                None => CmdOutcome::Quit,
             }
         }
         cmdbar::Cmd::Save => {
@@ -1757,7 +2954,7 @@ fn handle_cmd(
             CmdOutcome::Stay
         }
         cmdbar::Cmd::Backlog => {
-            show_backlog(win, font, backlog);
+            show_backlog(win, font, backlog, frame, &s.bg_dirs());
             CmdOutcome::Stay
         }
         // toggles are handled by the caller
@@ -1765,42 +2962,202 @@ fn handle_cmd(
     }
 }
 
-/// 履历 (backlog) viewer: scroll through recently shown lines.
-fn show_backlog(win: &mut sdl2::Sdl, font: &render::Font, lines: &[String]) {
-    const W: u32 = 1280;
-    const H: u32 = 720;
-    if lines.is_empty() {
-        return;
-    }
-    let cell = font.cell() as i32;
-    let line_h = cell + 6;
-    let per_page = ((H as i32 - 80) / line_h) as usize;
-    let total = lines.len();
-    let mut top = total.saturating_sub(per_page).max(0);
-    loop {
-        let mut surf = render::Surface::new(W, H, [6, 8, 16, 245]);
-        surf.fill_rect(20, 16, W - 40, H - 32, [12, 16, 30, 235]);
-        surf.fill_rect(20, 16, W - 40, 2, [150, 180, 230, 255]);
-        let mut y = 40;
-        for i in top..total.min(top + per_page) {
-            font.draw(&mut surf, &lines[i], 40, y);
-            y += line_h;
+/// One visual row of the text history. An empty string is a gap between lines.
+fn backlog_rows(lines: &[String]) -> Vec<String> {
+    let max_w = 1080;
+    let mut rows = Vec::new();
+    for line in lines {
+        let (name, body) = match line.split_once('：') {
+            Some((n, b)) if !n.is_empty() => (Some(n), b),
+            _ => (None, line.as_str()),
+        };
+        if let Some(n) = name {
+            push_wrapped(&mut rows, n, max_w);
         }
-        font.draw(&mut surf, "↑/↓ 翻页 · Enter/Esc 关闭", 40, H as i32 - 36);
+        if body.is_empty() {
+            rows.push(String::new());
+        } else {
+            for part in body.split('\n') {
+                push_wrapped(&mut rows, part, max_w);
+            }
+        }
+        rows.push(String::new());
+    }
+    rows
+}
+
+fn push_wrapped(rows: &mut Vec<String>, text: &str, max_w: i32) {
+    let mut buf = String::new();
+    let mut x = 0i32;
+    for ch in text.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        let adv = if (ch as u32) < 128 { 14 } else { 28 };
+        if x + adv > max_w && !buf.is_empty() {
+            rows.push(std::mem::take(&mut buf));
+            x = 0;
+        }
+        buf.push(ch);
+        x += adv;
+    }
+    if !buf.is_empty() {
+        rows.push(buf);
+    }
+}
+
+fn paint_backlog(
+    scene: &render::Surface,
+    font: &render::Font,
+    rows: &[String],
+    top: usize,
+    per_page: usize,
+    header: Option<&codec::tga::TgaImage>,
+    scroll: Option<&codec::tga::TgaImage>,
+    hover_bar: bool,
+    dragging: bool,
+) -> render::Surface {
+    const LINE_H: i32 = 32;
+    const TEXT_X: i32 = 72;
+    const TEXT_Y: i32 = 52;
+    const TEXT_BOTTOM: i32 = 688;
+    const BAR_X: i32 = 1232;
+    const BAR_Y: i32 = 40;
+    const BAR_H: i32 = 640;
+    const COL_W: i32 = 32;
+    let mut surf = render::Surface {
+        width: scene.width,
+        height: scene.height,
+        pixels: scene.pixels.clone(),
+    };
+    surf.dim(120);
+    if let Some(h) = header {
+        surf.blit(h, 0, 0);
+    }
+    let mut y = TEXT_Y;
+    for row in rows.iter().skip(top).take(per_page) {
+        if !row.is_empty() {
+            font.draw_pitch(&mut surf, row, TEXT_X, y, render::DIALOG_PITCH);
+        }
+        y += LINE_H;
+        if y >= TEXT_BOTTOM {
+            break;
+        }
+    }
+    let total = rows.len();
+    let max_top = total.saturating_sub(per_page);
+    if let Some(sb) = scroll {
+        let col = if dragging {
+            2
+        } else if hover_bar {
+            1
+        } else {
+            0
+        };
+        surf.blit_region(sb, col * COL_W, 0, COL_W as u32, BAR_H as u32, BAR_X, BAR_Y);
+        if max_top > 0 {
+            let track_y = BAR_Y + COL_W;
+            let track_h = BAR_H - COL_W * 2;
+            let thumb_h = ((track_h as usize) * per_page / total.max(1)).max(28) as i32;
+            let thumb_h = thumb_h.min(track_h);
+            let thumb_y = track_y + (track_h - thumb_h) * top as i32 / max_top as i32;
+            let src_h = thumb_h.min(BAR_H - 80).max(8) as u32;
+            surf.blit_region(sb, 2 * COL_W, 80, COL_W as u32, src_h, BAR_X, thumb_y);
+        }
+    }
+    surf
+}
+
+/// 文本历史. The banner is the game's own `sys_00032` ("Backlog"), the bar on
+/// the right is `sys_00030`, and the lines sit on the dimmed scene in the
+/// same face as the message window.
+fn show_backlog(
+    win: &mut sdl2::Sdl,
+    font: &render::Font,
+    lines: &[String],
+    scene: &render::Surface,
+    dirs: &[&std::path::Path],
+) {
+    const W: u32 = 1280;
+    const LINE_H: i32 = 32;
+    const TEXT_X: i32 = 72;
+    const TEXT_Y: i32 = 52;
+    const TEXT_BOTTOM: i32 = 688;
+    const BAR_X: i32 = 1232;
+    const BAR_Y: i32 = 40;
+    const BAR_H: i32 = 640;
+    const COL_W: i32 = 32;
+    let rows = backlog_rows(lines);
+    let per_page = ((TEXT_BOTTOM - TEXT_Y) / LINE_H) as usize;
+    let total = rows.len();
+    let max_top = total.saturating_sub(per_page);
+    let mut top = max_top;
+    let header = load_background(dirs, "sys_00032.tga");
+    let scroll = load_background(dirs, "sys_00030.tga");
+    let mut pointer: Option<(i32, i32)> = None;
+    let mut drag_top: Option<i32> = None;
+    loop {
+        let hover_bar = pointer
+            .map(|(x, yy)| x >= BAR_X && x < BAR_X + COL_W && yy >= BAR_Y && yy < BAR_Y + BAR_H)
+            .unwrap_or(false);
+        let surf = paint_backlog(
+            scene,
+            font,
+            &rows,
+            top,
+            per_page,
+            header.as_ref(),
+            scroll.as_ref(),
+            hover_bar,
+            drag_top.is_some(),
+        );
         win.present(&surf);
         match win.poll_input() {
-            sdl2::Input::Quit => return,
-            sdl2::Input::Up => {
-                if top > 0 {
-                    top -= 1;
+            sdl2::Input::Quit | sdl2::Input::Back | sdl2::Input::RightClick | sdl2::Input::Advance => {
+                return;
+            }
+            sdl2::Input::Up => top = top.saturating_sub(1),
+            sdl2::Input::Down => top = (top + 1).min(max_top),
+            sdl2::Input::Wheel { y } => {
+                let step = (y.abs() as usize).max(1) * 3;
+                if y > 0 {
+                    top = top.saturating_sub(step);
+                } else {
+                    top = (top + step).min(max_top);
                 }
             }
-            sdl2::Input::Down => {
-                if top + per_page < total {
-                    top += 1;
+            sdl2::Input::Pointer { x, y, pressed } => {
+                let (sx, sy) = win.surface_pos(x, y, W, 720);
+                pointer = Some((sx, sy));
+                let on_bar = sx >= BAR_X && sx < BAR_X + COL_W && sy >= BAR_Y && sy < BAR_Y + BAR_H;
+                if pressed && on_bar {
+                    let track_y = BAR_Y + COL_W;
+                    let track_h = BAR_H - COL_W * 2;
+                    if sy < track_y {
+                        top = top.saturating_sub(1);
+                    } else if sy >= track_y + track_h {
+                        top = (top + 1).min(max_top);
+                    } else if max_top > 0 {
+                        let rel = (sy - track_y).clamp(0, track_h);
+                        top = (rel as usize * max_top / track_h as usize).min(max_top);
+                        drag_top = Some(sy);
+                    }
+                } else if pressed {
+                    return;
+                } else {
+                    drag_top = None;
                 }
             }
-            sdl2::Input::Advance | sdl2::Input::Back | sdl2::Input::RightClick => return,
+            sdl2::Input::Drag { x, y } => {
+                let (sx, sy) = win.surface_pos(x, y, W, 720);
+                pointer = Some((sx, sy));
+                if drag_top.is_some() && max_top > 0 {
+                    let track_y = BAR_Y + COL_W;
+                    let track_h = BAR_H - COL_W * 2;
+                    let rel = (sy - track_y).clamp(0, track_h);
+                    top = (rel as usize * max_top / track_h as usize).min(max_top);
+                }
+            }
             _ => win.delay(16),
         }
     }
@@ -1901,15 +3258,12 @@ struct SpriteBank {
     dir: std::path::PathBuf,
     /// lowercased file names present in the directory
     index: std::collections::HashSet<String>,
-    /// Every prefix in the directory, in deterministic order.
-    all_prefixes: Vec<String>,
     cache: std::collections::HashMap<String, codec::tga::TgaImage>,
 }
 
 impl SpriteBank {
     fn new(dir: std::path::PathBuf) -> SpriteBank {
         let mut index = std::collections::HashSet::new();
-        let mut pset = std::collections::BTreeSet::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let name = match e.file_name().into_string() {
@@ -1917,23 +3271,14 @@ impl SpriteBank {
                     Err(_) => continue,
                 };
                 let lower = name.to_ascii_lowercase();
-                let stem = match lower.strip_suffix(".tga") {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                // Prefix = the leading ASCII letters ("tak013101" -> "tak").
-                // Char-based, so non-ASCII names cannot split a codepoint.
-                let p: String = stem.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-                if !p.is_empty() {
-                    pset.insert(p);
+                if lower.ends_with(".tga") {
+                    index.insert(lower);
                 }
-                index.insert(lower);
             }
         }
         SpriteBank {
             dir,
             index,
-            all_prefixes: pset.into_iter().collect(),
             cache: Default::default(),
         }
     }
@@ -1953,21 +3298,15 @@ impl SpriteBank {
     /// The shipped scripts' `(series, variant)` values match the file names
     /// directly for the vast majority of cues, so the search walks *outward*
     /// from the exact value (0, -1, +1, -2, +2). The previous order started at
-    /// -2, which made almost every pose collapse onto `<prefix>001101.tga` (the
-    /// variant-2 file, or the 101 fallback) - standing sprites then never
-    /// changed expression, and characters sharing a prefix (10/15 -> tak,
-    /// 12/17 -> oto) became indistinguishable duplicates on screen.
+    /// -2, which made almost every pose collapse onto `<prefix>001101.tga`.
+    ///
+    /// Only this character's own prefix is searched. Filling a missing pose
+    /// with somebody else's file put the wrong person on stage.
     ///
     /// The neutral-pose fallback (`...101`) is only tried after the whole
     /// neighbourhood search has failed.
     fn resolve(&mut self, cid: u32, series: u32, variant: u32) -> Option<String> {
-        let mut prefixes: Vec<String> =
-            sprite_prefixes(cid).iter().map(|s| s.to_string()).collect();
-        for p in &self.all_prefixes {
-            if !prefixes.iter().any(|x| x.eq_ignore_ascii_case(p)) {
-                prefixes.push(p.clone());
-            }
-        }
+        let prefixes: Vec<String> = sprite_prefixes(cid).iter().map(|s| s.to_string()).collect();
         const DELTAS: [i32; 5] = [0, -1, 1, -2, 2];
         let s_base = series as i32;
         let v_base = variant as i32;
@@ -2016,6 +3355,217 @@ struct ActiveSprite {
     img: codec::tga::TgaImage,
 }
 
+/// An ACT176 plate (item, effect, or a layer of a composite CG).
+struct Plate {
+    slot: u32,
+    name: String,
+    img: codec::tga::TgaImage,
+}
+
+/// How the message window and the scene behind it are drawn this frame.
+struct Look {
+    alpha: u8,
+    shade: u8,
+}
+
+fn scene_look(settings: &menu::Settings, cg: bool) -> Look {
+    let levels = menu::LEVELS as u32;
+    let level = if cg { settings.alpha_cg } else { settings.alpha_novel };
+    let level = level.clamp(0, menu::LEVELS) as u32;
+    Look {
+        alpha: (level * 255 / levels) as u8,
+        // Novel text gets a mild dim so the window reads. CG stays untouched,
+        // and the top of the slider (10) only reaches about a third darker.
+        shade: if cg {
+            0
+        } else {
+            (settings.alpha_back.clamp(0, menu::LEVELS) as u32 * 90 / levels) as u8
+        },
+    }
+}
+
+fn cmd_idle(settings: &menu::Settings) -> u8 {
+    (settings.alpha_command.clamp(0, menu::LEVELS) as u32 * 100 / menu::LEVELS as u32) as u8
+}
+
+/// The box is up when the player has not hidden it, and either the script
+/// has it open or skip is running. Skip keeps the lines on screen; the hide
+/// button only follows the player's own toggle.
+fn dialog_open(user_hide: bool, script_open: bool, skipping: bool) -> bool {
+    !user_hide && (script_open || skipping)
+}
+
+fn clone_surf(s: &render::Surface) -> render::Surface {
+    render::Surface {
+        width: s.width,
+        height: s.height,
+        pixels: s.pixels.clone(),
+    }
+}
+
+fn surface_from_tga(img: &codec::tga::TgaImage) -> render::Surface {
+    render::Surface {
+        width: img.width,
+        height: img.height,
+        pixels: img.rgba.clone(),
+    }
+}
+
+/// What the player did while fast-rewind was stepping.
+enum Cruise {
+    Keep,
+    Stop,
+    Quit,
+}
+
+fn present_rewind_frame(
+    win: &mut sdl2::Sdl,
+    cur: &render::Surface,
+    bar: &cmdbar::CmdBar,
+    hover: Option<cmdbar::Cmd>,
+    active: cmdbar::Active,
+    idle: u8,
+) {
+    let mut frame = clone_surf(cur);
+    bar.draw(&mut frame, hover, active, idle);
+    win.present(&frame);
+}
+
+/// Click, Enter, Page Up, or the rewind button stops the cruise. Moving the
+/// pointer only updates the hover, so the buttons stay usable. The stop is
+/// taken on release: the press and the release are one click, and leaving
+/// the release for the line-wait would advance the script.
+fn rewind_cruise_stop(win: &mut sdl2::Sdl, bar: &cmdbar::CmdBar, hover: &mut Option<cmdbar::Cmd>) -> Cruise {
+    match win.poll_input() {
+        sdl2::Input::Quit => Cruise::Quit,
+        sdl2::Input::Advance | sdl2::Input::Rewind | sdl2::Input::RightClick => Cruise::Stop,
+        sdl2::Input::Wheel { y } if y < 0 => Cruise::Stop,
+        sdl2::Input::Release { x, y } => {
+            let (sx, sy) = win.surface_pos(x, y, 1280, 720);
+            *hover = bar.hit(sx, sy);
+            Cruise::Stop
+        }
+        sdl2::Input::Pointer { x, y, .. } => {
+            let (sx, sy) = win.surface_pos(x, y, 1280, 720);
+            *hover = bar.hit(sx, sy);
+            Cruise::Keep
+        }
+        sdl2::Input::Drag { x, y } => {
+            let (sx, sy) = win.surface_pos(x, y, 1280, 720);
+            *hover = bar.hit(sx, sy);
+            Cruise::Keep
+        }
+        _ => Cruise::Keep,
+    }
+}
+
+fn fade_len(settings: &menu::Settings, skipping: bool, frames: u32) -> u32 {
+    if skipping || settings.effect == 0 {
+        0
+    } else {
+        frames.min(240)
+    }
+}
+
+/// Crossfade `from` into `to`. A click or a key lands on the destination.
+/// Returns true when the player closed the window.
+/// Snap the screen to `rgb` and fade back to `base` over `frames` at 60 fps.
+/// A click or a key lands on the picture. Returns true when the window closed.
+fn present_flash(win: &mut sdl2::Sdl, base: &render::Surface, frames: u32, r: u8, g: u8, b: u8) -> bool {
+    let mut buf = vec![0u8; base.pixels.len()];
+    for remain in (0..=frames).rev() {
+        render::apply_flash(&mut buf, &base.pixels, r, g, b, remain, frames);
+        win.present_raw(&buf, base.width, base.height);
+        if remain == 0 {
+            break;
+        }
+        match win.poll_input() {
+            sdl2::Input::Quit => return true,
+            sdl2::Input::None | sdl2::Input::Pointer { pressed: false, .. } | sdl2::Input::Drag { .. } => {}
+            _ => {
+                win.present(base);
+                return false;
+            }
+        }
+        win.delay(16);
+    }
+    false
+}
+
+fn present_fade(win: &mut sdl2::Sdl, from: &render::Surface, to: &render::Surface, frames: u32) -> bool {
+    if frames == 0 || from.pixels.len() != to.pixels.len() || from.width != to.width {
+        win.present(to);
+        return false;
+    }
+    let mut buf = vec![0u8; to.pixels.len()];
+    for step in 1..=frames {
+        render::lerp_pixels(&mut buf, &from.pixels, &to.pixels, step, frames);
+        win.present_raw(&buf, to.width, to.height);
+        match win.poll_input() {
+            sdl2::Input::Quit => return true,
+            sdl2::Input::None
+            | sdl2::Input::Pointer { pressed: false, .. }
+            | sdl2::Input::Drag { .. } => {}
+            _ => {
+                win.present(to);
+                return false;
+            }
+        }
+        win.delay(16);
+    }
+    win.present(to);
+    false
+}
+
+fn load_seen() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Ok(text) = std::fs::read_to_string(save::dir().join("seen.txt")) {
+        for line in text.lines() {
+            if !line.is_empty() {
+                set.insert(line.to_string());
+            }
+        }
+    }
+    set
+}
+
+fn note_seen(set: &mut std::collections::HashSet<String>, scene: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let key = format!("{}\t{}", scene, text.replace('\n', " "));
+    if !set.insert(key.clone()) {
+        return;
+    }
+    let dir = save::dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("seen.txt"))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", key);
+    }
+}
+
+fn place_overlays<'a>(plates: &'a [Plate], w: u32, h: u32) -> Vec<(&'a codec::tga::TgaImage, i32, i32)> {
+    plates
+        .iter()
+        .map(|p| {
+            let (x, y) = if p.img.width >= 1100 || p.img.height >= 600 {
+                (0, 0)
+            } else {
+                (
+                    (w as i32 - p.img.width as i32) / 2,
+                    (h as i32 - p.img.height as i32) / 2,
+                )
+            };
+            (&p.img, x, y)
+        })
+        .collect()
+}
+
 /// Horizontal anchor for the idx-th of `count` on-screen characters.
 fn sprite_x_for(idx: usize, count: usize, w: u32) -> i32 {
     let center = match (count, idx) {
@@ -2045,15 +3595,24 @@ fn draw_scene(
     window: bool,
     plate: Option<&codec::tga::TgaImage>,
     frame: Option<&codec::tga::TgaImage>,
+    plates: &[Plate],
+    look: Look,
 ) -> render::Surface {
-    let multi = slots.iter().filter(|s| s.is_some()).count() > 1;
+    // Dim the listeners only when the speaker is actually standing there.
+    // 春希 speaks thousands of times and is placed twice in the whole game:
+    // he is the camera, and the person on screen is who he is talking to.
+    // Dimming everyone in that case made the listener look like the wrong
+    // speaker. When the speaker is on stage, the others drop well below
+    // full brightness so the lit face is the name in the window.
+    let speaker_on_stage = focus.is_some_and(|id| {
+        slots.iter().flatten().any(|s| s.char_id == id)
+    });
     let draws: Vec<render::SpriteDraw> = SPRITE_DRAW_ORDER
         .iter()
         .filter_map(|&i| {
             let s = slots[i].as_ref()?;
-            // Dim the characters that are not speaking.
-            let alpha = if multi && focus.is_some() && focus != Some(s.char_id) {
-                170
+            let alpha = if speaker_on_stage && focus != Some(s.char_id) {
+                96
             } else {
                 255
             };
@@ -2065,7 +3624,22 @@ fn draw_scene(
             })
         })
         .collect();
-    let mut s = render::render_scene_ex(bg, text, font, w, h, &draws, tint, window, plate, frame);
+    let overlays = place_overlays(plates, w, h);
+    let mut s = render::render_scene_ex(
+        bg,
+        text,
+        font,
+        w,
+        h,
+        &draws,
+        tint,
+        window,
+        plate,
+        frame,
+        look.alpha,
+        look.shade,
+        &overlays,
+    );
     // The name sits on the upper rim of the oval, not inside 【】 in the line.
     if window {
         if let Some(name) = speaker {
@@ -2125,64 +3699,623 @@ fn clean_text(s: &str) -> String {
     out
 }
 
+/// CG stills from `bg/v*.tga`. Left and right (or the two halves of the
+/// screen) page through them; Esc or the right button returns to the title.
+fn cg_names(dirs: &[&std::path::Path]) -> Vec<String> {
+    let mut names = Vec::new();
+    for d in dirs {
+        let rd = match std::fs::read_dir(d) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let low = name.to_ascii_lowercase();
+            if low.starts_with('v')
+                && low.ends_with(".tga")
+                && !names.iter().any(|n: &String| n.eq_ignore_ascii_case(&name))
+            {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+fn browse_cg(win: &mut sdl2::Sdl, font: &render::Font, dirs: &[&std::path::Path], names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let mut i = 0usize;
+    loop {
+        let img = load_background(dirs, &names[i]).unwrap_or_else(|| solid_bg(W, H, [0, 0, 0]));
+        let mut surf = render::render_scene_ex(&img, "", font, W, H, &[], None, false, None, None, 255, 0, &[]);
+        let caption = format!("{}   {} / {}", names[i], i + 1, names.len());
+        if let Some((rw, rh, rgba)) =
+            render::text::block_rgba(&[caption], 700, 40, 22, render::text::DEFAULT_FONT)
+        {
+            surf.fill_rect(24, H as i32 - rh as i32 - 28, rw + 16, rh + 8, [0, 0, 0, 160]);
+            surf.blit_rgba(&rgba, rw, rh, 32, H as i32 - rh as i32 - 24);
+        }
+        win.present(&surf);
+        match win.poll_input() {
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
+            sdl2::Input::Advance | sdl2::Input::Down => i = (i + 1) % names.len(),
+            sdl2::Input::Up => i = (i + names.len() - 1) % names.len(),
+            sdl2::Input::Pointer { x, y, pressed: true } => {
+                let (sx, _) = win.surface_pos(x, y, W, H);
+                if sx < (W as i32) / 2 {
+                    i = (i + names.len() - 1) % names.len();
+                } else {
+                    i = (i + 1) % names.len();
+                }
+            }
+            _ => win.delay(16),
+        }
+    }
+}
+
+/// 「特别模式」. Labels are the system font. The highlight bar and the logo
+/// stay the original art. 「时间线」 replaces the atlas row 场景回放.
+enum SpecialPick {
+    Replay,
+    Cg,
+    /// An entry the original lists but this build does not open yet.
+    Notice,
+    Back,
+}
+
+/// Rasterize menu labels once. Each line is the system CJK font, white on
+/// transparent, ready to be tinted white or gold per frame.
+fn menu_labels(items: &[&str], size: u32) -> Vec<Option<(u32, u32, Vec<u8>)>> {
+    items.iter().map(|s| render::text::line_rgba(s, size)).collect()
+}
+
+/// Title highlight change. `SE_9011` is the short two-tap click.
+fn cursor_se_path(bg_dirs: &[&std::path::Path]) -> Option<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    for d in bg_dirs {
+        if let Some(p) = d.parent() {
+            roots.push(p.to_path_buf());
+        }
+    }
+    for root in roots {
+        for name in ["SE_9011.WAV", "SE_9011.wav", "SE_9011.OGG", "SE_9011.ogg"] {
+            let p = root.join("se").join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn play_cursor(mx: Option<&audio::Mixer>, se: Option<&std::path::Path>) {
+    let (Some(mx), Some(se)) = (mx, se) else { return };
+    mx.play_cat(&se.to_string_lossy(), 1.0, false, audio::mixer::CAT_SE);
+}
+
+/// Font size that has the same height, in window pixels, as `layout_px` on
+/// the 720-tall layout. Labels are drawn after the scene is scaled, so this
+/// is the size they must be rasterized at.
+fn layout_font_px(layout_px: u32, window_h: i32) -> u32 {
+    ((layout_px as i32 * window_h.max(1)) / 720).clamp(8, 160) as u32
+}
+
+/// Where the highlight sits in window pixels. `layout_y` stays fractional so
+/// a maximized window can move the bar one screen pixel at a time.
+fn bar_window_y(layout_y: f32, wh: i32) -> i32 {
+    (layout_y * wh.max(1) as f32 / 720.0).round() as i32
+}
+
+/// Slide the highlight toward `target`. At 720px tall this is the original
+/// per-frame ease. A taller window caps each step at about six screen pixels,
+/// otherwise one layout pixel becomes several screen pixels and the bar hops.
+fn slide_bar(bar_y: &mut f32, target: f32, wh: i32) {
+    let left = target - *bar_y;
+    let snap = if wh > 720 { 720.0 / wh as f32 } else { 0.5 };
+    if left.abs() <= snap {
+        *bar_y = target;
+        return;
+    }
+    let mut step = left * 0.30;
+    if wh > 720 {
+        let max_layout = 6.0 * 720.0 / wh as f32;
+        if step.abs() > max_layout {
+            step = max_layout.copysign(step);
+        }
+    }
+    *bar_y += step;
+}
+
+/// Logo and copyright, already stretched to the window, plus the highlight
+/// oval at that same pixel size. Rebuilt only when the window size changes,
+/// so the bar can animate without resampling the whole frame.
+struct FittedMenu {
+    ww: i32,
+    wh: i32,
+    stamp: u64,
+    plate: render::Surface,
+    bar: [Option<render::Surface>; 2],
+}
+
+fn scale_sprite(
+    img: &codec::tga::TgaImage,
+    sx: i32,
+    sy: i32,
+    sw: u32,
+    sh: u32,
+    dw: u32,
+    dh: u32,
+) -> render::Surface {
+    let mut s = render::Surface::new(sw.max(1), sh.max(1), [0, 0, 0, 0]);
+    for row in 0..sh as i32 {
+        for col in 0..sw as i32 {
+            let sxp = sx + col;
+            let syp = sy + row;
+            if sxp < 0 || syp < 0 || sxp >= img.width as i32 || syp >= img.height as i32 {
+                continue;
+            }
+            let si = ((syp as u32 * img.width + sxp as u32) * 4) as usize;
+            let di = ((row as u32 * s.width + col as u32) * 4) as usize;
+            s.pixels[di..di + 4].copy_from_slice(&img.rgba[si..si + 4]);
+        }
+    }
+    if dw == s.width && dh == s.height {
+        return s;
+    }
+    for px in s.pixels.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        px[0] = (px[0] as u32 * a / 255) as u8;
+        px[1] = (px[1] as u32 * a / 255) as u8;
+        px[2] = (px[2] as u32 * a / 255) as u8;
+    }
+    let mut up = s.scaled_to(dw, dh);
+    for px in up.pixels.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a == 0 {
+            continue;
+        }
+        px[0] = (px[0] as u32 * 255 / a).min(255) as u8;
+        px[1] = (px[1] as u32 * 255 / a).min(255) as u8;
+        px[2] = (px[2] as u32 * 255 / a).min(255) as u8;
+    }
+    up
+}
+
+fn ensure_fitted(
+    fitted: &mut Option<FittedMenu>,
+    ww: i32,
+    wh: i32,
+    stamp: u64,
+    layout: impl FnOnce() -> render::Surface,
+    bar: Option<&codec::tga::TgaImage>,
+    bar_w: u32,
+    bar_h: u32,
+) {
+    if let Some(f) = fitted.as_ref() {
+        if f.ww == ww && f.wh == wh && f.stamp == stamp {
+            return;
+        }
+    }
+    let layout = layout();
+    let plate = if ww as u32 == layout.width && wh as u32 == layout.height {
+        layout
+    } else {
+        layout.scaled_to(ww as u32, wh as u32)
+    };
+    let dw = (bar_w as i32 * ww / 1280).max(1) as u32;
+    let dh = (bar_h as i32 * wh / 720).max(1) as u32;
+    let mut frames = [None, None];
+    if let Some(img) = bar {
+        frames[0] = Some(scale_sprite(img, 0, 0, bar_w, bar_h, dw, dh));
+        if img.height >= bar_h * 2 {
+            frames[1] = Some(scale_sprite(img, 0, bar_h as i32, bar_w, bar_h, dw, dh));
+        }
+    }
+    *fitted = Some(FittedMenu { ww, wh, stamp, plate, bar: frames });
+}
+
+fn paint_bar(frame: &mut render::Surface, fitted: &FittedMenu, which: usize, layout_y: f32, x0: i32) {
+    let Some(img) = fitted.bar[which].as_ref() else { return };
+    let dx = x0 * fitted.ww / 1280;
+    let dy = bar_window_y(layout_y, fitted.wh);
+    frame.blit_rgba(&img.pixels, img.width, img.height, dx, dy);
+}
+
+fn draw_menu_labels(
+    surf: &mut render::Surface,
+    labels: &[Option<(u32, u32, Vec<u8>)>],
+    sel: usize,
+    x0: i32,
+    y0: i32,
+    item_w: i32,
+    item_h: i32,
+    pitch: i32,
+    ww: i32,
+    wh: i32,
+) {
+    let shadow = ((2 * wh) / 720).max(1);
+    for (i, label) in labels.iter().enumerate() {
+        let Some((w, h, rgba)) = label else { continue };
+        let rgb = if i == sel { [254, 232, 136] } else { [255, 255, 255] };
+        let ay = y0 + i as i32 * pitch;
+        let x0w = x0 * ww / 1280;
+        let y0w = ay * wh / 720;
+        let x1w = (x0 + item_w) * ww / 1280;
+        let y1w = (ay + item_h) * wh / 720;
+        blit_tinted_label(
+            surf,
+            rgba,
+            *w,
+            *h,
+            x0w + (x1w - x0w - *w as i32) / 2,
+            y0w + (y1w - y0w - *h as i32) / 2,
+            rgb,
+            shadow,
+        );
+    }
+}
+
+/// System-font stand-in for one menu cell. The atlas glyphs are white with a
+/// navy outline `(35, 45, 66)` about two pixels thick. The outline is drawn
+/// first so it surrounds the fill instead of sitting as a drop shadow.
+fn blit_tinted_label(
+    surf: &mut render::Surface,
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    x: i32,
+    y: i32,
+    rgb: [u8; 3],
+    stroke_px: i32,
+) {
+    let outline = [35, 45, 66];
+    let r = stroke_px.max(1);
+    for row in 0..h as i32 {
+        for col in 0..w as i32 {
+            let i = ((row as u32 * w + col as u32) * 4) as usize;
+            let a = rgba[i + 3];
+            if a == 0 {
+                continue;
+            }
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    surf.blend_pixel(
+                        x + col + dx,
+                        y + row + dy,
+                        [outline[0], outline[1], outline[2], a],
+                    );
+                }
+            }
+        }
+    }
+    for row in 0..h as i32 {
+        for col in 0..w as i32 {
+            let i = ((row as u32 * w + col as u32) * 4) as usize;
+            let a = rgba[i + 3];
+            if a == 0 {
+                continue;
+            }
+            surf.blend_pixel(x + col, y + row, [rgb[0], rgb[1], rgb[2], a]);
+        }
+    }
+}
+
+fn run_special(
+    win: &mut sdl2::Sdl,
+    bg_dirs: &[&std::path::Path],
+    cn: bool,
+    mixer: Option<&audio::Mixer>,
+    cursor: Option<&std::path::Path>,
+) -> SpecialPick {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    const ITEM_W: i32 = 320;
+    const ITEM_H: i32 = 40;
+    const PITCH: i32 = 40;
+    // Same horizontal placement as the title items. The six rows and the
+    // first item's y come from WA2.exe: the special page lists T0100 rows
+    // 9,10,11,12,13,8 and lays them out from y=380 at a pitch of 40.
+    const X0: i32 = (W as i32 - ITEM_W) / 2;
+    const Y0: i32 = 380;
+    const ROWS: [i32; 6] = [9, 10, 11, 12, 13, 8];
+    const N: usize = ROWS.len();
+    const BACKDROP: [u8; 4] = [1, 29, 89, 255];
+
+    let bar = load_background(bg_dirs, "T0101.tga");
+    let logo = load_background(bg_dirs, "T0011.tga");
+    let items: [&str; 6] = if cn {
+        ["电子小说", "CG模式", "时间线", "音乐模式", "声优访谈", "返回"]
+    } else {
+        ["デジタルノベル", "CGモード", "タイムライン", "サウンドモード", "ボイス", "戻る"]
+    };
+    let head_text = if cn { "特别内容" } else { "スペシャル" };
+    let mut label_px = 0u32;
+    let mut labels = Vec::new();
+    let mut head_px = 0u32;
+    let mut head: Option<(u32, u32, Vec<u8>)> = None;
+    let mut fitted: Option<FittedMenu> = None;
+
+    let pick = |sel: usize| match ROWS[sel] {
+        10 => SpecialPick::Cg,
+        11 => SpecialPick::Replay,
+        8 => SpecialPick::Back,
+        _ => SpecialPick::Notice,
+    };
+    let mut sel = 0usize;
+    let mut bar_y = Y0 as f32;
+    loop {
+        match win.poll_input() {
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
+                return SpecialPick::Back;
+            }
+            sdl2::Input::Up => {
+                sel = (sel + N - 1) % N;
+                play_cursor(mixer, cursor);
+            }
+            sdl2::Input::Down => {
+                sel = (sel + 1) % N;
+                play_cursor(mixer, cursor);
+            }
+            sdl2::Input::Advance | sdl2::Input::Choice(_) => return pick(sel),
+            sdl2::Input::Pointer { x, y, pressed } => {
+                let (sx, sy) = win.surface_pos(x, y, W, H);
+                if let Some(i) = (0..N).find(|i| {
+                    let iy = Y0 + *i as i32 * PITCH;
+                    sx >= X0 && sx < X0 + ITEM_W && sy >= iy && sy < iy + ITEM_H
+                }) {
+                    if i != sel {
+                        sel = i;
+                        play_cursor(mixer, cursor);
+                    }
+                    if pressed {
+                        return pick(sel);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let (ww, wh) = win.window_size();
+        let ww = ww.max(1);
+        let wh = wh.max(1);
+        let target = (Y0 + sel as i32 * PITCH) as f32;
+        slide_bar(&mut bar_y, target, wh);
+
+        // T0100 draws each label about 29px tall inside the 40px row.
+        let ipx = layout_font_px(32, wh);
+        if ipx != label_px {
+            label_px = ipx;
+            labels = menu_labels(&items, ipx);
+        }
+        let hpx = layout_font_px(16, wh);
+        if hpx != head_px {
+            head_px = hpx;
+            head = render::text::line_rgba(head_text, hpx);
+        }
+
+        ensure_fitted(
+            &mut fitted,
+            ww,
+            wh,
+            0,
+            || {
+                let mut s = render::Surface::new(W, H, BACKDROP);
+                if let Some(ref lg) = logo {
+                    s.blit(lg, (W as i32 - lg.width as i32) / 2, 24);
+                }
+                s
+            },
+            bar.as_ref(),
+            ITEM_W as u32,
+            ITEM_H as u32,
+        );
+        let fitted = fitted.as_ref().unwrap();
+        let mut frame = clone_surf(&fitted.plate);
+        paint_bar(&mut frame, fitted, 0, bar_y, X0);
+        if let Some((w, h, rgba)) = head.as_ref() {
+            let shadow = ((2 * wh) / 720).max(1);
+            blit_tinted_label(
+                &mut frame,
+                rgba,
+                *w,
+                *h,
+                (ww - *w as i32) / 2,
+                (Y0 - 44) * wh / 720,
+                [255, 255, 255],
+                shadow,
+            );
+        }
+        draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
+        win.present(&frame);
+        win.delay(16);
+    }
+}
+
 /// What the title screen resolved to.
 enum TitleAction {
     Start,
+    /// A scene picked on the timeline.
+    Jump(String),
     /// Resume from a save slot picked on the load screen.
     Load(save::SaveState),
     Quit,
 }
 
-/// Original title screen, composed from the game's own title graphics.
+/// One falling flake. Layout numbers are 1280×720 pixels; the draw scales them.
+struct TitleFlake {
+    x: f32,
+    y: f32,
+    /// Downward speed, layout pixels per second.
+    speed: f32,
+    phase: f32,
+    /// Which of the eight sizes. 0 is the largest.
+    kind: usize,
+    alpha: u8,
+}
+
+/// Title snowfall. The original loads `weather.tga` and draws the white flake
+/// cell over the street. Kind 248..255 is a size of 36..8 px. The exe's own
+/// alpha (about 96..40) vanishes on this bright plate, so the flakes are
+/// drawn brighter and there are more of them.
+struct TitleSnow {
+    ww: i32,
+    wh: i32,
+    flakes: Vec<TitleFlake>,
+    sprites: Vec<render::Surface>,
+    rng: u32,
+}
+
+fn snow_rng(state: &mut u32) -> u32 {
+    *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+    *state
+}
+
+impl TitleSnow {
+    const COUNT: usize = 400;
+    const KINDS: usize = 8;
+
+    fn new() -> TitleSnow {
+        let mut rng = 0x00a2_5e1du32;
+        let mut flakes = Vec::with_capacity(Self::COUNT);
+        for i in 0..Self::COUNT {
+            flakes.push(Self::make(&mut rng, i % Self::KINDS, true));
+        }
+        TitleSnow { ww: 0, wh: 0, flakes, sprites: Vec::new(), rng }
+    }
+
+    /// `kind` 0..8 maps to the exe's flake id 248..255.
+    fn make(rng: &mut u32, kind: usize, anywhere: bool) -> TitleFlake {
+        let id = 248 + kind;
+        let span = 100 * (256 - id);
+        let r = snow_rng(rng) % span as u32;
+        let v = (r as f32 / 100.0 + 1.0) * 0.5;
+        let x_span = (0x240 - id) * 4;
+        let y_span = (0x1b4 - id) * 4;
+        let inset = (256 - id) * 2;
+        let x = (snow_rng(rng) % x_span as u32) as f32 - inset as f32;
+        let y = if anywhere {
+            (snow_rng(rng) % y_span as u32) as f32 - inset as f32
+        } else {
+            -((snow_rng(rng) % 48) as f32) - 8.0
+        };
+        TitleFlake {
+            x,
+            y,
+            // vy * 5/40 per frame at 60fps. Larger ids are the small, slower flakes.
+            speed: v * 7.5,
+            phase: (snow_rng(rng) % 256) as f32 * std::f32::consts::TAU / 256.0,
+            kind,
+            // Exe's 96..40, lifted so a white flake still reads on the street.
+            alpha: (((256 - id) * 8 + 32) * 2).min(220) as u8,
+        }
+    }
+
+    fn ensure(&mut self, ww: i32, wh: i32, sheet: &codec::tga::TgaImage) {
+        if self.ww == ww && self.wh == wh && self.sprites.len() == Self::KINDS {
+            return;
+        }
+        self.sprites.clear();
+        for kind in 0..Self::KINDS {
+            let id = 248 + kind;
+            let size = ((257 - id) as i32 * wh / 720).max(2) as u32;
+            // weather.tga cell (0, 32): the white flake the title's source rect selects.
+            self.sprites.push(scale_sprite(sheet, 0, 32, 32, 32, size, size));
+        }
+        self.ww = ww;
+        self.wh = wh;
+    }
+
+    fn step(&mut self, dt: f32) {
+        for flake in &mut self.flakes {
+            flake.y += flake.speed * dt;
+            flake.phase += dt * 1.8;
+            flake.x += flake.phase.sin() * 18.0 * dt;
+            if flake.y > 760.0 || flake.x < -40.0 || flake.x > 1320.0 {
+                *flake = Self::make(&mut self.rng, flake.kind, false);
+            }
+        }
+    }
+
+    fn paint(&self, frame: &mut render::Surface, wh: i32) {
+        for flake in &self.flakes {
+            let Some(sp) = self.sprites.get(flake.kind) else { continue };
+            let x = (flake.x * wh as f32 / 720.0).round() as i32 - sp.width as i32 / 2;
+            let y = (flake.y * wh as f32 / 720.0).round() as i32 - sp.height as i32 / 2;
+            frame.blit_surface_alpha(sp, x, y, flake.alpha);
+        }
+    }
+}
+
+/// Original title screen. The logo, highlight bar and copyright stay the
+/// game's art. The five item labels are the system font, white at rest and
+/// gold when selected, so a player font can replace them later.
 ///
-/// Because the menu is drawn from image atlases instead of engine-side strings,
-/// it is automatically in the game's language - the Chinese patch ships
-/// translated copies of every one of these images and they win over the
-/// Japanese ones in `bg_dirs`.
-///
+///   T0000  1280x856  street plate. A 720-tall window pans down it.
+///   weather.tga      snowfall, drawn over the street and the logo
 ///   T0011  752x448   logo (transparent; the backdrop is its edge colour #011D59)
-///   T0100  640x640   menu atlas: 16 rows x 2 columns of 320x40 tiles,
-///                    left column = normal (white), right = selected (gold)
 ///   T0101  320x80    highlight bar: two 320x40 frames (dim / bright)
 ///   T0020  264x24    copyright line
 ///
-/// The bar slides between items and flashes its bright frame while it moves,
-/// which is the selection feedback the original has. Arrow keys move,
-/// Space/Enter confirms, Esc quits; items whose subsystems do not exist yet
-/// answer with a notice.
+/// The original title adds 1.2px per frame to the plate's source Y and clamps
+/// at 136 (856 − 720), so the street settles after about two seconds. The bar
+/// slides between items and flashes its bright frame while it moves. Arrow
+/// keys move, Space/Enter confirms, Esc quits; items whose subsystems do not
+/// exist yet answer with a notice.
 ///
 /// `WA2_TITLE_AUTO=<n>` pre-selects item `n` and confirms it (verification runs).
 fn run_title(
     win: &mut sdl2::Sdl,
     font: &render::Font,
     bg_dirs: &[&std::path::Path],
+    script_dir: &std::path::Path,
     cn: bool,
 ) -> TitleAction {
     const W: u32 = 1280;
     const H: u32 = 720;
     const ITEM_W: i32 = 320;
     const ITEM_H: i32 = 40;
-    const PITCH: i32 = 40;
+    // The highlight oval is 40px. The labels are larger than the original
+    // bitmap row, so the rows sit further apart than the oval height.
+    const PITCH: i32 = 52;
     const N: usize = 5;
     const X0: i32 = (W as i32 - ITEM_W) / 2;
-    const Y0: i32 = 432;
+    const Y0: i32 = 412;
     const BACKDROP: [u8; 4] = [1, 29, 89, 255]; // T0011's edge colour
 
-    // Only used when the menu atlas is missing from the data tree.
-    let fallback_items = if cn {
+    let items: [&str; 5] = if cn {
         ["开始游戏", "继续游戏", "系统设置", "特别模式", "结束游戏"]
     } else {
         ["はじめから", "つづきから", "オプション", "スペシャル", "ゲーム終了"]
     };
     let notice_text = if cn { "此功能尚未实现" } else { "ただいま準備中です" };
+    let mut label_px = 0u32;
+    let mut labels = Vec::new();
+    let mut note_px = 0u32;
+    let mut note_img: Option<(u32, u32, Vec<u8>)> = None;
+    let mut fitted: Option<FittedMenu> = None;
 
+    let street = load_background(bg_dirs, "T0000.tga");
+    let weather = load_background(bg_dirs, "weather.tga");
+    let mut snow = TitleSnow::new();
     let logo = load_background(bg_dirs, "T0011.tga");
     let copyright = load_background(bg_dirs, "T0020.tga");
-    let menu = load_background(bg_dirs, "T0100.tga");
     let bar = load_background(bg_dirs, "T0101.tga");
-    if menu.is_none() {
-        eprintln!("title: T0100.tga not found, falling back to engine-drawn menu text");
-    }
+    // Source Y of the 720-tall window into T0000. The exe adds 1.2 per frame
+    // and stops at image_height − 720, which is 136 for the shipped plate.
+    let scroll_max = street
+        .as_ref()
+        .map(|img| (img.height as i32 - H as i32).max(0) as f32)
+        .unwrap_or(0.0);
+    let mut scroll = 0.0f32;
+    let mut scroll_tick = std::time::Instant::now();
+    let mut street_scaled: Option<(i32, i32, render::Surface)> = None;
 
     if std::env::var_os("WA2_DEBUG_INPUT").is_some() {
         let (ww, wh) = win.window_size();
@@ -2191,6 +4324,11 @@ fn run_title(
     // 「画面模式」 applies as soon as the option screen is left.
     let startup = menu::Settings::load();
     win.set_fullscreen(startup.win_disp == 1);
+    let mixer = audio::Mixer::new(win);
+    if let Some(ref mx) = mixer {
+        menu::apply(&startup, Some(mx));
+    }
+    let cursor = cursor_se_path(bg_dirs);
 
     let item_y = |i: usize| (Y0 + i as i32 * PITCH) as f32;
     let mut sel = 0usize;
@@ -2217,10 +4355,12 @@ fn run_title(
                 sdl2::Input::Up => {
                     sel = (sel + N - 1) % N;
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
+                    play_cursor(mixer.as_ref(), cursor.as_deref());
                 }
                 sdl2::Input::Down => {
                     sel = (sel + 1) % N;
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
+                    play_cursor(mixer.as_ref(), cursor.as_deref());
                 }
                 sdl2::Input::Advance => confirm = true,
                 sdl2::Input::Choice(k) => {
@@ -2242,6 +4382,7 @@ fn run_title(
                             sel = i;
                             flash_until =
                                 std::time::Instant::now() + std::time::Duration::from_millis(160);
+                            play_cursor(mixer.as_ref(), cursor.as_deref());
                         }
                         if pressed {
                             confirm = true;
@@ -2252,79 +4393,124 @@ fn run_title(
             }
         }
 
-        // ---- animate the highlight bar -------------------------------------
-        let target = item_y(sel);
-        if (bar_y - target).abs() > 0.5 {
-            bar_y += (target - bar_y) * 0.30;
-        } else {
-            bar_y = target;
-        }
+        // ---- animate the highlight bar and the street ----------------------
+        let (ww, wh) = win.window_size();
+        let ww = ww.max(1);
+        let wh = wh.max(1);
+        slide_bar(&mut bar_y, item_y(sel), wh);
         let flashing = std::time::Instant::now() < flash_until;
+        let now = std::time::Instant::now();
+        let dt = now.saturating_duration_since(scroll_tick).as_secs_f32().min(0.05);
+        scroll_tick = now;
+        if scroll < scroll_max {
+            // 1.2 layout pixels per frame at 60fps.
+            scroll = (scroll + dt * 72.0).min(scroll_max);
+        }
+        if weather.is_some() {
+            snow.step(dt);
+        }
 
         // ---- compose --------------------------------------------------------
-        let mut s = render::Surface::new(W, H, BACKDROP);
-        if let Some(ref lg) = logo {
-            s.blit(lg, (W as i32 - lg.width as i32) / 2, 24);
-        }
-        // Highlight bar first: the item tiles are transparent except for the
-        // glyphs, so it shows through behind the selected label.
-        if let Some(ref b) = bar {
-            let frame = if flashing { ITEM_H } else { 0 };
-            s.blit_region(b, 0, frame, ITEM_W as u32, ITEM_H as u32, X0, bar_y as i32);
-        }
-        match menu {
-            Some(ref m) => {
-                for i in 0..N {
-                    let col = if i == sel { ITEM_W } else { 0 };
-                    s.blit_region(
-                        m,
-                        col,
-                        i as i32 * ITEM_H,
-                        ITEM_W as u32,
-                        ITEM_H as u32,
-                        X0,
-                        Y0 + i as i32 * PITCH,
-                    );
-                }
-            }
-            None => {
-                let cell = font.cell() as i32;
-                for (i, item) in fallback_items.iter().enumerate() {
-                    let y = Y0 + i as i32 * PITCH;
-                    font.draw(&mut s, item, X0 + 40, y);
-                }
-            }
+        // T0100 draws each label about 29px tall inside the 40px row.
+        let ipx = layout_font_px(32, wh);
+        if ipx != label_px {
+            label_px = ipx;
+            labels = menu_labels(&items, ipx);
         }
         if let Some(n) = notice {
-            // Engine-side strings are *not* renderable with the game atlas in
-            // Chinese mode: the patch's text is Shift-JIS-coded pseudo-Japanese
-            // (its glyphs live in repainted cells), so real Simplified Chinese
-            // has no glyphs. Use the system CJK font for this one label and fall
-            // back to the bitmap font if it is unavailable.
-            let mut drawn = false;
             if cn {
-                let strip_h = font.cell() + 24;
-                if let Some((rw, rh, rgba)) =
-                    render::text::block_rgba(&[n.to_string()], 640, strip_h, 26, render::text::DEFAULT_FONT)
-                {
-                    let nx = W as i32 / 2 - rw as i32 / 2;
-                    s.fill_rect(nx - 16, 366, rw + 32, rh + 8, [1, 29, 89, 235]);
-                    s.blit_rgba(&rgba, rw, rh, nx, 370);
-                    drawn = true;
+                let px = layout_font_px(26, wh);
+                if px != note_px {
+                    note_px = px;
+                    note_img = render::text::line_rgba(n, px);
                 }
             }
-            if !drawn {
-                let cell = font.cell() as i32;
-                let wpx = n.chars().count() as i32 * cell;
-                let nx = W as i32 / 2 - wpx / 2;
-                s.fill_rect(nx - 16, 372, (wpx + 32) as u32, (cell + 12) as u32, [1, 29, 89, 235]);
-                font.draw(&mut s, n, nx, 378);
+        } else {
+            note_px = 0;
+        }
+        let baked_notice = notice.is_some() && (!cn || note_img.is_none());
+
+        ensure_fitted(
+            &mut fitted,
+            ww,
+            wh,
+            if baked_notice { 1 } else { 0 },
+            || {
+                // The street is composited under this plate. With no street
+                // the plate itself is the navy field the logo was authored on.
+                let plate_bg = if street.is_some() { [0, 0, 0, 0] } else { BACKDROP };
+                let mut s = render::Surface::new(W, H, plate_bg);
+                if let Some(ref lg) = logo {
+                    s.blit(lg, (W as i32 - lg.width as i32) / 2, 24);
+                }
+                if baked_notice {
+                    if let Some(n) = notice {
+                        let cell = font.cell() as i32;
+                        let wpx = n.chars().count() as i32 * cell;
+                        let nx = W as i32 / 2 - wpx / 2;
+                        s.fill_rect(
+                            nx - 16,
+                            372,
+                            (wpx + 32) as u32,
+                            (cell + 12) as u32,
+                            [1, 29, 89, 235],
+                        );
+                        font.draw(&mut s, n, nx, 378);
+                    }
+                }
+                if let Some(ref cp) = copyright {
+                    s.blit(cp, W as i32 - cp.width as i32 - 24, H as i32 - cp.height as i32 - 14);
+                }
+                s
+            },
+            bar.as_ref(),
+            ITEM_W as u32,
+            ITEM_H as u32,
+        );
+        let fitted = fitted.as_ref().unwrap();
+        let mut frame = if let Some(ref img) = street {
+            let rebuild = match street_scaled.as_ref() {
+                Some((sw, sh, _)) => *sw != ww || *sh != wh,
+                None => true,
+            };
+            if rebuild {
+                let dh = ((img.height as i64 * wh as i64) / H as i64).max(wh as i64) as u32;
+                street_scaled = Some((ww, wh, surface_from_tga(img).scaled_to(ww as u32, dh)));
+            }
+            let scaled = &street_scaled.as_ref().unwrap().2;
+            let max_y = (scaled.height as i32 - wh).max(0);
+            let sy = ((scroll * wh as f32 / H as f32).round() as i32).clamp(0, max_y);
+            let mut frame = render::Surface::new(ww as u32, wh as u32, BACKDROP);
+            frame.copy_rows_from(scaled, sy);
+            frame.blit_surface(&fitted.plate, 0, 0);
+            frame
+        } else {
+            clone_surf(&fitted.plate)
+        };
+        // Bar under the labels: the glyphs are drawn on top of the oval.
+        paint_bar(&mut frame, fitted, if flashing { 1 } else { 0 }, bar_y, X0);
+        draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
+        if notice.is_some() {
+            if let Some((rw, rh, rgba)) = note_img.as_ref() {
+                let nx = ww / 2 - *rw as i32 / 2;
+                let ny = 370 * wh / 720;
+                let pad_x = (16 * ww / 1280).max(8);
+                let pad_y = (4 * wh / 720).max(2);
+                frame.fill_rect(
+                    nx - pad_x,
+                    ny - pad_y,
+                    *rw + pad_x as u32 * 2,
+                    *rh + pad_y as u32 * 2,
+                    [1, 29, 89, 235],
+                );
+                frame.blit_rgba(rgba, *rw, *rh, nx, ny);
             }
         }
-        if let Some(ref cp) = copyright {
-            s.blit(cp, W as i32 - cp.width as i32 - 24, H as i32 - cp.height as i32 - 14);
+        if let Some(ref sheet) = weather {
+            snow.ensure(ww, wh, sheet);
+            snow.paint(&mut frame, wh);
         }
-        win.present(&s);
+        win.present(&frame);
 
         // ---- act on the confirmation ---------------------------------------
         if confirm {
@@ -2349,6 +4535,25 @@ fn run_title(
                     win.set_fullscreen(st.win_disp == 1);
                     notice = None;
                 }
+                3 => match run_special(win, bg_dirs, cn, mixer.as_ref(), cursor.as_deref()) {
+                    SpecialPick::Replay => {
+                        if let Some(id) = timeline::run(win, font, bg_dirs, script_dir) {
+                            return TitleAction::Jump(id);
+                        }
+                        notice = None;
+                    }
+                    SpecialPick::Cg => {
+                        let names = cg_names(bg_dirs);
+                        if names.is_empty() {
+                            notice = Some(notice_text);
+                        } else {
+                            browse_cg(win, font, bg_dirs, &names);
+                            notice = None;
+                        }
+                    }
+                    SpecialPick::Back => notice = None,
+                    SpecialPick::Notice => notice = Some(notice_text),
+                },
                 4 => return TitleAction::Quit,
                 _ => notice = Some(notice_text),
             }
@@ -2497,4 +4702,157 @@ fn print_usage() {
     println!("  wa2-native sjis <file>          decode CP932 bytes to UTF-8");
     println!("  wa2-native text-info <txt>      parse a scenario text page");
     println!("  wa2-native scene <txt> <font> <charset> <bg.tga> <out.tga>  render a scene");
+}
+
+#[cfg(test)]
+mod menu_bar {
+    #[test]
+    fn windowed_step_is_thirty_percent() {
+        let mut y = 432.0;
+        super::slide_bar(&mut y, 472.0, 720);
+        assert!((y - 444.0).abs() < 0.01, "{y}");
+    }
+
+    #[test]
+    fn maximized_step_stays_within_six_screen_pixels() {
+        let mut y = 432.0;
+        let mut prev = super::bar_window_y(y, 1080);
+        for _ in 0..90 {
+            super::slide_bar(&mut y, 472.0, 1080);
+            let now = super::bar_window_y(y, 1080);
+            assert!((now - prev).abs() <= 6, "{prev} -> {now}");
+            prev = now;
+            if y == 472.0 {
+                break;
+            }
+        }
+        assert_eq!(y, 472.0);
+        // A fraction of a layout pixel still moves the bar on a tall window.
+        assert_eq!(super::bar_window_y(432.0, 1080), 648);
+        assert_eq!(super::bar_window_y(432.4, 1080), 649);
+    }
+
+    #[test]
+    fn highlight_tracks_fractional_layout_y() {
+        let rgba = vec![255u8; 320 * 40 * 4];
+        let img = crate::codec::tga::TgaImage { width: 320, height: 40, rgba };
+        let sprite = super::scale_sprite(&img, 0, 0, 320, 40, 480, 60);
+        let fitted = super::FittedMenu {
+            ww: 1920,
+            wh: 1080,
+            stamp: 0,
+            plate: crate::render::Surface::new(1, 1, [0, 0, 0, 255]),
+            bar: [Some(sprite), None],
+        };
+        let mut a = crate::render::Surface::new(1920, 1080, [1, 29, 89, 255]);
+        let mut b = crate::render::Surface::new(1920, 1080, [1, 29, 89, 255]);
+        super::paint_bar(&mut a, &fitted, 0, 432.0, 480);
+        super::paint_bar(&mut b, &fitted, 0, 440.0, 480);
+        let top = |s: &crate::render::Surface| -> i32 {
+            for y in 0..s.height {
+                for x in 0..s.width {
+                    let i = ((y * s.width + x) * 4) as usize;
+                    if s.pixels[i] > 200 {
+                        return y as i32;
+                    }
+                }
+            }
+            -1
+        };
+        let dy = top(&b) - top(&a);
+        assert!((dy - 12).abs() <= 1, "dy {dy}");
+    }
+}
+
+#[cfg(test)]
+mod rewind_history {
+    #[test]
+    fn rewind_drops_the_line_on_screen_and_keeps_the_previous() {
+        let mut history = vec!["a", "b", "c"];
+        assert_eq!(super::take_rewind(&mut history, true).as_deref(), Some("b"));
+        assert_eq!(history, ["a", "b"]);
+        assert_eq!(super::take_rewind(&mut history, true).as_deref(), Some("a"));
+        assert_eq!(history, ["a"]);
+        assert!(super::take_rewind(&mut history, true).is_none());
+        assert_eq!(history, ["a"]);
+        // A choice has not pushed a frame of its own, so the line stays put.
+        assert_eq!(super::take_rewind(&mut history, false).as_deref(), Some("a"));
+        assert_eq!(history, ["a"]);
+    }
+}
+
+mod backlog_paint {
+    #[test]
+    fn history_paints_the_banner_and_the_lines() {
+        let atlas = crate::codec::tga::decode_font(
+            &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
+        )
+        .unwrap();
+        let font = crate::render::Font::from_cell_map(
+            atlas,
+            40,
+            std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
+        )
+        .unwrap();
+        let dirs = [
+            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let header = super::load_background(&dirs, "sys_00032.tga");
+        let scroll = super::load_background(&dirs, "sys_00030.tga");
+        assert!(header.is_some());
+        assert!(scroll.is_some());
+        let scene = crate::render::Surface::new(1280, 720, [80, 120, 160, 255]);
+        let lines = [
+            "春希：不我".to_string(),
+            "春希：不我".to_string(),
+        ];
+        let rows = super::backlog_rows(&lines);
+        assert!(rows.len() > 2, "a name and a body should not collapse into one row");
+        let per_page = 19;
+        let top = rows.len().saturating_sub(per_page);
+        let surf = super::paint_backlog(
+            &scene,
+            &font,
+            &rows,
+            top,
+            per_page,
+            header.as_ref(),
+            scroll.as_ref(),
+            false,
+            false,
+        );
+        // Banner sits on the top edge and is not the flat scene colour.
+        let i = (20 * 1280 + 200) * 4;
+        assert!(surf.pixels[i + 2] > surf.pixels[i], "banner should be cyan, not grey");
+        let _ = std::fs::create_dir_all("/tmp/wa2btn");
+        let _ = surf.save_tga("/tmp/wa2btn/backlog.tga");
+    }
+
+    #[test]
+    fn quick_load_confirm_paints_yes_and_no() {
+        let dirs = [
+            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let plate = super::load_background(&dirs, "sys_00100.tga").unwrap();
+        let buttons = super::load_background(&dirs, "sys_00101.tga").unwrap();
+        let scene = crate::render::Surface::new(1280, 720, [20, 20, 20, 255]);
+        let text = crate::render::text::line_rgba("要读取快速存档吗？", 22);
+        assert!(text.is_some(), "system font should rasterize the prompt");
+        let surf = super::paint_confirm(&scene, Some(&plate), Some(&buttons), text.as_ref(), Some(true));
+        let (px, py) = super::centered_plate(plate.width as i32, plate.height as i32);
+        let boxes = super::ask_buttons(px, py, plate.width as i32, plate.height as i32);
+        let sample = |x: i32, y: i32| {
+            let i = ((y as u32 * 1280 + x as u32) * 4) as usize;
+            surf.pixels[i] as u16 + surf.pixels[i + 1] as u16 + surf.pixels[i + 2] as u16
+        };
+        let yes = sample(boxes[0].0 + 80, boxes[0].1 + 20);
+        let no = sample(boxes[1].0 + 80, boxes[1].1 + 20);
+        assert!(yes > 400, "yes button should be the gold hover row, sum {yes}");
+        assert!(no > 400, "no button should still be the idle row, sum {no}");
+        assert!(yes != no, "hover should change the yes button");
+        let _ = std::fs::create_dir_all("/tmp/wa2btn");
+        let _ = surf.save_tga("/tmp/wa2btn/confirm.tga");
+    }
 }

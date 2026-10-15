@@ -10,7 +10,7 @@
 //!   sys_03000               top banner (1280x36)
 //!   sys_03011               page tabs, 3 tabs x 3 states (192x32 each)
 //!   sys_03040/03041/03042   one help line per setting row, 24 px each
-//!   sys_03020               bottom navigation bar, 2 states of 432x64
+//!   sys_03020               bottom bar: 3 arrow states plus the label strip
 //!   sys_03030               "restore defaults" button, 3 states of 208x24
 //! ```
 //!
@@ -57,15 +57,25 @@ const GUIDE_Y: i32 = PAGE_Y + 440;
 const GUIDE_W: i32 = 956;
 const GUIDE_H: i32 = 19;
 
-const NAV_W: i32 = 432;
+/// `sys_03020` is 432×128. The top 64 rows are three left-arrow states (48 px
+/// apart) and then the label strip from x = 144. The bottom 64 rows are the
+/// three right-arrow states. Drawing the whole top row piles those three states
+/// on top of each other; the screen wants one arrow on each side of the strip.
+const ARROW_W: i32 = 48;
 const NAV_H: i32 = 64;
-const NAV_X: i32 = 128;
-const NAV_Y: i32 = 592;
-
+const BAR_SRC_X: i32 = 144;
+const BAR_W: i32 = 432 - BAR_SRC_X;
+const NAV_PAD: i32 = 40;
+const DEF_GAP: i32 = 56;
 const DEF_W: i32 = 208;
 const DEF_H: i32 = 24;
-const DEF_X: i32 = NAV_X + NAV_W + 24;
-const DEF_Y: i32 = NAV_Y + 20;
+const NAV_CLUSTER: i32 = ARROW_W + NAV_PAD + BAR_W + NAV_PAD + ARROW_W + DEF_GAP + DEF_W;
+const NAV_X: i32 = (W as i32 - NAV_CLUSTER) / 2;
+const NAV_Y: i32 = 608;
+const NAV_BAR_X: i32 = NAV_X + ARROW_W + NAV_PAD;
+const NAV_RIGHT_X: i32 = NAV_BAR_X + BAR_W + NAV_PAD;
+const DEF_X: i32 = NAV_RIGHT_X + ARROW_W + DEF_GAP;
+const DEF_Y: i32 = NAV_Y + (NAV_H - DEF_H) / 2;
 
 /// Geometry of a segmented slider bar, identical on every row: 21 segments of
 /// 14 px on a 16 px pitch, the first one starting at x = 545 of the page image.
@@ -620,7 +630,7 @@ fn draw_page(
             continue;
         }
         done.push(sl.key);
-        if let (Some(src), Some(w)) = (a.gold[page].as_ref(), fill_width(st, sl)) {
+        if let (Some(src), Some(w)) = (a.cyan[page].as_ref(), fill_width(st, sl)) {
             s.blit_region(src, sl.x0, sl.y, w as u32, BAR_H as u32, PAGE_X + sl.x0, PAGE_Y + sl.y);
         }
     }
@@ -630,8 +640,10 @@ fn draw_page(
             continue;
         }
         let src = match style {
-            Style::Gold => a.gold[page].as_ref(),
-            Style::Cyan => a.cyan[page].as_ref(),
+            // The value sheet is gold. Its rim and the body wash both read as
+            // yellow, which fights the cyan page. Selected and hovered options
+            // use the cyan sheet; the body wash tells them apart.
+            Style::Gold | Style::Cyan => a.cyan[page].as_ref(),
             Style::Base => None,
         };
         if let Some(src) = src {
@@ -647,6 +659,43 @@ fn draw_page(
                 }
             }
             s.blit_region(src, h.x.max(0), h.y.max(0), h.w as u32, h.h as u32, PAGE_X + h.x, PAGE_Y + h.y);
+            // The gold and cyan sheets only recolour the rim. The interior is
+            // the same dark plate as the base, so a selected option would
+            // otherwise read as a thin outline. Wash the body, and leave the
+            // label (the bright glyphs) alone.
+            if matches!(h.act, Act::Opt(_, _)) {
+                // Selected is the stronger cyan. Hover is the same hue, lighter,
+                // so the current value stays obvious under the cursor too.
+                let (tint, alpha) = if style == Style::Gold {
+                    ([48u8, 196, 208], 175u8)
+                } else {
+                    ([36, 176, 196], 90)
+                };
+                fill_option_body(s, PAGE_X + h.x, PAGE_Y + h.y, h.w, h.h, tint, alpha);
+            }
+        }
+    }
+}
+
+/// Tint the inside of an option button. Pixels bright enough to be the label
+/// are left as they are, so the caption stays white on the wash.
+fn fill_option_body(s: &mut Surface, x: i32, y: i32, w: i32, h: i32, tint: [u8; 3], alpha: u8) {
+    let inset = 5;
+    let a = alpha as u32;
+    let ia = 255 - a;
+    for yy in (y + inset)..(y + h - inset) {
+        for xx in (x + inset)..(x + w - inset) {
+            if xx < 0 || yy < 0 || xx >= s.width as i32 || yy >= s.height as i32 {
+                continue;
+            }
+            let i = ((yy as u32) * s.width + xx as u32) as usize * 4;
+            let lum = s.pixels[i] as u32 + s.pixels[i + 1] as u32 + s.pixels[i + 2] as u32;
+            if lum >= 230 {
+                continue;
+            }
+            for c in 0..3 {
+                s.pixels[i + c] = ((tint[c] as u32 * a + s.pixels[i + c] as u32 * ia) / 255) as u8;
+            }
         }
     }
 }
@@ -719,15 +768,16 @@ pub fn compose(s: &mut Surface, a: &Assets, st: &Settings, scr: &Screen) {
         s.blit_region(img, 0, y, HELP_W as u32, HELP_H as u32, HELP_X, HELP_Y);
     }
 
-    // Navigation bar and the "restore defaults" button.
+    // One left arrow, the label strip, one right arrow. Column 0 is idle,
+    // column 1 is the arrow under the cursor. The third column is the pressed
+    // frame and stays in the sheet.
     if let Some(n) = a.nav.as_ref() {
-        // Row 0 carries the labels (「上一页 / OPTION / 下一页」); row 1 is the same
-        // bar with the arrow cluster flipped, i.e. an animation frame rather
-        // than a hover state. Always draw row 0, and only swap the arrows.
-        s.blit_region(n, 0, 0, NAV_W as u32, NAV_H as u32, NAV_X, NAV_Y);
-        if scr.nav_hover.is_some() {
-            s.blit_region(n, 0, NAV_H, 150, NAV_H as u32, NAV_X, NAV_Y);
-        }
+        let left = if scr.nav_hover == Some(NAV_PREV) { 1 } else { 0 };
+        let right = if scr.nav_hover == Some(NAV_NEXT) { 1 } else { 0 };
+        // The sheet's top half points left and the bottom half points right.
+        s.blit_region(n, left * ARROW_W, 0, ARROW_W as u32, NAV_H as u32, NAV_X, NAV_Y);
+        s.blit_region(n, BAR_SRC_X, 0, BAR_W as u32, NAV_H as u32, NAV_BAR_X, NAV_Y);
+        s.blit_region(n, right * ARROW_W, NAV_H, ARROW_W as u32, NAV_H as u32, NAV_RIGHT_X, NAV_Y);
     }
     if let Some(d) = a.defbtn.as_ref() {
         let state = if scr.nav_hover == Some(NAV_DEF) { 2 } else { 0 };
@@ -771,16 +821,24 @@ fn hit(scr_page: usize, hots: &[Hot], sx: i32, sy: i32) -> Option<usize> {
             }
         }
     }
-    // navigation bar
-    if sy >= NAV_Y && sy < NAV_Y + NAV_H && sx >= NAV_X && sx < NAV_X + NAV_W {
-        let rel = sx - NAV_X;
-        return Some(if rel < 145 {
-            NAV_PREV
-        } else if rel < 290 {
-            NAV_MID
-        } else {
-            NAV_NEXT
-        });
+    // Left arrow and 「上一页」, the OPTION label, 「下一页」 and the right arrow.
+    if sy >= NAV_Y && sy < NAV_Y + NAV_H {
+        if sx >= NAV_X && sx < NAV_X + ARROW_W {
+            return Some(NAV_PREV);
+        }
+        if sx >= NAV_RIGHT_X && sx < NAV_RIGHT_X + ARROW_W {
+            return Some(NAV_NEXT);
+        }
+        if sx >= NAV_BAR_X && sx < NAV_BAR_X + BAR_W {
+            let rel = sx - NAV_BAR_X;
+            return Some(if rel < 100 {
+                NAV_PREV
+            } else if rel < 210 {
+                NAV_MID
+            } else {
+                NAV_NEXT
+            });
+        }
     }
     if sy >= DEF_Y && sy < DEF_Y + DEF_H && sx >= DEF_X && sx < DEF_X + DEF_W {
         return Some(NAV_DEF);
@@ -814,6 +872,636 @@ fn nav_act(idx: usize) -> Option<Act> {
     }
 }
 
+/// One caption drawn with the system font, in 1280×720 coordinates.
+struct Lab {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    text: &'static str,
+    sub: &'static str,
+    size: u32,
+    center: bool,
+    /// Pixels eaten off each edge before the baked glyphs are covered, so a
+    /// button frame is not painted over.
+    inset: i32,
+    /// Fill the whole box. Used where the artwork has no dark pixel to sample
+    /// (the tab face is brighter than its caption).
+    fill: bool,
+}
+
+fn lab(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    text: &'static str,
+    sub: &'static str,
+    size: u32,
+    center: bool,
+    inset: i32,
+    fill: bool,
+) -> Lab {
+    Lab { x, y, w, h, text, sub, size, center, inset, fill }
+}
+
+fn head(x: i32, y: i32, w: i32, text: &'static str) -> Lab {
+    lab(PAGE_X + x, PAGE_Y + y, w, 18, text, "", 18, false, 0, false)
+}
+
+fn row(x: i32, y: i32, w: i32, h: i32, text: &'static str, sub: &'static str) -> Lab {
+    lab(PAGE_X + x, PAGE_Y + y, w, h, text, sub, 22, false, 0, false)
+}
+
+fn note(x: i32, y: i32, w: i32, text: &'static str) -> Lab {
+    lab(PAGE_X + x, PAGE_Y + y, w, 16, text, "", 14, false, 0, false)
+}
+
+fn btn(x: i32, y: i32, w: i32, h: i32, text: &'static str, sub: &'static str) -> Lab {
+    lab(PAGE_X + x, PAGE_Y + y, w, h, text, sub, 18, true, 7, false)
+}
+
+fn tiny(x: i32, y: i32, w: i32, h: i32, text: &'static str) -> Lab {
+    lab(PAGE_X + x, PAGE_Y + y, w, h, text, "", 13, true, 3, false)
+}
+
+/// The original captions were letter-spaced. A regular gap keeps short Chinese
+/// labels from reading as one dense block.
+fn spread_cjk(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let cjk = |c: char| ('\u{3400}'..='\u{9fff}').contains(&c);
+    if chars.len() < 2 || chars.len() > 6 || !chars.iter().copied().all(cjk) {
+        return text.to_string();
+    }
+    chars.into_iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+fn menu_px(layout_px: u32, window_h: i32) -> u32 {
+    ((layout_px as i32 * window_h.max(1)) / 720).clamp(8, 64) as u32
+}
+
+fn page_labs(page: usize) -> Vec<Lab> {
+    let mut v = Vec::new();
+    match page {
+        0 => {
+            v.push(head(36, 0, 220, "画面设置"));
+            v.push(row(48, 20, 240, 28, "画面模式", ""));
+            v.push(btn(458, 14, 252, 36, "瞬间显示", "Window"));
+            v.push(btn(714, 14, 252, 36, "全屏模式", "Full Screen"));
+            v.push(head(36, 54, 200, "文本设置"));
+            v.push(row(40, 80, 250, 30, "文本显示速度", ""));
+            v.push(btn(458, 72, 124, 45, "瞬间显示", "Moment"));
+            v.push(btn(586, 72, 124, 45, "高速", "Fast"));
+            v.push(btn(714, 72, 124, 45, "普通", "Normal"));
+            v.push(btn(842, 72, 124, 45, "顺滑", "Smooth"));
+            v.push(row(40, 122, 250, 30, "文本快进模式", ""));
+            v.push(btn(458, 118, 252, 36, "全文", "All"));
+            v.push(btn(714, 118, 252, 36, "仅限已读", "Already Read"));
+            v.push(row(40, 162, 250, 28, "自动模式速度", ""));
+            v.push(tiny(532, 180, 48, 16, "FAST"));
+            v.push(tiny(848, 180, 52, 16, "SLOW"));
+            v.push(head(36, 204, 200, "视觉设置"));
+            v.push(row(48, 226, 240, 28, "画面特效", ""));
+            v.push(btn(458, 222, 252, 36, "瞬间显示", "Fast"));
+            v.push(btn(714, 222, 252, 36, "普通显示", "Normal"));
+            v.push(row(40, 254, 220, 22, "窗口透明度", ""));
+            v.push(note(48, 278, 180, "（普通场景）"));
+            v.push(tiny(388, 268, 80, 26, "窗口ON"));
+            v.push(row(40, 296, 220, 22, "窗口透明度", ""));
+            v.push(note(56, 320, 160, "（CG场景）"));
+            v.push(tiny(388, 308, 80, 26, "窗口OFF"));
+            v.push(row(40, 336, 220, 22, "背景透明度", ""));
+            v.push(note(48, 360, 180, "（小说场景）"));
+            v.push(row(40, 386, 260, 26, "指令图标透明度", ""));
+            for y in [280, 320, 360, 400] {
+                v.push(tiny(536, y, 40, 16, "0%"));
+                v.push(tiny(848, y, 48, 16, "100%"));
+            }
+        }
+        1 => {
+            v.push(head(36, 0, 220, "系统设置"));
+            v.push(row(40, 20, 240, 28, "是 / 否确认", ""));
+            v.push(btn(458, 14, 252, 36, "确认", "Confirmation ON"));
+            v.push(btn(714, 14, 252, 36, "不确认", "Confirmation OFF"));
+            v.push(row(40, 56, 260, 30, "滑鼠右键功能", ""));
+            v.push(btn(458, 48, 164, 47, "隐藏窗口", "Window OFF"));
+            v.push(btn(630, 48, 164, 47, "设置菜单", "Option"));
+            v.push(btn(802, 48, 164, 47, "存档", "Save"));
+            v.push(head(36, 96, 200, "声音设置"));
+            for (y, name) in [(118, "全体音量"), (158, "BGM音量"), (198, "SE音量"), (238, "VOICE音量")] {
+                v.push(row(40, y + 2, 220, 28, name, ""));
+                v.push(lab(PAGE_X + 390, PAGE_Y + y, 80, 28, "音量ON", "音量OFF", 12, true, 3, false));
+                v.push(tiny(534, y + 26, 36, 14, "MIN"));
+                v.push(tiny(860, y + 26, 40, 14, "MAX"));
+            }
+            v.push(head(36, 280, 200, "暂停设置"));
+            v.push(row(40, 308, 270, 30, "翻页时中断语音", ""));
+            v.push(btn(458, 302, 252, 36, "中断", "Stop"));
+            v.push(btn(714, 302, 252, 36, "不中断", "Keep"));
+            v.push(row(40, 348, 270, 30, "H场景时播放语音", ""));
+            v.push(btn(458, 342, 252, 36, "全部", "Normal"));
+            v.push(btn(714, 342, 252, 36, "仅限女性角色", "Female Voice Only"));
+        }
+        _ => {
+            v.push(head(36, 0, 280, "角色语音设置"));
+            let names = [
+                "北原春希",
+                "小木曾雪菜",
+                "冬马和纱",
+                "杉浦小春",
+                "和泉千晶",
+                "风冈麻理",
+                "饭塚武也",
+                "水泽依绪",
+                "其他男性角色",
+                "其他女性角色",
+            ];
+            for (i, name) in names.iter().enumerate() {
+                let y = 14 + i as i32 * 40;
+                v.push(row(70, y + 2, 260, 32, name, ""));
+                v.push(btn(458, y, 252, 36, "语音开", "ON"));
+                v.push(btn(714, y, 252, 36, "语音关", "OFF"));
+            }
+        }
+    }
+    v
+}
+
+fn chrome_labs() -> Vec<Lab> {
+    let mut v = Vec::new();
+    for i in 0..3 {
+        v.push(lab(
+            TABS_X + i * TAB_W,
+            TABS_Y,
+            TAB_W,
+            TAB_H,
+            match i {
+                0 => "OPTION 1",
+                1 => "OPTION 2",
+                _ => "OPTION 3",
+            },
+            "",
+            16,
+            true,
+            6,
+            true,
+        ));
+    }
+    v.push(lab(NAV_BAR_X, NAV_Y + 14, 100, 36, "上一页", "", 16, true, 0, false));
+    v.push(lab(NAV_BAR_X + 100, NAV_Y + 4, BAR_W - 200, 26, "更改游戏的环境设置", "", 15, true, 0, false));
+    v.push(lab(NAV_BAR_X + 100, NAV_Y + 36, BAR_W - 200, 22, "OPTION", "", 13, true, 0, false));
+    v.push(lab(NAV_BAR_X + BAR_W - 100, NAV_Y + 14, 100, 36, "下一页", "", 16, true, 0, false));
+    v.push(lab(DEF_X, DEF_Y, DEF_W, DEF_H, "恢复默认设置", "", 16, true, 4, false));
+    v
+}
+
+fn help_lines(page: usize) -> &'static [&'static str] {
+    match page {
+        0 => &[
+            "设置游戏时的画面模式。全屏模式时画面比例将固定为16:9",
+            "设置文本窗口中文本的显示速度。设置为「瞬间显示」时将无特效。",
+            "设置文本快进的条件。设置为「全文」时，未阅读的文本也能快进。",
+            "设置开启自动模式时自动播放的速度。",
+            "设置画面特效的表现方式。想要更快运行游戏请设置为「瞬间显示」。",
+            "设置文本窗口的透明度。「窗口OFF」时文本窗口将完全消失。",
+            "设置文本窗口的透明度。「窗口OFF」时文本窗口将完全消失。",
+            "设置阅读小说时背景（黑色）的透明度。",
+            "设置指令图标在通常情况下的透明度。",
+        ],
+        1 => &[
+            "设置存档和读档时是否弹出确认窗口。",
+            "设置滑鼠右键功能。",
+            "设置各种音量。按下「音量OFF」键时，将维持当前音量设置并将音量降为0。可按「音符键」试听效果。",
+            "设置语音播放的规则。设置为「中断」时，文本翻页时将强制中断语音。",
+            "设置H场景中的语音播放状况。设置为「仅限女性角色」时，H场景中将不播放男性角色的语音。",
+        ],
+        _ => &["设置角色的语音是否开启。设置为OFF的情形下，和VOICE音量设置有关的角色的语音将一概不会播放。"],
+    }
+}
+
+fn using_cn_art(dirs: &[&Path]) -> bool {
+    dirs.iter().any(|d| d.file_name().and_then(|s| s.to_str()) == Some("bg_cn"))
+}
+
+fn px_of(img: &TgaImage, x: i32, y: i32) -> [u8; 3] {
+    let i = ((y as u32 * img.width + x as u32) * 4) as usize;
+    [img.rgba[i], img.rgba[i + 1], img.rgba[i + 2]]
+}
+
+/// Teal rules and the section ticks. Same colour family as the caption glow,
+/// so they have to be recognised before any luminance test.
+fn structural_teal(p: [u8; 3]) -> bool {
+    p[0] < 60 && p[1] >= 75 && p[2] >= 75 && (p[1] as i32 - p[2] as i32).abs() < 30
+}
+
+fn bright_caption(p: [u8; 3]) -> bool {
+    if structural_teal(p) {
+        return false;
+    }
+    let m = p[0].max(p[1]).max(p[2]);
+    if m >= 140 {
+        return true;
+    }
+    // Dim Latin subtitles (SCREEN SETTING and the like). The rule is greener.
+    p[2] > p[0] + 20 && p[2] + 5 > p[1] && p[1] < 75 && m >= 75
+}
+
+/// Button captions sit on the teal fill. Chinese is around (49,119,124) and
+/// the English line under it is a little darker, around (34,107,111).
+/// Snowflakes stay under r < 32.
+fn button_caption(p: [u8; 3]) -> bool {
+    p[0] >= 32 && p[0] < 180 && p[1] >= 96 && p[1] < 230 && p[2] >= 90
+}
+
+/// The English line under a button caption, around (26,103,105). Dimmer than
+/// the Chinese stroke, still clearly above the teal plate.
+fn dim_caption(p: [u8; 3]) -> bool {
+    p[1] >= 98 && p[1] < 175 && p[2] >= 90 && p[0] < 90 && p[0] as i32 + 12 < p[1] as i32
+}
+
+/// Erase baked page captions, including the one-pixel halo around each stroke,
+/// and put the colour underneath back. Rules, dotted leaders, snowflakes and
+/// widget frames stay. The mask comes from the base art, so a selected
+/// button's wash cannot hide the letters or get punched out.
+fn wipe_baked_captions(s: &mut Surface, base: &TgaImage, page: usize) {
+    let pw = base.width as i32;
+    let ph = base.height as i32;
+    if pw <= 0 || ph <= 0 {
+        return;
+    }
+    let n = (pw * ph) as usize;
+    let mut mask = vec![false; n];
+    let mut protect = vec![false; n];
+    for y in 0..ph {
+        for x in 0..pw {
+            let p = px_of(base, x, y);
+            let i = (y * pw + x) as usize;
+            let m = p[0].max(p[1]).max(p[2]);
+            // Near-white on the left is the caption itself. On the right it is
+            // the widget frame, which has to survive.
+            if structural_teal(p) || (x >= 430 && m >= 245) {
+                protect[i] = true;
+            }
+        }
+    }
+    for y in 0..ph {
+        for x in 0..(430.min(pw)) {
+            let i = (y * pw + x) as usize;
+            if !protect[i] && bright_caption(px_of(base, x, y)) {
+                mask[i] = true;
+            }
+        }
+    }
+    for h in page_hots(page) {
+        if !matches!(h.act, Act::Opt(_, _) | Act::Off(_)) {
+            continue;
+        }
+        let x0 = (h.x + 6).max(0);
+        let y0 = (h.y + 6).max(0);
+        let x1 = (h.x + h.w - 6).min(pw);
+        let y1 = (h.y + h.h - 6).min(ph);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * pw + x) as usize;
+                // The frame is outside this inset. A white pixel in here is a
+                // caption, including on the gold and cyan sheets.
+                protect[i] = false;
+                let p = px_of(base, x, y);
+                // Snowflakes sit on the left and right of the caption. The dim
+                // English line is only in the middle, and its red channel drops
+                // under the Chinese stroke, so the centre uses a wider test.
+                let mid = x >= h.x + h.w / 6 && x < h.x + h.w - h.w / 6;
+                if button_caption(p) || (mid && dim_caption(p)) {
+                    mask[i] = true;
+                }
+            }
+        }
+    }
+    // FAST / SLOW / 0% / 100% / MIN / MAX sit outside the option buttons.
+    for lab in page_labs(page) {
+        if !lab.sub.is_empty() || lab.w > 80 {
+            continue;
+        }
+        let x0 = (lab.x - PAGE_X).max(0);
+        let y0 = (lab.y - PAGE_Y).max(0);
+        let x1 = (x0 + lab.w).min(pw);
+        let y1 = (y0 + lab.h).min(ph);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * pw + x) as usize;
+                let p = px_of(base, x, y);
+                if !protect[i] && p[0] > 40 && p[1] > 80 && p[0].max(p[1]).max(p[2]) < 220 {
+                    mask[i] = true;
+                }
+            }
+        }
+    }
+    // Two pixels of halo, but not onto a rule or a frame.
+    for _ in 0..3 {
+        let prev = mask.clone();
+        for y in 1..ph - 1 {
+            for x in 1..pw - 1 {
+                let i = (y * pw + x) as usize;
+                if protect[i] || prev[i] {
+                    continue;
+                }
+                let near = prev[i - 1] || prev[i + 1] || prev[(i as i32 - pw) as usize] || prev[(i as i32 + pw) as usize];
+                if near {
+                    mask[i] = true;
+                }
+            }
+        }
+    }
+    for y in 0..ph {
+        for x in 0..pw {
+            if !mask[(y * pw + x) as usize] {
+                continue;
+            }
+            let sx = PAGE_X + x;
+            let sy = PAGE_Y + y;
+            if let Some(c) = nearby_fill(s, &mask, pw, x, y) {
+                if sx >= 0 && sy >= 0 && (sx as u32) < s.width && (sy as u32) < s.height {
+                    let di = ((sy as u32 * s.width + sx as u32) * 4) as usize;
+                    s.pixels[di] = c[0];
+                    s.pixels[di + 1] = c[1];
+                    s.pixels[di + 2] = c[2];
+                    s.pixels[di + 3] = 255;
+                }
+            }
+        }
+    }
+}
+
+fn nearby_fill(s: &Surface, mask: &[bool], pw: i32, x: i32, y: i32) -> Option<[u8; 3]> {
+    // Left of the widgets the page is black. Inside a button, take a pixel
+    // from the same row so the vertical gradient stays and the caption is not
+    // replaced by one flat dark rectangle.
+    let want_black = x < 430;
+    if !want_black {
+        if let Some(c) = body_on_row(s, mask, pw, x, y) {
+            return Some(c);
+        }
+    }
+    let mut best: Option<(u32, [u8; 3])> = None;
+    for rad in 1i32..24 {
+        for dy in -rad..=rad {
+            for dx in -rad..=rad {
+                if dx.abs() != rad && dy.abs() != rad {
+                    continue;
+                }
+                let nx = x + dx;
+                let ny = y + dy;
+                if nx < 0 || ny < 0 || nx >= pw || ny >= (mask.len() as i32 / pw) {
+                    continue;
+                }
+                if mask[(ny * pw + nx) as usize] {
+                    continue;
+                }
+                let sx = PAGE_X + nx;
+                let sy = PAGE_Y + ny;
+                if sx < 0 || sy < 0 || sx as u32 >= s.width || sy as u32 >= s.height {
+                    continue;
+                }
+                let i = ((sy as u32 * s.width + sx as u32) * 4) as usize;
+                let c = [s.pixels[i], s.pixels[i + 1], s.pixels[i + 2]];
+                let sum = c[0] as u32 + c[1] as u32 + c[2] as u32;
+                let good = if want_black { sum < 40 } else { (40..190).contains(&sum) };
+                if good {
+                    return Some(c);
+                }
+                if best.map(|(s0, _)| sum < s0).unwrap_or(true) {
+                    best = Some((sum, c));
+                }
+            }
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
+/// Teal button fill on this row: darker than a caption, not the white frame.
+fn body_on_row(s: &Surface, mask: &[bool], pw: i32, x: i32, y: i32) -> Option<[u8; 3]> {
+    let rows = mask.len() as i32 / pw;
+    let mut idle_hit = None;
+    for dist in 1..160 {
+        for nx in [x - dist, x + dist] {
+            if nx < 0 || nx >= pw || y < 0 || y >= rows {
+                continue;
+            }
+            if mask[(y * pw + nx) as usize] {
+                continue;
+            }
+            let sx = PAGE_X + nx;
+            let sy = PAGE_Y + y;
+            if sx < 0 || sy < 0 || sx as u32 >= s.width || sy as u32 >= s.height {
+                continue;
+            }
+            let i = ((sy as u32 * s.width + sx as u32) * 4) as usize;
+            let c = [s.pixels[i], s.pixels[i + 1], s.pixels[i + 2]];
+            let gb = (c[1] as i32 - c[2] as i32).abs();
+            // A selected button's plate is the cyan wash. Prefer that over a
+            // darker unwashed fringe, or the old English line is repainted as
+            // a shadow.
+            let washed = c[1] > 160 && c[0] < 90 && (c[0] as i32 + 40) < c[1] as i32 && gb < 30 && c[0].max(c[1]).max(c[2]) < 240;
+            if washed {
+                return Some(c);
+            }
+            let idle = c[0] < 30 && (45..95).contains(&c[1]) && gb < 25;
+            if idle && idle_hit.is_none() {
+                idle_hit = Some(c);
+            }
+        }
+    }
+    idle_hit
+}
+
+/// Tabs, the bottom bar and the default button are separate sheets. Repaint
+/// each caption area from a clean pixel so the baked letters are gone and the
+/// face stays a smooth gradient. A per-pixel brightness test leaves ridges.
+fn wipe_chrome_captions(s: &mut Surface) {
+    for i in 0..3 {
+        let x = TABS_X + i * TAB_W;
+        repaint_from_column(s, x + 8, x + 16, TABS_Y + 8, TAB_W - 32, 18);
+    }
+    s.fill_rect(NAV_BAR_X + 2, NAV_Y + 2, (BAR_W - 4) as u32, (NAV_H - 4) as u32, [0, 0, 0, 255]);
+    flatten_pill(s, DEF_X + 6, DEF_Y + 3, DEF_W - 12, DEF_H - 6);
+}
+
+fn repaint_from_column(s: &mut Surface, src_x: i32, x: i32, y: i32, w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    for yy in y..y + h {
+        let Some(bg) = surf_px(s, src_x, yy) else { continue };
+        for xx in x..x + w {
+            put_px(s, xx, yy, bg);
+        }
+    }
+}
+
+fn flatten_pill(s: &mut Surface, x: i32, y: i32, w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let mut body = None;
+    for yy in y..y + h {
+        for xx in x..x + w {
+            let Some(p) = surf_px(s, xx, yy) else { continue };
+            if p[0] < 35 && p[1] > 50 && p[1] < 140 {
+                body = Some(p);
+                break;
+            }
+        }
+        if body.is_some() {
+            break;
+        }
+    }
+    let body = body.unwrap_or([12, 70, 68]);
+    s.fill_rect(x, y, w as u32, h as u32, [body[0], body[1], body[2], 255]);
+}
+
+fn surf_px(s: &Surface, x: i32, y: i32) -> Option<[u8; 3]> {
+    if x < 0 || y < 0 || x >= s.width as i32 || y >= s.height as i32 {
+        return None;
+    }
+    let i = ((y as u32 * s.width + x as u32) * 4) as usize;
+    Some([s.pixels[i], s.pixels[i + 1], s.pixels[i + 2]])
+}
+
+fn put_px(s: &mut Surface, x: i32, y: i32, c: [u8; 3]) {
+    if x < 0 || y < 0 || x >= s.width as i32 || y >= s.height as i32 {
+        return;
+    }
+    let i = ((y as u32 * s.width + x as u32) * 4) as usize;
+    s.pixels[i] = c[0];
+    s.pixels[i + 1] = c[1];
+    s.pixels[i + 2] = c[2];
+}
+
+struct MenuText {
+    ww: i32,
+    wh: i32,
+    page: usize,
+    /// Window-sized label layer, then one full-width row per help line, then
+    /// the idle guide caption.
+    buf: Vec<u8>,
+    help_h: u32,
+    help_n: usize,
+}
+
+fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
+    let help_h = menu_px(18, wh);
+    let helps = help_lines(page);
+    let extra = (helps.len() as u32 + 1) * help_h;
+    let mut stamps = Vec::new();
+    let mapx = |x: i32| x * ww / 1280;
+    let mapy = |y: i32| y * wh / 720;
+    let mapw = |x: i32, w: i32| (x + w) * ww / 1280 - x * ww / 1280;
+    let maph = |y: i32, h: i32| (y + h) * wh / 720 - y * wh / 720;
+    for lab in page_labs(page).iter().chain(chrome_labs().iter()) {
+        let size = menu_px(lab.size, wh);
+        let (bx, by, bw, bh) = (mapx(lab.x), mapy(lab.y), mapw(lab.x, lab.w), maph(lab.y, lab.h));
+        // English under the Chinese (Window, Full Screen, …) is not drawn.
+        // A second line is kept only when it is itself Chinese, such as 音量OFF.
+        let sub_is_cjk = lab.sub.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
+        if lab.sub.is_empty() || !sub_is_cjk {
+            stamps.push(crate::render::text::Stamp {
+                text: spread_cjk(lab.text),
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                size,
+                center: lab.center,
+            });
+        } else {
+            let gap = (bh / 8).max(4);
+            let top = ((bh - gap) * 5 / 8).max(1);
+            let sub_h = (bh - top - gap).max(1);
+            stamps.push(crate::render::text::Stamp {
+                text: spread_cjk(lab.text),
+                x: bx,
+                y: by,
+                w: bw,
+                h: top,
+                size,
+                center: true,
+            });
+            stamps.push(crate::render::text::Stamp {
+                text: lab.sub.to_string(),
+                x: bx,
+                y: by + top + gap,
+                w: bw,
+                h: sub_h,
+                size: menu_px((lab.size * 2 / 3).max(11), wh),
+                center: true,
+            });
+        }
+    }
+    for (i, line) in helps.iter().enumerate() {
+        stamps.push(crate::render::text::Stamp {
+            text: (*line).to_string(),
+            x: 40,
+            y: wh + i as i32 * help_h as i32,
+            w: ww - 80,
+            h: help_h as i32,
+            size: menu_px(17, wh),
+            center: true,
+        });
+    }
+    stamps.push(crate::render::text::Stamp {
+        text: "向导信息".to_string(),
+        x: mapx(GUIDE_X),
+        y: wh + helps.len() as i32 * help_h as i32,
+        w: 220,
+        h: help_h as i32,
+        size: menu_px(14, wh),
+        center: false,
+    });
+    let (_w, _h, buf) = crate::render::text::stamps_rgba(ww as u32, wh as u32 + extra, &stamps)?;
+    Some(MenuText { ww, wh, page, buf, help_h, help_n: helps.len() })
+}
+
+fn blit_tint(surf: &mut Surface, rgba: &[u8], w: u32, h: u32, x: i32, y: i32, rgb: [u8; 3]) {
+    for row in 0..h as i32 {
+        for col in 0..w as i32 {
+            let i = ((row as u32 * w + col as u32) * 4) as usize;
+            if i + 3 >= rgba.len() {
+                return;
+            }
+            let a = rgba[i + 3];
+            if a == 0 {
+                continue;
+            }
+            surf.blend_pixel(x + col, y + row, [rgb[0], rgb[1], rgb[2], a]);
+        }
+    }
+}
+
+fn paint_menu_text(frame: &mut Surface, text: &MenuText, help_row: Option<usize>) {
+    let ww = text.ww as u32;
+    let wh = text.wh.max(0) as u32;
+    let rgb = [214u8, 244, 248];
+    let main = (wh as usize) * (ww as usize) * 4;
+    if text.buf.len() >= main {
+        blit_tint(frame, &text.buf[..main], ww, wh, 0, 0, rgb);
+    }
+    let row_bytes = (text.help_h as usize) * (ww as usize) * 4;
+    let idx = match help_row {
+        Some(r) if r < text.help_n => r,
+        _ => text.help_n,
+    };
+    let start = main + idx * row_bytes;
+    let end = start + row_bytes;
+    if end <= text.buf.len() {
+        let y = if help_row.is_some() {
+            HELP_Y * text.wh / 720
+        } else {
+            GUIDE_Y * text.wh / 720
+        };
+        blit_tint(frame, &text.buf[start..end], ww, text.help_h, 0, y, rgb);
+    }
+}
+
 /// Run the option screen until the player leaves it.
 ///
 /// `mx` is used for the little sample sound behind the volume rows; when no
@@ -826,13 +1514,19 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
     }
     let mut scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None };
     let mut dirty = false;
+    let cn = using_cn_art(dirs);
+    let mut menu_text: Option<MenuText> = None;
+    let mut shown: Option<(String, Surface)> = None;
 
     loop {
         let mut activate: Option<Act> = None;
         // Where the click happened, for the slider tracks.
         let mut click_at: (i32, i32) = (0, 0);
         match win.poll_input() {
-            sdl2::Input::Quit => break,
+            sdl2::Input::Quit => {
+                win.set_fullscreen(st.win_disp == 1);
+                break;
+            }
             sdl2::Input::Up => {
                 scr.help_row = Some(match scr.help_row {
                     Some(r) if r > 0 => r - 1,
@@ -880,12 +1574,18 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
 
         if let Some(a) = activate {
             if a == Act::Close {
+                win.set_fullscreen(st.win_disp == 1);
                 break;
             }
             match a {
                 Act::Opt(k, v) => {
                     st.set(k, v);
                     dirty = true;
+                    // Apply while the page is still open, so the gold frame and
+                    // the window change together.
+                    if k == "win_disp" {
+                        win.set_fullscreen(st.win_disp == 1);
+                    }
                 }
                 Act::Step(k, d) => {
                     let cur = st.get(k).unwrap_or(0);
@@ -937,6 +1637,7 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                 Act::Reset => {
                     *st = Settings::default();
                     dirty = true;
+                    win.set_fullscreen(false);
                 }
                 Act::Tab(p) => {
                     if std::env::var_os("WA2_DEBUG_INPUT").is_some() {
@@ -965,26 +1666,58 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
             dirty = false;
         }
 
-        let mut s = Surface::new(W, H, [0, 0, 0, 255]);
-        compose(&mut s, &assets, st, &scr);
-        // `WA2_MENU_DUMP` writes the frame whenever the screen state changes,
-        // which makes the option screen verifiable without a working X11 screen
-        // capture. The write goes to a temporary file and is renamed, so a
-        // reader never sees a half-written image.
-        if let Ok(path) = std::env::var("WA2_MENU_DUMP") {
-            let sig = format!("{:?}|{:?}|{:?}|{:?}", scr.page, scr.hover, scr.help_row, st);
-            let changed = DUMP_SIG.lock().map(|g| *g != sig).unwrap_or(true);
-            if changed {
-                let tmp = format!("{}.tmp", path);
-                if s.save_tga(&tmp).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path);
-                }
-                if let Ok(mut g) = DUMP_SIG.lock() {
-                    *g = sig;
+        let (ww, wh) = win.window_size();
+        let ww = ww.max(1);
+        let wh = wh.max(1);
+        let sig = format!("{:?}|{:?}|{:?}|{:?}|{}|{}", scr.page, scr.hover, scr.help_row, st, ww, wh);
+        let reuse = shown.as_ref().map(|(k, _)| k == &sig).unwrap_or(false);
+        if !reuse {
+            if cn {
+                let stale = menu_text
+                    .as_ref()
+                    .map(|t| t.ww != ww || t.wh != wh || t.page != scr.page)
+                    .unwrap_or(true);
+                if stale {
+                    menu_text = build_menu_text(scr.page, ww, wh);
                 }
             }
+            let mut s = Surface::new(W, H, [0, 0, 0, 255]);
+            compose(&mut s, &assets, st, &scr);
+            if cn && menu_text.is_some() {
+                s.fill_rect(GUIDE_X, GUIDE_Y, GUIDE_W as u32, GUIDE_H as u32, [0, 0, 0, 255]);
+                if let Some(base) = assets.base[scr.page].as_ref() {
+                    wipe_baked_captions(&mut s, base, scr.page);
+                }
+                wipe_chrome_captions(&mut s);
+            }
+            let mut frame = if ww as u32 == W && wh as u32 == H {
+                s
+            } else {
+                s.scaled_to(ww as u32, wh as u32)
+            };
+            if let Some(text) = menu_text.as_ref() {
+                paint_menu_text(&mut frame, text, scr.help_row);
+            }
+            // `WA2_MENU_DUMP` writes the frame the player sees, labels included.
+            // The write goes to a temporary file and is renamed, so a reader
+            // never sees a half-written image.
+            if let Ok(path) = std::env::var("WA2_MENU_DUMP") {
+                let changed = DUMP_SIG.lock().map(|g| *g != sig).unwrap_or(true);
+                if changed {
+                    let tmp = format!("{}.tmp", path);
+                    if frame.save_tga(&tmp).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                    if let Ok(mut g) = DUMP_SIG.lock() {
+                        *g = sig.clone();
+                    }
+                }
+            }
+            shown = Some((sig, frame));
         }
-        win.present(&s);
+        if let Some((_, frame)) = shown.as_ref() {
+            win.present(frame);
+        }
         win.delay(16);
     }
 }
@@ -1009,11 +1742,176 @@ mod tests {
     use super::*;
 
     #[test]
+    fn baked_page_captions_are_replaced_by_the_background() {
+        let dirs = [
+            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let assets = Assets::load(&dirs);
+        let base = assets.base[0].as_ref().expect("page art");
+        let st = Settings::default();
+        let scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None };
+        let mut s = Surface::new(W, H, [0, 0, 0, 255]);
+        compose(&mut s, &assets, &st, &scr);
+        // A stroke of 「画面模式」, page (140, 32).
+        let at = |s: &Surface, x: u32, y: u32| {
+            let i = ((y * s.width + x) * 4) as usize;
+            s.pixels[i] as u32 + s.pixels[i + 1] as u32 + s.pixels[i + 2] as u32
+        };
+        let mut found = None;
+        for y in (PAGE_Y as u32)..(PAGE_Y as u32 + 50) {
+            for x in (PAGE_X as u32 + 40)..(PAGE_X as u32 + 280) {
+                let sum = at(&s, x, y);
+                if sum > 400 {
+                    found = Some((x, y, sum));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (gx, gy, before) = found.expect("no bright caption pixel on the left");
+        assert!(before > 400, "expected a baked glyph, sum {before}");
+        wipe_baked_captions(&mut s, base, 0);
+        let after = at(&s, gx, gy);
+        assert!(after < 80, "glyph should be gone, sum {after}");
+        let mut leftover = 0u32;
+        let mut worst = (0u32, 0u32, 0u32, [0u8; 3]);
+        for y in (PAGE_Y as u32 + 20)..(PAGE_Y as u32 + 50) {
+            for x in (PAGE_X as u32 + 40)..(PAGE_X as u32 + 250) {
+                let i = ((y * s.width + x) * 4) as usize;
+                let p = [s.pixels[i], s.pixels[i + 1], s.pixels[i + 2]];
+                if structural_teal(p) {
+                    continue;
+                }
+                let sum = p[0] as u32 + p[1] as u32 + p[2] as u32;
+                if sum > 80 {
+                    leftover += 1;
+                    if sum > worst.0 {
+                        worst = (sum, x, y, p);
+                    }
+                }
+            }
+        }
+        assert!(
+            leftover < 40,
+            "caption halo still visible: {leftover} px, worst {worst:?}"
+        );
+        // The button frame stays white, and the caption inside it does not.
+        let frame = at(&s, (PAGE_X as u32) + 465, (PAGE_Y as u32) + 16);
+        assert!(frame > 600, "frame was eaten, sum {frame}");
+        let mut btn_left = 0u32;
+        for y in (PAGE_Y as u32 + 22)..(PAGE_Y as u32 + 40) {
+            for x in (PAGE_X as u32 + 560)..(PAGE_X as u32 + 640) {
+                if at(&s, x, y) > 500 {
+                    btn_left += 1;
+                }
+            }
+        }
+        assert!(btn_left < 24, "button caption still bright: {btn_left} px");
+        wipe_chrome_captions(&mut s);
+        let margin = at(&s, (TABS_X + TAB_W + 16) as u32, (TABS_Y + 16) as u32);
+        let mut tab_left = 0u32;
+        for y in (TABS_Y as u32 + 12)..(TABS_Y as u32 + 26) {
+            for x in (TABS_X as u32 + TAB_W as u32 + 20)..(TABS_X as u32 + TAB_W as u32 * 2 - 20) {
+                if at(&s, x, y) > margin + 50 {
+                    tab_left += 1;
+                }
+            }
+        }
+        assert!(tab_left < 12, "idle tab caption remains: {tab_left} px, margin {margin}");
+    }
+
+    #[test]
     fn auto_hold_follows_the_slider_and_the_line() {
         let fast = auto_hold_ms(0, 20);
         let slow = auto_hold_ms(LEVELS, 20);
         assert!(slow > fast * 2, "slow {slow} should be well above fast {fast}");
         assert!(auto_hold_ms(5, 40) > auto_hold_ms(5, 8));
         assert!(fast >= 200);
+    }
+
+    #[test]
+    fn selected_option_is_filled_not_just_an_edge() {
+        let dirs = [
+            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let assets = Assets::load(&dirs);
+        assert!(assets.available());
+        let mut st = Settings::default();
+        st.text_speed = 1;
+        let scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None };
+        let mut surf = Surface::new(W, H, [0, 0, 0, 255]);
+        compose(&mut surf, &assets, &st, &scr);
+        let sample = |x: i32, y: i32| {
+            let i = ((y as u32 * W + x as u32) * 4) as usize;
+            (surf.pixels[i], surf.pixels[i + 1], surf.pixels[i + 2])
+        };
+        // Centres of 「瞬间显示」 and the selected 「高速」.
+        let idle = sample(PAGE_X + 458 + 62, PAGE_Y + 72 + 22);
+        let picked = sample(PAGE_X + 586 + 62, PAGE_Y + 72 + 22);
+        assert!(
+            picked.2 > idle.2 + 15 && picked.1 > picked.0,
+            "selected body should be cyan, idle {:?} picked {:?}",
+            idle,
+            picked
+        );
+        let _ = std::fs::create_dir_all("/tmp/wa2btn");
+        let _ = surf.save_tga("/tmp/wa2btn/menu_selected.tga");
+    }
+
+    #[test]
+    fn nav_arrows_are_one_on_each_side() {
+        let dirs = [
+            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let assets = Assets::load(&dirs);
+        let st = Settings::default();
+        let scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None };
+        let mut surf = Surface::new(W, H, [0, 0, 0, 255]);
+        compose(&mut surf, &assets, &st, &scr);
+        let lit = |x: i32, y: i32| {
+            let i = ((y as u32 * W + x as u32) * 4) as usize;
+            let s = surf.pixels[i] as u16 + surf.pixels[i + 1] as u16 + surf.pixels[i + 2] as u16;
+            s > 80
+        };
+        let mut arrow = 0;
+        let mut gap = 0;
+        for y in NAV_Y..NAV_Y + NAV_H {
+            for x in NAV_X..NAV_X + ARROW_W {
+                if lit(x, y) {
+                    arrow += 1;
+                }
+            }
+            for x in NAV_X + ARROW_W..NAV_BAR_X {
+                if lit(x, y) {
+                    gap += 1;
+                }
+            }
+        }
+        assert!(arrow > 200, "left arrow should be drawn, lit pixels {arrow}");
+        assert!(gap < 40, "the other arrow states must not sit in the gap, lit {gap}");
+        // A left-pointing triangle has its base on the right.
+        let mut base = 0;
+        let mut tip = 0;
+        let mid = NAV_X + ARROW_W / 2;
+        for y in NAV_Y..NAV_Y + NAV_H {
+            for x in NAV_X..mid {
+                if lit(x, y) {
+                    tip += 1;
+                }
+            }
+            for x in mid..NAV_X + ARROW_W {
+                if lit(x, y) {
+                    base += 1;
+                }
+            }
+        }
+        assert!(base > tip, "left arrow should point left, base {base} tip {tip}");
+        let _ = std::fs::create_dir_all("/tmp/wa2btn");
+        let _ = surf.save_tga("/tmp/wa2btn/menu_nav.tga");
     }
 }
