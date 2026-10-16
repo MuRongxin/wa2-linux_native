@@ -90,7 +90,11 @@ impl Font {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let mut it = line.split_whitespace();
+            // Split on tabs, not whitespace: the char column holds the
+            // ideographic space (U+3000) and, for codes that are not valid
+            // Shift-JIS, is empty. Both are lost to `split_whitespace`, which
+            // would drop those rows or shift their fields.
+            let mut it = line.split('\t');
             let (code, _ch, cellidx) = match (it.next(), it.next(), it.next()) {
                 (Some(a), Some(b), Some(c)) => (a, b, c),
                 _ => continue,

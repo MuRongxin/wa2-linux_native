@@ -121,11 +121,13 @@ def main():
             "# sjis_code\tchar\tatlas_cell  (cell = 139 + table index)",
             f"# source: {os.path.basename(exe_path)} table @ {base} (0x{base:X})",
         ]
+        # Every table entry is emitted, including codes that are not valid
+        # Shift-JIS (trail byte 0x7F): the atlas still reserves a cell for
+        # them, and dropping the row left those glyphs unresolvable. The char
+        # column stays empty when the code has no Shift-JIS decoding.
         mapped = 0
         for i, (code, ch) in enumerate(table):
-            if ch is None:
-                continue
-            lines.append(f"0x{code:04X}\t{ch}\t{CELL_OFFSET + i}")
+            lines.append(f"0x{code:04X}\t{ch or ''}\t{CELL_OFFSET + i}")
             mapped += 1
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:

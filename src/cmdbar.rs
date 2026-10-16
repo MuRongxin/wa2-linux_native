@@ -84,9 +84,9 @@ pub struct CmdBar {
 
 fn load_img(dirs: &[&Path], name: &str) -> Option<TgaImage> {
     for dir in dirs {
-        let p = dir.join(name);
-        if let Ok(d) = std::fs::read(&p) {
-            if let Ok(img) = crate::codec::tga::decode(&d) {
+        for cand in crate::codec::image::candidate_names(name) {
+            let p = dir.join(cand);
+            if let Ok(img) = crate::codec::image::decode_file(&p) {
                 return Some(img);
             }
         }
@@ -105,26 +105,42 @@ impl CmdBar {
             icons,
             labels: load_img(dirs, "sys_00012.tga"),
             rewind,
-            rewind_label: crate::render::text::line_rgba("快退", 16),
+            rewind_label: crate::render::text::with_ui_font(16, |f| f.line_rgba("快退", 16)).flatten(),
         }
     }
 
-    /// Which command a surface-space point falls on.
-    pub fn hit(&self, sx: i32, sy: i32) -> Option<Cmd> {
-        if sy < ROW_Y || sy >= ROW_Y + CELL {
+    /// Which command a point falls on, in 720-layout coordinates. Callers
+    /// convert pointer events with `Sdl::surface_pos` before asking, so the
+    /// bar's rects are the same whether the frame was scaled up or not.
+    pub fn hit(&self, x: i32, y: i32) -> Option<Cmd> {
+        if y < ROW_Y || y >= ROW_Y + CELL {
             return None;
         }
-        BTNS.iter().find(|b| sx >= b.x && sx < b.x + CELL).map(|b| b.cmd)
+        BTNS.iter().find(|b| x >= b.x && x < b.x + CELL).map(|b| b.cmd)
     }
 
     /// Draw the icons, and the hovered button's caption just above it.
     ///
     /// `idle_alpha` is how faint the resting icons are (the original sits
     /// near 100). Hover and the toggled-on state stay at full strength.
-    pub fn draw(&self, surf: &mut Surface, hover: Option<Cmd>, active: Active, idle_alpha: u8) {
+    /// `ww`/`wh` is the size of `surf`; the bar's own geometry is 720-layout
+    /// pixels and is scaled onto it.
+    pub fn draw(
+        &self,
+        surf: &mut Surface,
+        hover: Option<Cmd>,
+        active: Active,
+        idle_alpha: u8,
+        ww: i32,
+        wh: i32,
+    ) {
         let Some(icons) = self.icons.as_ref() else {
             return;
         };
+        let cx = |v: i32| v * ww.max(1) / 1280;
+        let cy = |v: i32| v * wh.max(1) / 720;
+        let cw = |v: i32| (v * ww.max(1) / 1280).max(1);
+        let ch = |v: i32| (v * wh.max(1) / 720).max(1);
         for b in &BTNS {
             let on = b.cmd.is_on(active);
             let row = if on {
@@ -139,19 +155,30 @@ impl CmdBar {
             let alpha = if on || hover == Some(b.cmd) { 255 } else { idle_alpha };
             if b.cmd == Cmd::Rewind {
                 if let Some(rew) = self.rewind.as_ref() {
-                    surf.blit_region_alpha(
-                        rew, 0, row * CELL, CELL as u32, CELL as u32, b.x, ROW_Y, alpha,
+                    surf.blit_region_scaled(
+                        rew,
+                        0,
+                        row * CELL,
+                        CELL as u32,
+                        CELL as u32,
+                        cx(b.x),
+                        cy(ROW_Y),
+                        cw(CELL) as u32,
+                        ch(CELL) as u32,
+                        alpha,
                     );
                 }
             } else if let Some(col) = b.sheet {
-                surf.blit_region_alpha(
+                surf.blit_region_scaled(
                     icons,
                     col * CELL,
                     row * CELL,
                     CELL as u32,
                     CELL as u32,
-                    b.x,
-                    ROW_Y,
+                    cx(b.x),
+                    cy(ROW_Y),
+                    cw(CELL) as u32,
+                    ch(CELL) as u32,
                     alpha,
                 );
             }
@@ -160,7 +187,9 @@ impl CmdBar {
             if cmd == Cmd::Rewind {
                 if let Some((w, h, rgba)) = self.rewind_label.as_ref() {
                     let b = BTNS.iter().find(|b| b.cmd == Cmd::Rewind).unwrap();
-                    blit_gold(surf, rgba, *w, *h, b.x + CELL - *w as i32, ROW_Y - *h as i32 + 6);
+                    let x = cx(b.x + CELL - *w as i32);
+                    let y = cy(ROW_Y - *h as i32 + 6);
+                    surf.blit_rgba_scaled(rgba, *w, *h, x, y, cw(*w as i32) as u32, ch(*h as i32) as u32);
                 }
             } else if let Some(labels) = self.labels.as_ref() {
                 if let Some(b) = BTNS.iter().find(|b| b.cmd == cmd) {
@@ -169,7 +198,18 @@ impl CmdBar {
                     // ends just above the icon and the empty left side stays clear.
                     let x = b.x + CELL - LABEL_W;
                     let y = ROW_Y - LABEL_H - 2;
-                    surf.blit_region(labels, 0, row * LABEL_H, LABEL_W as u32, LABEL_H as u32, x, y);
+                    surf.blit_region_scaled(
+                        labels,
+                        0,
+                        row * LABEL_H,
+                        LABEL_W as u32,
+                        LABEL_H as u32,
+                        cx(x),
+                        cy(y),
+                        cw(LABEL_W) as u32,
+                        ch(LABEL_H) as u32,
+                        255,
+                    );
                 }
             }
         }
@@ -248,7 +288,7 @@ mod integration {
 
         let mut surf = Surface::new(1280, 720, [8, 12, 24, 255]);
         let active = Active { auto: true, skip: false, rewind: false, hide: false };
-        bar.draw(&mut surf, Some(Cmd::Save), active, 100);
+        bar.draw(&mut surf, Some(Cmd::Save), active, 100, 1280, 720);
 
         // Idle quick-save icon is the cyan row.
         let mut cyan = 0u32;
@@ -304,6 +344,8 @@ mod integration {
             Some(Cmd::Rewind),
             Active { auto: false, skip: false, rewind: true, hide: false },
             100,
+            1280,
+            720,
         );
         let mut cap_rew = 0u32;
         for y in 640..678 {
@@ -367,7 +409,7 @@ mod integration {
             Path::new("/home/lrxin/wa2-native/data/bg"),
         ];
         let bar = CmdBar::load(&dirs);
-        bar.draw(&mut surf, Some(Cmd::Save), Active { auto: true, skip: false, rewind: false, hide: false }, 100);
+        bar.draw(&mut surf, Some(Cmd::Save), Active { auto: true, skip: false, rewind: false, hide: false }, 100, 1280, 720);
         // A glyph of the line must land inside the oval, not on the bare background.
         let i = ((600 * 1280 + 700) * 4) as usize;
         assert!(

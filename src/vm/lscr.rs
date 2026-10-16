@@ -78,7 +78,10 @@ fn rd(b: &[u8], o: usize) -> u32 {
 }
 
 impl Program {
-    pub fn load(bnr: &[u8], txt: &[u8]) -> Result<Program, String> {
+    /// `cn` selects the Chinese-patch reading of the token pool: the patch
+    /// keeps Shift-JIS codes and repaints the glyphs, so the bytes only mean
+    /// something once they are looked up in its glyph table.
+    pub fn load(bnr: &[u8], txt: &[u8], cn: bool) -> Result<Program, String> {
         if bnr.len() < 20 || &bnr[0..4] != b"LSCR" {
             return Err("not an LSCR file".into());
         }
@@ -100,7 +103,7 @@ impl Program {
 
         let tokens: Vec<String> = txt
             .split(|&b| b == b',')
-            .map(|t| sjis::decode(t))
+            .map(|t| if cn { sjis::decode_cn(t) } else { sjis::decode(t) })
             .collect();
 
         let mut ops = Vec::new();

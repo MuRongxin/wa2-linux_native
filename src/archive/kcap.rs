@@ -13,7 +13,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::codec::lzss;
+use crate::codec::{lzss, sjis};
 
 pub struct Entry {
     pub compressed: bool,
@@ -28,13 +28,23 @@ fn le_u32(b: &[u8]) -> u32 {
 
 /// Build a safe output path from the (Shift-JIS) archive filename, preserving
 /// any subdirectory components but stripping path traversal.
+///
+/// Archive names are CP932 bytes, not UTF-8.  Keeping those bytes as a Unix
+/// filename makes names such as `ギター.tga` appear as mojibake and prevents
+/// the engine from resolving the name decoded from the script.  Decode valid
+/// names while extracting; retain the raw-byte fallback for a malformed entry.
 fn out_path(out_dir: &Path, raw_name: &[u8]) -> PathBuf {
     let mut pb = out_dir.to_path_buf();
     for comp in raw_name.split(|&b| b == b'/' || b == b'\\') {
         if comp.is_empty() || comp == b".." {
             continue;
         }
-        pb.push(std::ffi::OsStr::from_bytes(comp));
+        let decoded = sjis::decode(comp);
+        if decoded.chars().any(|c| c == '\u{FFFD}') {
+            pb.push(std::ffi::OsStr::from_bytes(comp));
+        } else {
+            pb.push(decoded);
+        }
     }
     pb
 }
@@ -175,7 +185,7 @@ pub fn unpack(pak: &Path, out_dir: &Path) -> io::Result<()> {
         println!(
             "  [{}] {} ({} bytes)",
             idx,
-            String::from_utf8_lossy(&ent.raw_name),
+            sjis::decode(&ent.raw_name),
             data.len()
         );
         ok += 1;

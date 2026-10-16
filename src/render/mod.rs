@@ -204,6 +204,68 @@ impl Surface {
         }
     }
 
+    /// Blit a sub-rectangle of `img` scaled to (dw, dh), nearest-neighbour.
+    /// Used by the command bar, whose icons are 40px cells on the 720 layout
+    /// and have to follow the window.
+    pub fn blit_region_scaled(
+        &mut self,
+        img: &TgaImage,
+        sx: i32,
+        sy: i32,
+        sw: u32,
+        sh: u32,
+        dx: i32,
+        dy: i32,
+        dw: u32,
+        dh: u32,
+        alpha: u8,
+    ) {
+        if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
+            return;
+        }
+        for row in 0..dh as i32 {
+            for col in 0..dw as i32 {
+                let sxp = sx + col * sw as i32 / dw as i32;
+                let syp = sy + row * sh as i32 / dh as i32;
+                if sxp < 0 || syp < 0 || sxp >= img.width as i32 || syp >= img.height as i32 {
+                    continue;
+                }
+                let si = ((syp as u32) * img.width + (sxp as u32)) as usize * 4;
+                let a = (img.rgba[si + 3] as u32 * alpha as u32 / 255) as u8;
+                let c = [img.rgba[si], img.rgba[si + 1], img.rgba[si + 2], a];
+                self.put(dx + col, dy + row, c);
+            }
+        }
+    }
+
+    /// Blit a raw RGBA buffer (w*h*4) scaled to (dw, dh), with alpha blending.
+    pub fn blit_rgba_scaled(
+        &mut self,
+        rgba: &[u8],
+        w: u32,
+        h: u32,
+        dx: i32,
+        dy: i32,
+        dw: u32,
+        dh: u32,
+    ) {
+        if dw == 0 || dh == 0 || w == 0 || h == 0 {
+            return;
+        }
+        for row in 0..dh as i32 {
+            for col in 0..dw as i32 {
+                let sx = col * w as i32 / dw as i32;
+                let sy = row * h as i32 / dh as i32;
+                let si = ((sy as u32) * w + sx as u32) as usize * 4;
+                if si + 3 >= rgba.len() {
+                    continue;
+                }
+                let c = [rgba[si], rgba[si + 1], rgba[si + 2], rgba[si + 3]];
+                self.put(dx + col, dy + row, c);
+            }
+        }
+    }
+
     /// Blit a raw RGBA buffer (w*h*4) at (dx,dy) with alpha blending.
     pub fn blit_rgba(&mut self, rgba: &[u8], w: u32, h: u32, dx: i32, dy: i32) {
         for row in 0..h as i32 {
@@ -438,6 +500,9 @@ impl Surface {
 /// multiplier (used to dim non-speaking characters).
 pub struct SpriteDraw<'a> {
     pub img: &'a TgaImage,
+    /// Logical 1280x720 size. The source may be an 8x image.
+    pub logical_w: u32,
+    pub logical_h: u32,
     pub x: i32,
     pub y: i32,
     pub alpha: u8,
@@ -499,6 +564,12 @@ pub fn lerp_pixels(dst: &mut [u8], from: &[u8], to: &[u8], step: u32, frames: u3
     }
 }
 
+/// The scene is always laid out on the original 1280x720 grid; the composed
+/// frame is then stretched to the window. Text is drawn after that, at the
+/// window's own size (see `draw_dialog_vector`).
+pub const LAYOUT_W: u32 = 1280;
+pub const LAYOUT_H: u32 = 720;
+
 /// `sys_00000` / `sys_00001` are blitted here. The oval's stroke runs from
 /// about y=525 to y=666; glyphs start below the top glow and clear of the
 /// snowflakes on either side.
@@ -545,6 +616,32 @@ pub fn render_scene_ex(
     // Already positioned in surface space, drawn under the dialog box.
     overlays: &[(&TgaImage, i32, i32)],
 ) -> Surface {
+    render_scene_ex_art(
+        bg, text, font, w, h, sprites, lut, window, plate, frame,
+        window_alpha, shade, overlays, 1,
+    )
+}
+
+/// Scene compositor with an explicit source-art scale. Layout coordinates stay
+/// at 1280x720, while the returned surface can be the actual window size. This
+/// lets an 8x WebP contribute detail before the final window-sized composite.
+pub fn render_scene_ex_art(
+    bg: &TgaImage,
+    text: &str,
+    font: &Font,
+    w: u32,
+    h: u32,
+    sprites: &[SpriteDraw],
+    lut: Option<&[u8]>,
+    window: bool,
+    plate: Option<&TgaImage>,
+    frame: Option<&TgaImage>,
+    window_alpha: u8,
+    shade: u8,
+    overlays: &[(&TgaImage, i32, i32)],
+    art_scale: u32,
+) -> Surface {
+    let art_scale = art_scale.max(1);
     let mut s = Surface::new(w, h, [0, 0, 0, 255]);
     // Background, scaled to fit (nearest-neighbour stretch).
     let (bw, bh) = (bg.width as f32, bg.height as f32);
@@ -561,10 +658,23 @@ pub fn render_scene_ex(
 
     // Standing character sprites (bottom-anchored), below the dialog box.
     for sp in sprites {
-        s.blit_region_alpha(sp.img, 0, 0, sp.img.width, sp.img.height, sp.x, sp.y, sp.alpha);
+        let dx = (sp.x as i64 * w as i64 / LAYOUT_W as i64) as i32;
+        let dy = (sp.y as i64 * h as i64 / LAYOUT_H as i64) as i32;
+        let dw = sp.logical_w.max(1) * w / LAYOUT_W;
+        let dh = sp.logical_h.max(1) * h / LAYOUT_H;
+        s.blit_region_scaled(
+            sp.img, 0, 0, sp.img.width, sp.img.height,
+            dx, dy, dw.max(1), dh.max(1), sp.alpha,
+        );
     }
     for (img, x, y) in overlays {
-        s.blit(img, *x, *y);
+        let logical_w = (img.width / art_scale).max(1);
+        let logical_h = (img.height / art_scale).max(1);
+        let dx = (*x).max(0) as u32 * w / LAYOUT_W;
+        let dy = (*y).max(0) as u32 * h / LAYOUT_H;
+        let dw = logical_w * w / LAYOUT_W;
+        let dh = logical_h * h / LAYOUT_H;
+        s.blit_region_scaled(img, 0, 0, img.width, img.height, dx as i32, dy as i32, dw.max(1), dh.max(1), 255);
     }
 
     // Colour filter (sepia / nega / ...) over the scene art.
@@ -585,10 +695,18 @@ pub fn render_scene_ex(
     // Without those assets, fall back to the flat plate the tools use.
     if plate.is_some() {
         if let Some(pl) = plate {
-            s.blit_region_alpha(pl, 0, 0, pl.width, pl.height, WINDOW_X, WINDOW_Y, window_alpha);
+            let pw = (pl.width / art_scale).max(1) * w / LAYOUT_W;
+            let ph = (pl.height / art_scale).max(1) * h / LAYOUT_H;
+            let px = WINDOW_X.max(0) as u32 * w / LAYOUT_W;
+            let py = WINDOW_Y.max(0) as u32 * h / LAYOUT_H;
+            s.blit_region_scaled(pl, 0, 0, pl.width, pl.height, px as i32, py as i32, pw.max(1), ph.max(1), window_alpha);
         }
         if let Some(fr) = frame {
-            s.blit_region_alpha(fr, 0, 0, fr.width, fr.height, WINDOW_X, WINDOW_Y, window_alpha);
+            let fw = (fr.width / art_scale).max(1) * w / LAYOUT_W;
+            let fh = (fr.height / art_scale).max(1) * h / LAYOUT_H;
+            let fx = WINDOW_X.max(0) as u32 * w / LAYOUT_W;
+            let fy = WINDOW_Y.max(0) as u32 * h / LAYOUT_H;
+            s.blit_region_scaled(fr, 0, 0, fr.width, fr.height, fx as i32, fy as i32, fw.max(1), fh.max(1), window_alpha);
         }
     } else {
         s.fill_rect(30, box_y, w - 60, box_h, [10, 10, 24, 200]);
@@ -662,6 +780,109 @@ pub fn draw_dialog_text(
     }
 }
 
+
+/// Dialogue font size on the 1280x720 layout. The bitmap cell is 40px stepped
+/// at a 28px pitch, which puts the strokes at about 26px.
+pub const DIALOG_FONT_720: u32 = 26;
+
+/// Scale a 720-layout measurement into window pixels.
+pub fn layout_px(v: i32, wh: i32) -> i32 {
+    v * wh.max(1) / 720
+}
+
+/// Split scenario text into the lines the player reads: literal backslash-n
+/// breaks the line, backslash-k vanishes, a ruby tag ``<Rbase|reading>``
+/// keeps its base, and any other tag is dropped.
+pub fn dialog_lines(text: &str) -> Vec<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.peek() {
+                Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some('k') => {
+                    chars.next();
+                }
+                _ => out.push(c),
+            },
+            '<' => {
+                let mut tag = String::new();
+                loop {
+                    match chars.next() {
+                        Some('>') | None => break,
+                        Some(d) => tag.push(d),
+                    }
+                }
+                if let Some(rest) = tag.strip_prefix('R') {
+                    if let Some(base) = rest.split('|').next() {
+                        out.push_str(base);
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out.lines().map(|l| l.to_string()).collect()
+}
+
+/// Draw the speaker name and the dialogue body with a vector font, at the
+/// window's own pixel size.
+///
+/// This is the vector counterpart of ``draw_dialog_text``. The scene art under
+/// it has already been stretched to the window, so the glyphs land on real
+/// screen pixels instead of being enlarged with the picture. ``limit`` is how
+/// many characters of the body to reveal.
+pub fn draw_dialog_vector(
+    s: &mut Surface,
+    vf: &mut text::VectorFont,
+    text: &str,
+    speaker: Option<&str>,
+    ww: i32,
+    wh: i32,
+    limit: usize,
+) {
+    let size = layout_px(DIALOG_FONT_720 as i32, wh).max(8) as u32;
+    // Only a resize changes this, and set_size drops the glyph cache, so it is
+    // worth the check: the name and the body share one size for that reason.
+    if vf.size() != size {
+        let _ = vf.set_size(size);
+    }
+    let sx = |v: i32| v * ww.max(1) / 1280;
+    let sy = |v: i32| v * wh.max(1) / 720;
+    if let Some(name) = speaker {
+        if !name.is_empty() {
+            let baseline = sy(NAME_Y) + vf.ascent();
+            vf.draw(s, name, sx(NAME_X), baseline);
+        }
+    }
+    let body: String = dialog_lines(text).join("\n");
+    let shown: String = body.chars().take(limit).collect();
+    let x0 = sx(DIALOG_TEXT_X);
+    let x_max = sx(DIALOG_TEXT_RIGHT);
+    let mut baseline = sy(DIALOG_TEXT_Y) + vf.ascent();
+    let line_h = sy(DIALOG_LINE).max(1);
+    for line in shown.lines() {
+        let mut pen = x0;
+        for ch in line.chars() {
+            let advance = vf.measure_char(ch);
+            // The script pre-wraps its lines; anything past the right edge of
+            // the oval is dropped rather than reflowed.
+            if pen + advance > x_max {
+                break;
+            }
+            vf.draw_char(s, ch, pen, baseline);
+            pen += advance;
+        }
+        baseline += line_h;
+        if baseline > sy(DIALOG_TEXT_Y + DIALOG_LINE * 3) {
+            break;
+        }
+    }
+}
+
 /// Build a sample scene: background, optional character sprite, dialog box, and a
 /// strip of glyphs drawn from the font atlas. Proves the full offscreen pipeline.
 pub fn demo_scene(font: &TgaImage, sprite: Option<&TgaImage>, w: u32, h: u32) -> Surface {
@@ -697,17 +918,11 @@ pub fn demo_scene(font: &TgaImage, sprite: Option<&TgaImage>, w: u32, h: u32) ->
 }
 
 /// Like `render_scene`, but rasterizes the dialog text with a SYSTEM CJK font
-/// (ffmpeg drawtext) instead of the game bitmap atlas.
+/// (rasterized from a font file) instead of the game bitmap atlas.
 ///
 /// Use this when the atlas glyph order is unknown: text stays fully readable
 /// even though it is not drawn in the game's own face.
-pub fn render_scene_sysfont(
-    bg: &TgaImage,
-    text: &str,
-    w: u32,
-    h: u32,
-    fontfile: &str,
-) -> Surface {
+pub fn render_scene_sysfont(bg: &TgaImage, text: &str, w: u32, h: u32) -> Surface {
     let mut s = Surface::new(w, h, [0, 0, 0, 255]);
     let (bw, bh) = (bg.width as f32, bg.height as f32);
     let scale = (w as f32 / bw).min(h as f32 / bh);
@@ -739,7 +954,8 @@ pub fn render_scene_sysfont(
 
     let tw = w - 100;
     let th = box_h - 30;
-    if let Some((rw, rh, rgba)) = text::block_rgba(&lines, tw, th, 26, fontfile) {
+    let block = text::with_ui_font(26, |f| f.block_rgba(&lines, tw, th, 26)).flatten();
+    if let Some((rw, rh, rgba)) = block {
         s.blit_rgba(&rgba, rw, rh, 50, box_y + 16);
     }
     s
@@ -747,7 +963,9 @@ pub fn render_scene_sysfont(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_flash, lerp_pixels, Surface};
+    use super::{apply_flash, draw_dialog_vector, lerp_pixels, Surface};
+    use crate::render::text;
+    use crate::render::{DIALOG_FONT_720, LAYOUT_H, LAYOUT_W};
 
     #[test]
     fn flash_peaks_at_white_and_returns() {
@@ -779,6 +997,52 @@ mod tests {
         assert_eq!(&up.pixels[0..4], &[0, 0, 0, 255]);
         assert_eq!(&up.pixels[4..8], &[0, 0, 0, 255]);
         assert_eq!(&up.pixels[8..12], &[255, 255, 255, 255]);
+    }
+
+    /// Ink bounding box of a surface, counting anything bright.
+    fn ink_box(s: &Surface) -> Option<(i32, i32, i32, i32)> {
+        let mut box_ = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for y in 0..s.height as i32 {
+            for x in 0..s.width as i32 {
+                let i = ((y as u32 * s.width + x as u32) * 4) as usize;
+                if s.pixels[i] > 200 {
+                    box_.0 = box_.0.min(x);
+                    box_.1 = box_.1.min(y);
+                    box_.2 = box_.2.max(x);
+                    box_.3 = box_.3.max(y);
+                }
+            }
+        }
+        if box_.0 == i32::MAX { None } else { Some(box_) }
+    }
+
+    /// The whole point of drawing text after the scene is scaled: at 1080p the
+    /// glyphs are rasterized 1.5x bigger, not stretched from 720p.
+    #[test]
+    fn dialog_text_follows_the_window_size() {
+        let Some(mut vf) = text::VectorFont::open(text::DEFAULT_FONT, DIALOG_FONT_720) else {
+            return
+        };
+        let line = "冬馬和紗";
+        let mut small = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        draw_dialog_vector(&mut small, &mut vf, line, None, 1280, 720, usize::MAX);
+        let mut big = Surface::new(1920, 1080, [0, 0, 0, 255]);
+        draw_dialog_vector(&mut big, &mut vf, line, None, 1920, 1080, usize::MAX);
+        let (Some(a), Some(b)) = (ink_box(&small), ink_box(&big)) else {
+            panic!("nothing was drawn")
+        };
+        // Four full-width glyphs at 26px vs 39px.
+        let wa = a.2 - a.0 + 1;
+        let wb = b.2 - b.0 + 1;
+        assert!((wb as f32 - wa as f32 * 1.5).abs() < 6.0, "width {wa} -> {wb}");
+        // And the whole block sits 1.5x further down the screen.
+        assert!((b.1 as f32 - a.1 as f32 * 1.5).abs() < 6.0, "top {} -> {}", a.1, b.1);
+        assert!(
+            (b.0 as f32 - a.0 as f32 * 1.5).abs() < 6.0,
+            "left {} -> {}",
+            a.0,
+            b.0
+        );
     }
 
     #[test]

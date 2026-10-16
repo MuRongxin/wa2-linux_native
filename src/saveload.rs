@@ -69,9 +69,8 @@ struct Assets {
 
 fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
     for dir in dirs {
-        let p = dir.join(name);
-        if let Ok(d) = std::fs::read(&p) {
-            if let Ok(img) = crate::codec::tga::decode(&d) {
+        for cand in crate::codec::image::candidate_names(name) {
+            if let Ok(img) = crate::codec::image::decode_file(&dir.join(cand)) {
                 return Some(img);
             }
         }
@@ -268,26 +267,20 @@ fn render_captions(
     let lines: Vec<String> = (0..n)
         .map(|i| caption_of(scr.page * PER_PAGE + i, slots[scr.page * PER_PAGE + i].as_ref()))
         .collect();
-    let caps = crate::render::text::block_rgba(
-        &lines,
-        FRAME_W as u32,
-        (n as u32) * CAP_H as u32,
-        14,
-        crate::render::text::DEFAULT_FONT,
-    );
+    let caps = crate::render::text::with_ui_font(14, |f| {
+        f.block_rgba(&lines, FRAME_W as u32, (n as u32) * CAP_H as u32, 14)
+    })
+    .flatten();
     let hint_text = format!(
         "[1]保存 [2]读档   现在:[{}]   [Enter]确定  [Esc]返回   {}/{} 页",
         if mode == Mode::Save { "保存" } else { "读档" },
         scr.page + 1,
         pages
     );
-    let hint = crate::render::text::block_rgba(
-        &[hint_text],
-        HINT_W as u32,
-        CAP_H as u32,
-        14,
-        crate::render::text::DEFAULT_FONT,
-    );
+    let hint = crate::render::text::with_ui_font(14, |f| {
+        f.block_rgba(&[hint_text], HINT_W as u32, CAP_H as u32, 14)
+    })
+    .flatten();
     (caps, hint)
 }
 fn compose(

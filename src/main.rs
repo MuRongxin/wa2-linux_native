@@ -3,6 +3,7 @@ mod audio;
 mod codec;
 mod cmdbar;
 mod data;
+mod ft2;
 mod menu;
 mod render;
 mod save;
@@ -211,7 +212,7 @@ fn main() {
             let bg = match std::fs::read(&args[3]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
                 Some(i) => i, None => { eprintln!("bg fail"); return; }
             };
-            let surf = render::render_scene_sysfont(&bg, &page.text(), 1280, 720, render::text::DEFAULT_FONT);
+            let surf = render::render_scene_sysfont(&bg, &page.text(), 1280, 720);
             if let Err(e) = surf.save_tga(&args[4]) { eprintln!("{}", e); return; }
             println!("scene-noto: {} chars -> {}", page.text().chars().count(), args[4]);
         }
@@ -232,7 +233,7 @@ fn main() {
             let mut idx: i32 = 0;
             let n = page.lines.len() as i32;
             loop {
-                let surf = render::render_scene_sysfont(&bg, &page.lines[idx.max(0) as usize], 1280, 720, render::text::DEFAULT_FONT);
+                let surf = render::render_scene_sysfont(&bg, &page.lines[idx.max(0) as usize], 1280, 720);
                 win.present(&surf);
                 loop {
                     match win.poll_input() {
@@ -394,6 +395,7 @@ fn main() {
             let voice_dir = args.get(8).map(std::path::PathBuf::from);
             let session = Session {
                 script_dir: script_dir.clone(),
+                cn: is_cn_script(&script_dir),
                 bg_dir: bg_dir.clone(),
                 bg_cn: None,
                 sprite_dir: find_sprite_dir(&bg_dir, &script_dir),
@@ -421,6 +423,7 @@ fn main() {
                 let start_id = args.get(6).cloned().unwrap_or_else(|| "1001".to_string());
                 let session = Session {
                     script_dir: script_dir.clone(),
+                    cn: is_cn_script(&script_dir),
                     bg_dir: bg_dir.clone(),
                     bg_cn: None,
                     sprite_dir: find_sprite_dir(&bg_dir, &script_dir),
@@ -483,7 +486,7 @@ fn main() {
                     eprintln!("scene chain limit reached");
                     return;
                 }
-                let prog = match load_program(dir, &id) {
+                let prog = match load_program(dir, &id, is_cn_script(dir)) {
                     Some(p) => p,
                     None => {
                         eprintln!("scene {} not found", id);
@@ -576,7 +579,7 @@ fn main() {
         "steps-info" => {
             if args.len() < 3 { eprintln!("usage: wa2-native steps-info <scenario.txt>"); return; }
             let scen = match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); return; } };
-            let steps = vm::parse_steps(&scen);
+            let steps = vm::parse_steps(&scen, is_cn_script(std::path::Path::new(&args[2]).parent().unwrap_or(std::path::Path::new("."))));
             println!("steps: {}", steps.len());
             for (i, s) in steps.iter().enumerate() {
                 match s {
@@ -627,17 +630,38 @@ fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::
             candidates.push(name[..name.len() - sfx.len()].to_string());
         }
     }
-    // Also try with .tga extension added if missing.
-    let base = name.trim_end_matches(".tga").trim_end_matches(".TGA");
+    // Each sibling tree keeps the same stem but may use WebP after upscale.
+    let base = name.trim_end_matches(".tga").trim_end_matches(".TGA").trim_end_matches(".webp").trim_end_matches(".WEBP");
+    candidates.push(format!("{}.webp", base));
+    candidates.push(format!("{}.WEBP", base));
     candidates.push(format!("{}.tga", base));
     candidates.push(format!("{}.TGA", base));
 
     for dir in dirs {
         for cand in &candidates {
             let p = dir.join(cand);
-            if let Ok(data) = std::fs::read(&p) {
-                if let Ok(img) = codec::tga::decode(&data) {
-                    return Some(img);
+            if let Ok(img) = codec::image::decode_file(&p) {
+                return Some(img);
+            }
+            // Older data trees were extracted with the archive's raw CP932
+            // filename bytes.  On Unix those names are valid byte strings but
+            // are not the UTF-8 path produced by the script decoder.  Match a
+            // directory entry after CP932-decoding it so existing data keeps
+            // working; newly extracted trees use normalized UTF-8 names.
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for entry in rd.flatten() {
+                        let raw = entry.file_name();
+                        if codec::sjis::decode(raw.as_bytes())
+                            .eq_ignore_ascii_case(cand)
+                        {
+                            if let Ok(img) = codec::image::decode_file(&entry.path()) {
+                                return Some(img);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -787,11 +811,12 @@ impl BgIndex {
                 };
                 let lower = name.to_ascii_lowercase();
                 let picture = (lower.starts_with('b') || lower.starts_with('v'))
-                    && lower.ends_with(".tga");
+                    && (lower.ends_with(".tga") || lower.ends_with(".webp"));
                 if !picture {
                     continue;
                 }
-                let digits = lower[1..lower.len() - 4].to_string();
+                let ext_len = if lower.ends_with(".webp") { 5 } else { 4 };
+                let digits = lower[1..lower.len() - ext_len].to_string();
                 if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_digit()) {
                     continue;
                 }
@@ -831,9 +856,11 @@ impl BgIndex {
             return None;
         }
         for prefix in ["b", "v"] {
-            let exact = format!("{}{:04}{:02}.tga", prefix, id, variant);
-            if let Some(n) = self.by_name.get(&exact) {
-                return Some(n.clone());
+            for ext in [".webp", ".tga"] {
+                let exact = format!("{}{:04}{:02}{}", prefix, id, variant, ext);
+                if let Some(n) = self.by_name.get(&exact) {
+                    return Some(n.clone());
+                }
             }
         }
         self.by_id.get(&(id as u32)).cloned()
@@ -847,6 +874,9 @@ impl BgIndex {
 /// runtime goes through here - no `.pak` archive is opened.
 struct Session {
     script_dir: std::path::PathBuf,
+    /// True when `script_dir` is the CK-GAL Chinese patch: its text needs the
+    /// glyph-table reading (see `codec::sjis::decode_cn`).
+    cn: bool,
     bg_dir: std::path::PathBuf,
     /// Chinese-patch UI overrides - the 31 images shipped loose in the game's
     /// `grp/` directory, which win over the same-named files inside `grp.pak`.
@@ -866,8 +896,9 @@ impl Session {
     fn from_data(d: &data::Data, bgm: Option<String>) -> Session {
         Session {
             script_dir: d.script(),
+            cn: d.cn,
             bg_dir: d.bg(),
-            bg_cn: if d.cn { Some(d.root.join("bg_cn")) } else { None },
+            bg_cn: if d.cn { Some(d.bg_cn()) } else { None },
             sprite_dir: Some(d.sprite()),
             movie_dir: d.movie(),
             voice_dir: Some(d.voice()),
@@ -939,6 +970,24 @@ fn run_game_at(
     let bgm_path = s.bgm.as_deref();
     const W: u32 = 1280;
     const H: u32 = 720;
+    // The art is laid out at 1280x720 and stretched to the window; the
+    // dialogue is rasterized at the window's own size so it stays sharp.
+    let mut win_size = win.window_size();
+    // Chinese script text only reads correctly after the patch's glyph table
+    // has been applied to it, and that text needs a real font to draw.
+    // Japanese keeps the game's own bitmap atlas.
+    let choice = render::text::font_choice();
+    let mut vfont = if s.cn {
+        render::text::VectorFont::open(&choice.path, render::DIALOG_FONT_720)
+    } else {
+        None
+    };
+    if let Some(vf) = vfont.as_ref() {
+        render::text::apply_choice(vf, &choice);
+    }
+    if s.cn && vfont.is_none() {
+        eprintln!("dialog: no vector font, falling back to the bitmap atlas");
+    }
     // Function buttons (sys_00010) and the message-window frame (sys_00000).
     let bar = cmdbar::CmdBar::load(&s.bg_dirs());
     let msg_plate = load_background(&s.bg_dirs(), "sys_00001.tga");
@@ -1120,7 +1169,7 @@ fn run_game_at(
                 }
             }
         }
-        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
         win.present(&cur_surf);
         eprintln!("load: scene {} at pc {}", current_id, snap.vm.pc);
         remember(
@@ -1156,7 +1205,7 @@ fn run_game_at(
         }
     }
     loop {
-        let prog = match load_program(script_dir, &current_id) {
+        let prog = match load_program(script_dir, &current_id, s.cn) {
             Some(p) => p,
             None => {
                 eprintln!("scene {} not found (.bnr/.txt)", current_id);
@@ -1179,6 +1228,7 @@ fn run_game_at(
             it.restore(snap.vm);
         }
         'events: loop {
+        win_size = win.window_size();
             let event = if park_wait {
                 park_wait = false;
                 vm::lscr::Event::Wait
@@ -1283,10 +1333,10 @@ fn run_game_at(
                         line_base = None;
                         line_done = true;
                         reveal = body.chars().count();
-                        cur_surf = draw_scene(&bg, &body, speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                        cur_surf = draw_scene(&bg, &body, speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         win.present(&cur_surf);
                     } else {
-                        line_base = Some(draw_scene(&bg, "", speaker.as_deref(), font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg)));
+                        line_base = Some(draw_scene(&bg, "", speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut()));
                         reveal = 0;
                         line_done = false;
                         type_tick = 0;
@@ -1301,7 +1351,8 @@ fn run_game_at(
                                 rewind: cmd_rewind,
                                 hide: user_hide,
                             };
-                            bar.draw(&mut frame, None, active, cmd_idle(&settings));
+                            let (fw, fh) = (frame.width as i32, frame.height as i32);
+                            bar.draw(&mut frame, None, active, cmd_idle(&settings), fw, fh);
                             cur_surf = frame;
                             win.present(&cur_surf);
                         }
@@ -1362,7 +1413,7 @@ fn run_game_at(
                         // The previous line has already been advanced past. Leave
                         // the box empty until the next line, so the old speaker's
                         // words are not left sitting on the new face.
-                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                             return Ok(None);
                         }
@@ -1380,7 +1431,7 @@ fn run_game_at(
                     if before > 0 {
                         line_base = None;
                         line_done = true;
-                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                             return Ok(None);
                         }
@@ -1408,7 +1459,7 @@ fn run_game_at(
                             }
                         }
                     };
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::BgScene { id, variant, frames } => {
@@ -1459,7 +1510,7 @@ fn run_game_at(
                     }
                     line_base = None;
                     line_done = true;
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                         return Ok(None);
                     }
@@ -1489,7 +1540,7 @@ fn run_game_at(
                     }
                     line_base = None;
                     line_done = true;
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                         return Ok(None);
                     }
@@ -1513,7 +1564,7 @@ fn run_game_at(
                         plates.push(Plate { slot, name, img });
                         line_base = None;
                         line_done = true;
-                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         win.present(&cur_surf);
                     } else {
                         eprintln!("  overlay: slot {} {} NOT FOUND", slot, name);
@@ -1539,7 +1590,7 @@ fn run_game_at(
                             );
                             line_base = None;
                             line_done = true;
-                            cur_surf = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                            cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                             win.present(&cur_surf);
                         }
                     }
@@ -1706,7 +1757,7 @@ fn run_game_at(
                     // Plate only. The highlight is painted under the glyphs, and
                     // the glyphs are redrawn each frame — a full scene rebuild
                     // is far too slow to repeat while the mouse moves.
-                    let base = draw_scene(&bg, "", None, font, &slots, focus, W, H, tint.as_deref(), true, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg));
+                    let base = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), true, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     let mut hover: Option<usize> = None;
                     let mut bar_hover: Option<cmdbar::Cmd> = None;
                     cur_surf = render::Surface {
@@ -1714,7 +1765,8 @@ fn run_game_at(
                         height: base.height,
                         pixels: base.pixels.clone(),
                     };
-                    render::draw_dialog_text(&mut cur_surf, font, &body, msg_plate.is_some(), W, H, usize::MAX);
+                    let (fw, fh) = (cur_surf.width, cur_surf.height);
+                    draw_body(&mut cur_surf, font, vfont.as_mut(), &body, None, msg_plate.is_some(), fw, fh, usize::MAX);
                     win.present(&cur_surf);
                     eprintln!(
                         "  choice: presenting {} options (click one, or press 1-{})",
@@ -1745,6 +1797,7 @@ fn run_game_at(
                                             &mut rewind_vm,
                                             s,
                                             font,
+                                            vfont.as_mut(),
                                             win,
                                             &mut bg,
                                             &mut bg_cg,
@@ -1845,14 +1898,16 @@ fn run_game_at(
                                 };
                                 frame.fill_rect(hx, y, hw, (line_h + 4) as u32, [40, 70, 120, 255]);
                             }
-                            render::draw_dialog_text(&mut frame, font, &body, msg_plate.is_some(), W, H, usize::MAX);
+                            let (fw, fh) = (frame.width, frame.height);
+                            draw_body(&mut frame, font, vfont.as_mut(), &body, None, msg_plate.is_some(), fw, fh, usize::MAX);
                             let active = cmdbar::Active {
                                 auto: cmd_auto,
                                 skip: cmd_skip,
                                 rewind: cmd_rewind,
                                 hide: user_hide,
                             };
-                            bar.draw(&mut frame, bar_hover, active, cmd_idle(&settings));
+                            let (fw, fh) = (frame.width as i32, frame.height as i32);
+                            bar.draw(&mut frame, bar_hover, active, cmd_idle(&settings), fw, fh);
                             win.present(&frame);
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
@@ -1908,14 +1963,15 @@ fn run_game_at(
                                                         font,
                                                         &slots,
                                                         focus,
-                                                        W,
-                                                        H,
+                                                        win_size.0 as u32,
+                                                        win_size.1 as u32,
                                                         tint.as_deref(),
                                                         window,
                                                         msg_plate.as_ref(),
                                                         msg_frame.as_ref(),
                                                         &plates,
                                                         scene_look(&settings, bg_cg),
+                                                        vfont.as_mut(),
                                                     );
                                                 }
                                                 other => match handle_cmd(
@@ -2031,6 +2087,7 @@ fn run_game_at(
                                             &mut rewind_vm,
                                             s,
                                             font,
+                                            vfont.as_mut(),
                                             win,
                                             &mut bg,
                                             &mut bg_cg,
@@ -2137,13 +2194,16 @@ fn run_game_at(
                             if line_done {
                                 if let Some(base) = line_base.take() {
                                     let mut full = clone_surf(&base);
-                                    render::draw_dialog_text(
+                                    let (fw, fh) = (full.width, full.height);
+                                    draw_body(
                                         &mut full,
                                         font,
+                                        vfont.as_mut(),
                                         &last_text,
+                                        None,
                                         msg_plate.is_some(),
-                                        W,
-                                        H,
+                                        fw,
+                                        fh,
                                         usize::MAX,
                                     );
                                     cur_surf = full;
@@ -2152,13 +2212,16 @@ fn run_game_at(
                             let mut frame = if !line_done {
                                 if let Some(base) = line_base.as_ref() {
                                     let mut partial = clone_surf(base);
-                                    render::draw_dialog_text(
+                                    let (fw, fh) = (partial.width, partial.height);
+                                    draw_body(
                                         &mut partial,
                                         font,
+                                        vfont.as_mut(),
                                         &last_text,
+                                        None,
                                         msg_plate.is_some(),
-                                        W,
-                                        H,
+                                        fw,
+                                        fh,
                                         reveal,
                                     );
                                     // Saves and the hide button read `cur_surf`, so it
@@ -2177,7 +2240,8 @@ fn run_game_at(
                                 rewind: cmd_rewind,
                                 hide: user_hide,
                             };
-                            bar.draw(&mut frame, cmd_hover, active, cmd_idle(&settings));
+                            let (fw, fh) = (frame.width as i32, frame.height as i32);
+                            bar.draw(&mut frame, cmd_hover, active, cmd_idle(&settings), fw, fh);
                             win.present(&frame);
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
@@ -2260,14 +2324,15 @@ fn run_game_at(
                                                     font,
                                                     &slots,
                                                     focus,
-                                                    W,
-                                                    H,
+                                                    win_size.0 as u32,
+                                                    win_size.1 as u32,
                                                     tint.as_deref(),
                                                     window,
                                                     msg_plate.as_ref(),
                                                     msg_frame.as_ref(),
                                                     &plates,
                                                     scene_look(&settings, bg_cg),
+                                                    vfont.as_mut(),
                                                 );
                                             }
                                             other => match handle_cmd(
@@ -2520,6 +2585,7 @@ fn rewind_step(
     rewind_vm: &mut Option<vm::lscr::InterpState>,
     s: &Session,
     font: &render::Font,
+    vfont: Option<&mut render::text::VectorFont>,
     win: &mut sdl2::Sdl,
     bg: &mut codec::tga::TgaImage,
     bg_cg: &mut bool,
@@ -2628,6 +2694,7 @@ fn rewind_step(
             }
         }
     }
+    let win_size = win.window_size();
     *cur_surf = draw_scene(
         bg,
         last_text,
@@ -2635,14 +2702,15 @@ fn rewind_step(
         font,
         slots,
         *focus,
-        1280,
-        720,
+        win_size.0 as u32,
+        win_size.1 as u32,
         tint.as_deref(),
         *window,
         msg_plate,
         msg_frame,
         plates,
         scene_look(settings, *bg_cg),
+        vfont,
     );
     if announce {
         if let (Some(mx), Some(vi), Some(cue)) = (mixer, voices, dest.voice) {
@@ -2789,7 +2857,7 @@ fn show_toast(
     message: &str,
 ) -> bool {
     let plate = load_background(dirs, "sys_00110.tga");
-    let text = render::text::line_rgba(message, 22);
+    let text = render::text::with_ui_font(22, |f| f.line_rgba(message, 22)).flatten();
     let surf = paint_toast(frame, plate.as_ref(), text.as_ref());
     win.present(&surf);
     let t0 = std::time::Instant::now();
@@ -2814,7 +2882,7 @@ fn ask_yes_no(
 ) -> Option<bool> {
     let plate = load_background(dirs, "sys_00100.tga");
     let buttons = load_background(dirs, "sys_00101.tga");
-    let text = render::text::line_rgba(message, 22);
+    let text = render::text::with_ui_font(22, |f| f.line_rgba(message, 22)).flatten();
     let (pw, ph) = plate
         .as_ref()
         .map(|p| (p.width as i32, p.height as i32))
@@ -3163,11 +3231,17 @@ fn show_backlog(
     }
 }
 
+/// The Chinese patch keeps its text in `script_cn`: Shift-JIS codes whose
+/// glyphs were repainted, which `codec::sjis::decode_cn` resolves.
+fn is_cn_script(dir: &std::path::Path) -> bool {
+    dir.file_name().and_then(|n| n.to_str()) == Some("script_cn")
+}
+
 /// Load and parse an LSCR program (`.bnr` + companion `.txt` token pool).
-fn load_program(script_dir: &std::path::Path, id: &str) -> Option<vm::lscr::Program> {
+fn load_program(script_dir: &std::path::Path, id: &str, cn: bool) -> Option<vm::lscr::Program> {
     let bnr = std::fs::read(script_dir.join(format!("{}.bnr", id))).ok()?;
     let txt = std::fs::read(script_dir.join(format!("{}.txt", id))).ok()?;
-    match vm::lscr::Program::load(&bnr, &txt) {
+    match vm::lscr::Program::load(&bnr, &txt, cn) {
         Ok(p) => Some(p),
         Err(e) => {
             eprintln!("lscr parse error for {}: {}", id, e);
@@ -3176,7 +3250,7 @@ fn load_program(script_dir: &std::path::Path, id: &str) -> Option<vm::lscr::Prog
     }
 }
 
-/// Locate a directory of loose `*.tga` character sprites (legacy layout helper).
+/// Locate a directory of loose character sprites (legacy layout helper).
 ///
 /// The data tree passes its own sprite directory explicitly; this is only used
 /// by the explicit-path CLI form, where it tries the common layouts.
@@ -3248,7 +3322,7 @@ fn sprite_prefixes(cid: u32) -> &'static [&'static str] {
     }
 }
 
-/// Character sprite bank backed by a directory of loose `*.tga` files.
+/// Character sprite bank backed by a directory of loose TGA or WebP files.
 ///
 /// On construction it indexes the directory once, so resolution is an in-memory
 /// lookup. (The previous archive-backed version sliced filenames by byte index,
@@ -3271,7 +3345,7 @@ impl SpriteBank {
                     Err(_) => continue,
                 };
                 let lower = name.to_ascii_lowercase();
-                if lower.ends_with(".tga") {
+                if lower.ends_with(".tga") || lower.ends_with(".webp") {
                     index.insert(lower);
                 }
             }
@@ -3286,8 +3360,7 @@ impl SpriteBank {
     fn get(&mut self, name: &str) -> Option<&codec::tga::TgaImage> {
         let key = name.to_ascii_lowercase();
         if !self.cache.contains_key(&key) {
-            let data = std::fs::read(self.dir.join(&key)).ok()?;
-            let img = codec::tga::decode(&data).ok()?;
+            let img = codec::image::decode_file(&self.dir.join(&key)).ok()?;
             self.cache.insert(key.clone(), img);
         }
         self.cache.get(&key)
@@ -3321,9 +3394,11 @@ impl SpriteBank {
                     if v < 0 {
                         continue;
                     }
-                    let name = format!("{}{:03}{:03}.tga", pf, s as u32, v as u32).to_ascii_lowercase();
-                    if self.index.contains(&name) {
-                        return Some(name);
+                    for ext in [".webp", ".tga"] {
+                        let name = format!("{}{:03}{:03}{}", pf, s as u32, v as u32, ext).to_ascii_lowercase();
+                        if self.index.contains(&name) {
+                            return Some(name);
+                        }
                     }
                 }
             }
@@ -3335,9 +3410,11 @@ impl SpriteBank {
                     continue;
                 }
                 for v in [101u32, 102, 100] {
-                    let name = format!("{}{:03}{:03}.tga", pf, s as u32, v).to_ascii_lowercase();
-                    if self.index.contains(&name) {
-                        return Some(name);
+                    for ext in [".webp", ".tga"] {
+                        let name = format!("{}{:03}{:03}{}", pf, s as u32, v, ext).to_ascii_lowercase();
+                        if self.index.contains(&name) {
+                            return Some(name);
+                        }
                     }
                 }
             }
@@ -3427,7 +3504,8 @@ fn present_rewind_frame(
     idle: u8,
 ) {
     let mut frame = clone_surf(cur);
-    bar.draw(&mut frame, hover, active, idle);
+    let (fw, fh) = (frame.width as i32, frame.height as i32);
+    bar.draw(&mut frame, hover, active, idle, fw, fh);
     win.present(&frame);
 }
 
@@ -3549,16 +3627,19 @@ fn note_seen(set: &mut std::collections::HashSet<String>, scene: &str, text: &st
     }
 }
 
-fn place_overlays<'a>(plates: &'a [Plate], w: u32, h: u32) -> Vec<(&'a codec::tga::TgaImage, i32, i32)> {
+fn place_overlays<'a>(plates: &'a [Plate], w: u32, h: u32, art_scale: u32) -> Vec<(&'a codec::tga::TgaImage, i32, i32)> {
+    let art_scale = art_scale.max(1);
     plates
         .iter()
         .map(|p| {
-            let (x, y) = if p.img.width >= 1100 || p.img.height >= 600 {
+            let logical_w = (p.img.width / art_scale).max(1);
+            let logical_h = (p.img.height / art_scale).max(1);
+            let (x, y) = if logical_w >= 1100 || logical_h >= 600 {
                 (0, 0)
             } else {
                 (
-                    (w as i32 - p.img.width as i32) / 2,
-                    (h as i32 - p.img.height as i32) / 2,
+                    (w as i32 - logical_w as i32) / 2,
+                    (h as i32 - logical_h as i32) / 2,
                 )
             };
             (&p.img, x, y)
@@ -3588,8 +3669,9 @@ fn draw_scene(
     font: &render::Font,
     slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
     focus: Option<u32>,
-    w: u32,
-    h: u32,
+    // Size of the frame to return - the window, not the 1280x720 layout.
+    out_w: u32,
+    out_h: u32,
     tint: Option<&[u8]>,
     // 「ウィンドウ一時消去」: false hides the dialog box and its text.
     window: bool,
@@ -3597,7 +3679,18 @@ fn draw_scene(
     frame: Option<&codec::tga::TgaImage>,
     plates: &[Plate],
     look: Look,
+    // Vector font for the dialogue, or None to keep the bitmap atlas.
+    vf: Option<&mut render::text::VectorFont>,
 ) -> render::Surface {
+    let art_scale = std::env::var("WA2_ART_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&v| matches!(v, 2 | 4 | 8))
+        .unwrap_or(1);
+    // The Japanese bitmap atlas still belongs to the 1280x720 compositor. The
+    // Chinese path uses vector text and can composite high-res art directly at
+    // the window size without stretching the bitmap glyphs.
+    let hires = art_scale > 1 && vf.is_some();
     // Dim the listeners only when the speaker is actually standing there.
     // 春希 speaks thousands of times and is placed twice in the whole game:
     // he is the camera, and the person on screen is who he is talking to.
@@ -3616,21 +3709,29 @@ fn draw_scene(
             } else {
                 255
             };
+            let logical_w = (s.img.width / art_scale.max(1)).max(1);
+            let logical_h = (s.img.height / art_scale.max(1)).max(1);
             Some(render::SpriteDraw {
                 img: &s.img,
-                x: SPRITE_ANCHORS[i] - s.img.width as i32 / 2,
-                y: (h as i32 - s.img.height as i32).max(0),
+                logical_w,
+                logical_h,
+                x: SPRITE_ANCHORS[i] - logical_w as i32 / 2,
+                y: (render::LAYOUT_H as i32 - logical_h as i32).max(0),
                 alpha,
             })
         })
         .collect();
-    let overlays = place_overlays(plates, w, h);
-    let mut s = render::render_scene_ex(
+    let overlays = place_overlays(plates, render::LAYOUT_W, render::LAYOUT_H, art_scale);
+    // With a vector font the text is drawn after the frame is scaled, so the
+    // atlas path hands the text to the compositor and the vector path does not.
+    let render_w = if hires { out_w } else { render::LAYOUT_W };
+    let render_h = if hires { out_h } else { render::LAYOUT_H };
+    let mut s = render::render_scene_ex_art(
         bg,
-        text,
+        if vf.is_some() { "" } else { text },
         font,
-        w,
-        h,
+        render_w,
+        render_h,
         &draws,
         tint,
         window,
@@ -3639,16 +3740,77 @@ fn draw_scene(
         look.alpha,
         look.shade,
         &overlays,
+        if hires { art_scale } else { 1 },
     );
-    // The name sits on the upper rim of the oval, not inside 【】 in the line.
-    if window {
-        if let Some(name) = speaker {
-            if !name.is_empty() && plate.is_some() {
-                font.draw_pitch(&mut s, name, render::NAME_X, render::NAME_Y, render::DIALOG_PITCH);
+    match vf {
+        Some(vf) => {
+            let mut s = if !hires && (out_w, out_h) != (render::LAYOUT_W, render::LAYOUT_H) {
+                s.scaled_to(out_w, out_h)
+            } else {
+                s
+            };
+            if window {
+                // The name sits on the upper rim of the oval, not inside 【】
+                // in the line, and only the game's own window has a rim.
+                let name = if plate.is_some() { speaker } else { None };
+                render::draw_dialog_vector(
+                    &mut s,
+                    vf,
+                    text,
+                    name,
+                    out_w as i32,
+                    out_h as i32,
+                    usize::MAX,
+                );
             }
+            s
+        }
+        None => {
+            // The name sits on the upper rim of the oval, not inside 【】 in the line.
+            if window && plate.is_some() {
+                if let Some(name) = speaker {
+                    if !name.is_empty() {
+                        font.draw_pitch(&mut s, name, render::NAME_X, render::NAME_Y, render::DIALOG_PITCH);
+                    }
+                }
+            }
+            s
         }
     }
-    s
+}
+
+/// Draw the dialogue body onto a frame that is already composited, at the size
+/// the frame actually is.
+///
+/// With a vector font the frame is window-sized and the glyphs are rasterized
+/// at that size; otherwise the atlas is stamped onto the 1280x720 layer. `limit`
+/// is how many characters to reveal.
+fn draw_body(
+    frame: &mut render::Surface,
+    font: &render::Font,
+    vf: Option<&mut render::text::VectorFont>,
+    text: &str,
+    speaker: Option<&str>,
+    plate: bool,
+    out_w: u32,
+    out_h: u32,
+    limit: usize,
+) {
+    match vf {
+        Some(vf) => {
+            let name = if plate { speaker } else { None };
+            render::draw_dialog_vector(frame, vf, text, name, out_w as i32, out_h as i32, limit);
+        }
+        None => render::draw_dialog_text(
+            frame,
+            font,
+            text,
+            plate,
+            render::LAYOUT_W,
+            render::LAYOUT_H,
+            limit,
+        ),
+    }
 }
 
 /// Older saves stored the line as `【name】\nbody`. Split that so a loaded
@@ -3712,7 +3874,7 @@ fn cg_names(dirs: &[&std::path::Path]) -> Vec<String> {
             let name = ent.file_name().to_string_lossy().into_owned();
             let low = name.to_ascii_lowercase();
             if low.starts_with('v')
-                && low.ends_with(".tga")
+                && (low.ends_with(".tga") || low.ends_with(".webp"))
                 && !names.iter().any(|n: &String| n.eq_ignore_ascii_case(&name))
             {
                 names.push(name);
@@ -3735,7 +3897,7 @@ fn browse_cg(win: &mut sdl2::Sdl, font: &render::Font, dirs: &[&std::path::Path]
         let mut surf = render::render_scene_ex(&img, "", font, W, H, &[], None, false, None, None, 255, 0, &[]);
         let caption = format!("{}   {} / {}", names[i], i + 1, names.len());
         if let Some((rw, rh, rgba)) =
-            render::text::block_rgba(&[caption], 700, 40, 22, render::text::DEFAULT_FONT)
+            render::text::with_ui_font(22, |f| f.block_rgba(&[caption], 700, 40, 22)).flatten()
         {
             surf.fill_rect(24, H as i32 - rh as i32 - 28, rw + 16, rh + 8, [0, 0, 0, 160]);
             surf.blit_rgba(&rgba, rw, rh, 32, H as i32 - rh as i32 - 24);
@@ -3771,7 +3933,10 @@ enum SpecialPick {
 /// Rasterize menu labels once. Each line is the system CJK font, white on
 /// transparent, ready to be tinted white or gold per frame.
 fn menu_labels(items: &[&str], size: u32) -> Vec<Option<(u32, u32, Vec<u8>)>> {
-    items.iter().map(|s| render::text::line_rgba(s, size)).collect()
+    items
+        .iter()
+        .map(|s| render::text::with_ui_font(size, |f| f.line_rgba(s, size)).flatten())
+        .collect()
 }
 
 /// Title highlight change. `SE_9011` is the short two-tap click.
@@ -4097,7 +4262,7 @@ fn run_special(
         let hpx = layout_font_px(16, wh);
         if hpx != head_px {
             head_px = hpx;
-            head = render::text::line_rgba(head_text, hpx);
+            head = render::text::with_ui_font(hpx, |f| f.line_rgba(head_text, hpx)).flatten();
         }
 
         ensure_fitted(
@@ -4422,7 +4587,8 @@ fn run_title(
                 let px = layout_font_px(26, wh);
                 if px != note_px {
                     note_px = px;
-                    note_img = render::text::line_rgba(n, px);
+                    note_img =
+                        render::text::with_ui_font(px, |f| f.line_rgba(n, px)).flatten();
                 }
             }
         } else {
@@ -4838,7 +5004,10 @@ mod backlog_paint {
         let plate = super::load_background(&dirs, "sys_00100.tga").unwrap();
         let buttons = super::load_background(&dirs, "sys_00101.tga").unwrap();
         let scene = crate::render::Surface::new(1280, 720, [20, 20, 20, 255]);
-        let text = crate::render::text::line_rgba("要读取快速存档吗？", 22);
+        let text = crate::render::text::with_ui_font(22, |f| {
+            f.line_rgba("要读取快速存档吗？", 22)
+        })
+        .flatten();
         assert!(text.is_some(), "system font should rasterize the prompt");
         let surf = super::paint_confirm(&scene, Some(&plate), Some(&buttons), text.as_ref(), Some(true));
         let (px, py) = super::centered_plate(plate.width as i32, plate.height as i32);

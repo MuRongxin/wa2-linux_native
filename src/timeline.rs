@@ -6,7 +6,7 @@
 //! so the chart opens on the line you were reading.
 
 use crate::codec::sjis;
-use crate::codec::tga::{self, TgaImage};
+use crate::codec::tga::TgaImage;
 use crate::render::{self, Surface};
 use crate::sdl2::{self, Sdl};
 use crate::vm::lscr::{Op, Program};
@@ -206,7 +206,7 @@ struct Label {
 }
 
 fn text_label(text: &str, size: u32) -> Option<Label> {
-    let (w, h, rgba) = render::text::line_rgba(text, size)?;
+    let (w, h, rgba) = render::text::with_ui_font(size, |f| f.line_rgba(text, size)).flatten()?;
     Some(Label { rgba, w, h })
 }
 
@@ -651,8 +651,7 @@ fn frame_rect(s: &mut Surface, x: i32, y: i32, w: i32, h: i32, t: i32, c: [u8; 4
 fn load_thumbs(dirs: &[&Path], nodes: &[Node]) -> HashMap<String, TgaImage> {
     let mut out = HashMap::new();
     for (id, path) in scene_files(dirs, nodes) {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Ok(img) = tga::decode(&bytes) else { continue };
+        let Ok(img) = crate::codec::image::decode_file(&path) else { continue };
         out.insert(format!("preview:{id}"), fit(&img, PREVIEW_W as u32, PREVIEW_H_THUMB as u32));
         // Three times the on-screen node, so a zoom still has pixels to sample
         // instead of stretching a 104×58 nearest-neighbor crumb.
@@ -721,7 +720,13 @@ fn picture_index(dirs: &[&Path]) -> PictureIndex {
     }
     let mut index = PictureIndex { bg: HashMap::new(), cg: HashMap::new() };
     for (name, path) in &files {
-        let Some(stem) = name.strip_suffix(".tga") else { continue };
+        let stem = if let Some(stem) = name.strip_suffix(".tga") {
+            stem
+        } else if let Some(stem) = name.strip_suffix(".webp") {
+            stem
+        } else {
+            continue;
+        };
         let (thumb, rest) = if let Some(rest) = stem.strip_prefix("tv") {
             (true, rest)
         } else if let Some(rest) = stem.strip_prefix("b") {
@@ -735,7 +740,8 @@ fn picture_index(dirs: &[&Path]) -> PictureIndex {
             continue;
         }
         let Ok(number) = rest.parse::<i64>() else { continue };
-        let has_background = files.contains_key(&format!("b{rest}.tga"));
+        let has_background = files.contains_key(&format!("b{rest}.tga"))
+            || files.contains_key(&format!("b{rest}.webp"));
         if stem.starts_with("b") {
             index.bg.entry(number / 100).or_default().push(Pic {
                 variant: (number % 100) as i32,
@@ -804,7 +810,10 @@ fn pick_picture(
 
 /// `tv100100.tga` is script 1001, variant 00.
 fn thumb_script_id(filename: &str) -> Option<String> {
-    let stem = filename.strip_suffix(".tga")?.strip_prefix("tv")?;
+    let stem = filename
+        .strip_suffix(".tga")
+        .or_else(|| filename.strip_suffix(".webp"))?
+        .strip_prefix("tv")?;
     if stem.len() < 3 || !stem.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
@@ -899,12 +908,9 @@ fn strip_tags(s: &str) -> String {
 
 fn load_tga(dirs: &[&Path], name: &str) -> Option<TgaImage> {
     for dir in dirs {
-        for cand in [name.to_string(), name.to_ascii_lowercase(), name.to_ascii_uppercase()] {
-            let path = dir.join(&cand);
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(img) = tga::decode(&bytes) {
-                    return Some(img);
-                }
+        for cand in crate::codec::image::candidate_names(name) {
+            if let Ok(img) = crate::codec::image::decode_file(&dir.join(cand)) {
+                return Some(img);
             }
         }
     }
@@ -963,7 +969,9 @@ fn build_nodes(script_dir: &Path) -> Vec<Node> {
         let txt_path = ent.path().with_extension("txt");
         let Ok(bnr) = std::fs::read(ent.path()) else { continue };
         let Ok(txt) = std::fs::read(&txt_path) else { continue };
-        let Ok(prog) = Program::load(&bnr, &txt) else { continue };
+        // Shot names and jump targets are ASCII resource tokens, so the
+        // Chinese-patch glyph reading is not needed here.
+        let Ok(prog) = Program::load(&bnr, &txt, false) else { continue };
         let found = scene_shots(&prog);
         if !found.is_empty() {
             shots.entry(entry.to_string()).or_default().push((stem.to_string(), found));

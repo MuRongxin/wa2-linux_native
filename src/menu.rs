@@ -526,24 +526,21 @@ pub struct Assets {
 
 fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
     for dir in dirs {
-        for cand in [name.to_string(), name.to_ascii_lowercase(), name.to_ascii_uppercase()] {
+        for cand in crate::codec::image::candidate_names(name) {
             let p = dir.join(&cand);
-            if let Ok(d) = std::fs::read(&p) {
-                if let Ok(img) = crate::codec::tga::decode(&d) {
+            if let Ok(img) = crate::codec::image::decode_file(&p) {
                     return Some(img);
-                }
             }
         }
         // case-insensitive scan as a last resort
         if let Ok(rd) = std::fs::read_dir(dir) {
-            let want = name.to_ascii_lowercase();
+            let wants: Vec<String> = crate::codec::image::candidate_names(name)
+                .into_iter().map(|n| n.to_ascii_lowercase()).collect();
             for e in rd.flatten() {
                 if let Ok(n) = e.file_name().into_string() {
-                    if n.to_ascii_lowercase() == want {
-                        if let Ok(d) = std::fs::read(e.path()) {
-                            if let Ok(img) = crate::codec::tga::decode(&d) {
-                                return Some(img);
-                            }
+                    if wants.iter().any(|w| n.to_ascii_lowercase() == *w) {
+                        if let Ok(img) = crate::codec::image::decode_file(&e.path()) {
+                            return Some(img);
                         }
                     }
                 }
@@ -1404,7 +1401,7 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
         // A second line is kept only when it is itself Chinese, such as 音量OFF.
         let sub_is_cjk = lab.sub.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
         if lab.sub.is_empty() || !sub_is_cjk {
-            stamps.push(crate::render::text::Stamp {
+            stamps.push(crate::render::text::Label {
                 text: spread_cjk(lab.text),
                 x: bx,
                 y: by,
@@ -1412,12 +1409,13 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
                 h: bh,
                 size,
                 center: lab.center,
+                rgb: [255, 255, 255],
             });
         } else {
             let gap = (bh / 8).max(4);
             let top = ((bh - gap) * 5 / 8).max(1);
             let sub_h = (bh - top - gap).max(1);
-            stamps.push(crate::render::text::Stamp {
+            stamps.push(crate::render::text::Label {
                 text: spread_cjk(lab.text),
                 x: bx,
                 y: by,
@@ -1425,8 +1423,9 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
                 h: top,
                 size,
                 center: true,
+                rgb: [255, 255, 255],
             });
-            stamps.push(crate::render::text::Stamp {
+            stamps.push(crate::render::text::Label {
                 text: lab.sub.to_string(),
                 x: bx,
                 y: by + top + gap,
@@ -1434,11 +1433,12 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
                 h: sub_h,
                 size: menu_px((lab.size * 2 / 3).max(11), wh),
                 center: true,
+                rgb: [255, 255, 255],
             });
         }
     }
     for (i, line) in helps.iter().enumerate() {
-        stamps.push(crate::render::text::Stamp {
+        stamps.push(crate::render::text::Label {
             text: (*line).to_string(),
             x: 40,
             y: wh + i as i32 * help_h as i32,
@@ -1446,9 +1446,10 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
             h: help_h as i32,
             size: menu_px(17, wh),
             center: true,
+            rgb: [255, 255, 255],
         });
     }
-    stamps.push(crate::render::text::Stamp {
+    stamps.push(crate::render::text::Label {
         text: "向导信息".to_string(),
         x: mapx(GUIDE_X),
         y: wh + helps.len() as i32 * help_h as i32,
@@ -1456,8 +1457,14 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
         h: help_h as i32,
         size: menu_px(14, wh),
         center: false,
+        rgb: [255, 255, 255],
     });
-    let (_w, _h, buf) = crate::render::text::stamps_rgba(ww as u32, wh as u32 + extra, &stamps)?;
+    // One canvas for the whole page: the labels are re-tinted per frame, so
+    // they have to come back as a buffer with the glyph coverage in alpha.
+    let first = stamps.first().map(|l| l.size).unwrap_or(14);
+    let buf = crate::render::text::with_ui_font(first, |f| {
+        f.labels_rgba(ww as u32, wh as u32 + extra, &stamps)
+    })??;
     Some(MenuText { ww, wh, page, buf, help_h, help_n: helps.len() })
 }
 

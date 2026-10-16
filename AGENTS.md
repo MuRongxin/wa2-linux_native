@@ -48,7 +48,7 @@
 | **零 crate** | `Cargo.toml` 的 `[dependencies]` 必须保持为空。标准库 + 手写 FFI。 |
 | **手写 SDL2 FFI** | `src/sdl2.rs` 是唯一 `extern "C"` 的地方，用 `dlopen`/`dlsym` + `transmute` 函数指针。 |
 | **素材不入库** | `data/` 在 `.gitignore` 里。游戏素材有版权，**绝不能提交或分发**。 |
-| **运行时依赖** | `libSDL2-2.0.so.0`、`ffmpeg`/`ffprobe`（子进程解码）、系统 CJK 字体（`NotoSansCJK-Regular.ttc`。菜单标题和引擎侧字符串用它光栅化；对白仍是位图字体，见第 8 节）。 |
+| **运行时依赖** | `libSDL2-2.0.so.0`、`libfreetype.so.6`（矢量字光栅化）、`ffmpeg`/`ffprobe`（只剩视频/音频解码）、系统字体文件（默认 `NotoSansCJK-Medium.ttc`，可用 `WA2_FONT` 换，见第 6 节）。 |
 | **默认中文** | 存在 `data/script_cn/` 时默认中文；`WA2_LANG=jp` 切日文。 |
 
 ---
@@ -80,6 +80,9 @@ movie-frame movie-test audio-test verify-window
 | `WA2_DATA` | 数据根目录（默认 `./data`） |
 | `WA2_LANG` | `cn`（默认，若有 `script_cn`）/ `jp` |
 | `WA2_INI` | 配置文件路径（默认 `<data>/wa2.ini`） |
+| `WA2_FONT` | 矢量字字体文件（默认 `NotoSansCJK-Medium.ttc`） |
+| `WA2_FONT_BOLD` | 笔画加粗像素数（默认 0） |
+| `WA2_FONT_GAIN` | 墨迹覆盖率放大百分比，26px 的 Regular 笔画一半是半透明像素、会发灰，默认 130 把它压实（默认 100） |
 | `WA2_SPRITES` | 覆盖立绘目录 |
 | `WA2_AUTO` / `WA2_AUTO_TEXT` | 自动推进（跑流程/截图用） |
 | `WA2_TITLE_AUTO=2` | 标题画面自动选第 N 项（无头测试用） |
@@ -100,9 +103,11 @@ src/
   cmdbar.rs       217  底部指令条（保存/读档/自动/跳过…）
   vm/lscr.rs      728  LSCR 字节码解释器（舞台指令 ACT）
   vm/mod.rs       325  剧本 .txt 字符串池 + 页面解析
-  render/mod.rs   418  图层合成、对话框、滤镜
-  render/font.rs  316  位图字体（cell map 按 SJIS 码查表）
-  render/text.rs   64  系统字体回退（中文引擎侧字符串）
+  render/mod.rs   794  图层合成、对话框、滤镜、矢量正文排版
+  render/font.rs  380  位图字体（cell map 按 SJIS 码查表，日文模式用）
+  render/text.rs      矢量字体（字形缓存 + 描边 + 排版 + 标签缓冲），全局一份
+  ft2.rs              手写 FreeType FFI（dlopen libfreetype.so.6）
+  codec/cn_text.rs    中文补丁字形表（SJIS 码 -> 真实汉字，生成物）
   sdl2.rs         487  SDL2 FFI + 输入（含 Pointer / Drag / RightClick）
   audio/mixer.rs  325  软件混音（每流独立 ffmpeg 管道 + 分组增益）
   video/mod.rs     83  影片播放（ffmpeg 解 RGBA 帧）
@@ -179,7 +184,11 @@ wa2.ini            玩家设置（键名沿用原版 exe）
 
 中文模式（加载了 `bg_cn`）才替换贴图上的字。日文模式继续用原版图片和位图字体。
 
-矢量字走 `render/text.rs`：一次 ffmpeg `drawtext`，字体 `NotoSansCJK-Regular.ttc`，白色、alpha 为覆盖率，贴上界面时再着色。不要加阴影或描边。
+矢量字走 `render/text.rs` 的 `VectorFont`：FreeType（`ft2.rs`）按字号光栅化一次并缓存成「字形瓦片」，瓦片里同时存墨迹和描边的覆盖率，所以能按任意颜色盖章。整个程序共用一份字体（`with_ui_font`，懒开，读 `WA2_FONT`/`WA2_FONT_BOLD`/`WA2_FONT_GAIN`，见 `font_choice()`），缓存按（字, 字号）做键，所以设置页要 18px 不会把对白 26px 的字形冲掉。正文描一圈细黑边（随字号放大，1~3px），界面上的短标签不描边。
+
+默认脸是 **Medium** 不是 Regular：26px 的 Regular 笔画大多半透明、看着发灰（实测实心像素只占 0.54），而原版位图字是实心的；Medium + 覆盖率 ×1.3 把实心比例拉到 0.80。`set_ink_gain`（覆盖率放大）和 `set_bold`（膨胀算子加粗）是两个独立的旋钮，设置界面会写进 `wa2.ini` 的同一组值。
+
+标签需要被缓存后再着色时，用 `line_rgba` / `block_rgba` / `labels_rgba` 拿到「白墨 + 覆盖率做 alpha」的缓冲，再按颜色贴上去。`Surface::put` 会把 alpha 压成 255，所以这些缓冲是自己在裸 RGBA 上写的，不能拿 `Surface` 当中转。
 
 ### 盖掉贴图上的旧字
 
@@ -198,13 +207,25 @@ wa2.ini            玩家设置（键名沿用原版 exe）
 |---|---|
 | 标题菜单各项、特别模式菜单（含「时间线」） | 已改成矢量字 |
 | 系统设置三页的标签、按钮、页签、底栏、默认按钮、向导 | 已改成矢量字 |
+| 存档/读档、底部指令条上的短语 | 存档/读档的说明文字已是矢量字；按钮本身仍是贴图 |
 | 存档/读档、底部指令条上的短语 | 仍是贴图，还没改 |
-| 对白 | 仍是位图字体，还没改 |
-| 玩家自选字体文件 | 还没做。等矢量这条路稳定后再接 |
+| **对白（正文）** | **已改成矢量字**（中文模式，FreeType）；日文模式仍是位图 |
+| 中文正文的取字 | SJIS 码 -> `wa2_cell_map_cn.tsv` 格子 -> `wa2.cht.txt`，已接进 `sjis::decode_cn` |
+| 玩家自选字体文件 | 引擎侧已能换（`WA2_FONT`，全局一份字体）；设置界面里的选项还没做 |
 
-### 对白以后怎么换（现在不要做）
+### 对白已经怎么换的
 
-不需要 OCR。中文：SJIS 码 → `tools/tables/wa2_cell_map_cn.tsv` 的格子 → `tools/tables/wa2.cht.txt` 里 `cell - 748` 的字。格子号小于 748 的标点保持解码出的符号。日文模式不用这张对照。用户没有再次要求之前，不要改对白字体。
+不需要 OCR。中文补丁的 `.txt` 是「SJIS 码当容器」，直接解码是乱码，真正的字要绕一圈：
+SJIS 码 → `tools/tables/wa2_cell_map_cn.tsv` 的格子 → `tools/tables/wa2.cht.txt` 里 `cell - 748` 的字。
+格子号小于 748 的标点保持解码出的符号。这张表由 `tools/gen_cn_text.py` 生成成
+`src/codec/cn_text.rs`，运行时通过 `codec::sjis::decode_cn` 生效（`vm::lscr::Program::load`
+的 `cn` 参数决定走不走这条路）。
+
+全脚本 173 万个双字节码 100% 可还原。`gen_cell_map.py` 原来会把 trail=0x7F 的码整行丢掉
+（不是合法 Shift-JIS，但图集给它留了格子），已修；`Font::from_cell_map` 原来用
+`split_whitespace` 解析，会把 U+3000 那一格吃掉，已改成按 tab 切。
+
+日文模式不用这张对照，继续走位图字体。
 
 改这一节时核对一次就够：编译，外加一条断言或一张截图。像素已经说明旧字盖掉了，就不要为了截图描述再开一轮。
 

@@ -86,8 +86,8 @@ pub fn strip_choice_prefix(s: &str) -> Option<String> {
 /// `Bg`/`Movie`, quoted lines become `Say` (with a remembered speaker),
 /// narration becomes `Mono`, numbered options become `Choice`, and `CATCH*`
 /// tokens become `Jump`.
-pub fn parse_steps(bytes: &[u8]) -> Vec<Step> {
-    let s = sjis::decode(bytes);
+pub fn parse_steps(bytes: &[u8], cn: bool) -> Vec<Step> {
+    let s = if cn { sjis::decode_cn(bytes) } else { sjis::decode(bytes) };
     let toks: Vec<&str> = s.split(',').collect();
     let mut steps: Vec<Step> = Vec::new();
     let mut cur_speaker = String::new();
@@ -314,7 +314,7 @@ mod tests {
     fn parse_simple_scene() {
         // Tokens are ASCII / latin1-safe so sjis::decode round-trips them.
         let raw = ",mv01,sepia.AMP,CATCH,1002";
-        let steps = parse_steps(raw.as_bytes());
+        let steps = parse_steps(raw.as_bytes(), false);
         assert!(matches!(steps[0], Step::Movie(_)));
         assert!(matches!(steps[1], Step::Bg(_)));
         match &steps[2] {

@@ -10,6 +10,8 @@
 //!   script_cn/  *.bnr + *.txt    same, CK-GAL Chinese patch text
 //!   bg/         *.tga, *.amp     backgrounds and tint LUTs
 //!   sprite/     *.tga            standing character sprites
+//!   bg_8x/      *.webp           optional high-resolution art sibling
+//!   sprite_8x/  *.webp           optional high-resolution sprite sibling
 //!   voice/      *.ogg            voice
 //!   bgm/        *.ogg            music
 //!   movie/      *.wmv            movies (raw ASF, renamed from mv*.pak)
@@ -19,6 +21,7 @@
 //!
 //! `WA2_LANG=cn` switches the script directory and the font pair to the Chinese
 //! patch (`script_cn/`, `cn_body80.tga` + `wa2_cell_map_cn.tsv`).
+//! `WA2_ART_SCALE=8` selects the corresponding `*_8x/` art siblings.
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +30,8 @@ pub struct Data {
     pub root: PathBuf,
     /// Chinese patch data (script_cn / cn_body80 / cell_map_cn).
     pub cn: bool,
+    /// Art scale selected by `WA2_ART_SCALE` (1 keeps the original TGA tree).
+    pub art_scale: u32,
 }
 
 impl Data {
@@ -71,10 +76,41 @@ impl Data {
                 return None;
             }
         };
-        Some(Data { root, cn })
+        let requested_scale = std::env::var("WA2_ART_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| matches!(v, 1 | 2 | 4 | 8))
+            .unwrap_or(1);
+        let art_scale = if requested_scale > 1 {
+            let suffix = format!("{}x", requested_scale);
+            let ready = root.join(format!("bg_{}", suffix)).is_dir()
+                && root.join(format!("sprite_{}", suffix)).is_dir()
+                && (!cn || root.join(format!("bg_cn_{}", suffix)).is_dir());
+            if ready { requested_scale } else {
+                eprintln!("art: WA2_ART_SCALE={} requested but sibling tree is incomplete; using original art", requested_scale);
+                1
+            }
+        } else {
+            1
+        };
+        if art_scale > 1 {
+            eprintln!("art: using {}x sibling directories when present", art_scale);
+        } else if requested_scale > 1 {
+            // The renderer reads the effective scale for layout decisions too;
+            // do not let a partial sibling tree make original TGA look like 8x
+            // art after the data resolver has fallen back.
+            std::env::set_var("WA2_ART_SCALE", "1");
+        }
+        Some(Data { root, cn, art_scale })
     }
 
     fn sub(&self, name: &str) -> PathBuf {
+        if self.art_scale > 1 {
+            let scaled = self.root.join(format!("{}_{}x", name, self.art_scale));
+            if scaled.is_dir() {
+                return scaled;
+            }
+        }
         self.root.join(name)
     }
 
@@ -86,6 +122,9 @@ impl Data {
     }
     pub fn sprite(&self) -> PathBuf {
         self.sub("sprite")
+    }
+    pub fn bg_cn(&self) -> PathBuf {
+        self.sub("bg_cn")
     }
     pub fn voice(&self) -> PathBuf {
         self.sub("voice")
@@ -119,6 +158,6 @@ impl Data {
 
     /// Path of the `char.pak`-era legacy layout, if the caller still passed one.
     pub fn from_explicit(root: &Path) -> Data {
-        Data { root: root.to_path_buf(), cn: false }
+        Data { root: root.to_path_buf(), cn: false, art_scale: 1 }
     }
 }

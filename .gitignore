@@ -1,5 +1,9 @@
 /target
 
+# Runtime log from upscale_art.py.
+/upscale.log
+/upscale-failed.txt
+
 # Game content as loose files. Built once from the user's own copy of the game
 # by tools/build_data_tree.py -- never commit (huge + copyrighted).
 /data
@@ -10,3 +14,5 @@ tools/verify/
 
 # Character/font sample rasters (copyrighted artwork, like /data).
 tools/samples/
+__pycache__/
+tools/__pycache__/
