@@ -614,17 +614,18 @@ pub fn render_scene_ex(
     shade: u8,
     // Extra plates (ACT176): items, effect layers, composite CG pieces.
     // Already positioned in surface space, drawn under the dialog box.
-    overlays: &[(&TgaImage, i32, i32)],
+    overlays: &[(&TgaImage, i32, i32, u32)],
 ) -> Surface {
     render_scene_ex_art(
         bg, text, font, w, h, sprites, lut, window, plate, frame,
-        window_alpha, shade, overlays, 1,
+        window_alpha, shade, overlays,
     )
 }
 
-/// Scene compositor with an explicit source-art scale. Layout coordinates stay
-/// at 1280x720, while the returned surface can be the actual window size. This
-/// lets an 8x WebP contribute detail before the final window-sized composite.
+/// Scene compositor with per-image source scales. Layout coordinates stay at
+/// 1280x720, while the returned surface can be the actual window size. Each
+/// overlay carries the scale represented by its decoded pixels, so mixed 1x,
+/// 2x, 4x and 8x assets share the same logical placement.
 pub fn render_scene_ex_art(
     bg: &TgaImage,
     text: &str,
@@ -638,10 +639,8 @@ pub fn render_scene_ex_art(
     frame: Option<&TgaImage>,
     window_alpha: u8,
     shade: u8,
-    overlays: &[(&TgaImage, i32, i32)],
-    art_scale: u32,
+    overlays: &[(&TgaImage, i32, i32, u32)],
 ) -> Surface {
-    let art_scale = art_scale.max(1);
     let mut s = Surface::new(w, h, [0, 0, 0, 255]);
     // Background, scaled to fit (nearest-neighbour stretch).
     let (bw, bh) = (bg.width as f32, bg.height as f32);
@@ -667,9 +666,10 @@ pub fn render_scene_ex_art(
             dx, dy, dw.max(1), dh.max(1), sp.alpha,
         );
     }
-    for (img, x, y) in overlays {
-        let logical_w = (img.width / art_scale).max(1);
-        let logical_h = (img.height / art_scale).max(1);
+    for (img, x, y, art_scale) in overlays {
+        let scale = (*art_scale).max(1);
+        let logical_w = (img.width / scale).max(1);
+        let logical_h = (img.height / scale).max(1);
         let dx = (*x).max(0) as u32 * w / LAYOUT_W;
         let dy = (*y).max(0) as u32 * h / LAYOUT_H;
         let dw = logical_w * w / LAYOUT_W;
@@ -695,20 +695,17 @@ pub fn render_scene_ex_art(
     // Without those assets, fall back to the flat plate the tools use.
     if plate.is_some() {
         if let Some(pl) = plate {
-            // Scaled sibling trees keep every asset at art_scale x logical size.
-            // UI loaders may already have normalized a high-resolution sheet
-            // to logical dimensions; do not divide that image a second time.
-            let scale = if pl.width > 2000 { art_scale } else { 1 };
-            let pw = (pl.width / scale).max(1) * w / LAYOUT_W;
-            let ph = (pl.height / scale).max(1) * h / LAYOUT_H;
+            // UI loaders normalize the message-window sheets to logical
+            // coordinates before they reach the compositor.
+            let pw = pl.width.max(1) * w / LAYOUT_W;
+            let ph = pl.height.max(1) * h / LAYOUT_H;
             let px = WINDOW_X.max(0) as u32 * w / LAYOUT_W;
             let py = WINDOW_Y.max(0) as u32 * h / LAYOUT_H;
             s.blit_region_scaled(pl, 0, 0, pl.width, pl.height, px as i32, py as i32, pw.max(1), ph.max(1), window_alpha);
         }
         if let Some(fr) = frame {
-            let scale = if fr.width > 2000 { art_scale } else { 1 };
-            let fw = (fr.width / scale).max(1) * w / LAYOUT_W;
-            let fh = (fr.height / scale).max(1) * h / LAYOUT_H;
+            let fw = fr.width.max(1) * w / LAYOUT_W;
+            let fh = fr.height.max(1) * h / LAYOUT_H;
             let fx = WINDOW_X.max(0) as u32 * w / LAYOUT_W;
             let fy = WINDOW_Y.max(0) as u32 * h / LAYOUT_H;
             s.blit_region_scaled(fr, 0, 0, fr.width, fr.height, fx as i32, fy as i32, fw.max(1), fh.max(1), window_alpha);

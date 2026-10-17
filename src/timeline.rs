@@ -62,7 +62,11 @@ pub fn run(
         eprintln!("timeline: no scenes under {}", script_dir.display());
         return None;
     }
-    let thumbs = load_thumbs(bg_dirs, &chart.nodes);
+    let cache_dir = script_dir
+        .parent()
+        .map(|root| root.join("cache").join("timeline"))
+        .unwrap_or_else(|| PathBuf::from("cache/timeline"));
+    let thumbs = load_thumbs(bg_dirs, &chart.nodes, &cache_dir);
     let banner = load_tga(bg_dirs, "sys_06000.tga");
     let pager = load_tga(bg_dirs, "sys_06021.tga");
     eprintln!("timeline: {} scenes", chart.nodes.len());
@@ -648,10 +652,24 @@ fn frame_rect(s: &mut Surface, x: i32, y: i32, w: i32, h: i32, t: i32, c: [u8; 4
     s.fill_rect(x + w - t, y, t as u32, h as u32, c);
 }
 
-fn load_thumbs(dirs: &[&Path], nodes: &[Node]) -> HashMap<String, TgaImage> {
+fn load_thumbs(dirs: &[&Path], nodes: &[Node], cache_dir: &Path) -> HashMap<String, TgaImage> {
     let mut out = HashMap::new();
-    for (id, path) in scene_files(dirs, nodes) {
-        let Ok(img) = crate::codec::image::decode_file(&path) else { continue };
+    for (id, path) in scene_files_with(dirs, nodes, true) {
+        // `tools/build_timeline_cache.py` pre-renders small TGA thumbnails from
+        // the 8x WebP tree: decoding a 59 MP lossless background just to draw a
+        // 104x58 node would otherwise make opening the chart take minutes.
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let cached = cache_dir.join(format!("{stem}.tga"));
+        let img = if let Ok(img) = crate::codec::image::decode_file(&cached) {
+            img
+        } else if let Ok(img) = crate::codec::image::decode_ui_file(&path) {
+            img
+        } else {
+            continue;
+        };
         out.insert(format!("preview:{id}"), fit(&img, PREVIEW_W as u32, PREVIEW_H_THUMB as u32));
         // Three times the on-screen node, so a zoom still has pixels to sample
         // instead of stretching a 104×58 nearest-neighbor crumb.
@@ -682,10 +700,21 @@ struct PictureIndex {
 /// script that begins by repeating the previous location does not stamp that
 /// location onto every following node. An event CG breaks a tie.
 fn scene_files(dirs: &[&Path], nodes: &[Node]) -> HashMap<String, PathBuf> {
+    scene_files_with(dirs, nodes, false)
+}
+
+fn scene_files_with(dirs: &[&Path], nodes: &[Node], prefer_thumb: bool) -> HashMap<String, PathBuf> {
     let index = picture_index(dirs);
+    let resolve_shot = |shot: &(bool, i64, i32)| {
+        if prefer_thumb {
+            resolve_thumb(&index, *shot)
+        } else {
+            resolve(&index, *shot)
+        }
+    };
     let resolved: Vec<Vec<Option<PathBuf>>> = nodes
         .iter()
-        .map(|node| node.shot.iter().map(|shot| resolve(&index, *shot)).collect())
+        .map(|node| node.shot.iter().map(resolve_shot).collect())
         .collect();
     let mut owners: HashMap<PathBuf, usize> = HashMap::new();
     for list in &resolved {
@@ -785,6 +814,27 @@ fn resolve(index: &PictureIndex, shot: (bool, i64, i32)) -> Option<PathBuf> {
                 // keeping only the preview in memory.  Keep `tv*` as a
                 // fallback for assets that have no corresponding full file.
                 u8::from(pic.thumb),
+                u8::from(pic.variant != 0),
+                pic.variant,
+            )
+        })
+        .map(|pic| pic.path.clone())
+}
+
+/// Like [`resolve`], but prefers the small `tv*` copy of a picture. Timeline
+/// nodes are 104x58 and its preview is 208x117, so decoding the full 8x CG is
+/// wasted I/O and memory.
+fn resolve_thumb(index: &PictureIndex, shot: (bool, i64, i32)) -> Option<PathBuf> {
+    let (cg, id, variant) = shot;
+    let pics = if cg { index.cg.get(&id)? } else { index.bg.get(&id)? };
+    pics.iter()
+        .min_by_key(|pic| {
+            (
+                u8::from(pic.variant != variant),
+                // The whole point of this resolver: take the small `tv*` copy
+                // before considering whether the file is a shipped background.
+                u8::from(!pic.thumb),
+                u8::from(!cg && !pic.background),
                 u8::from(pic.variant != 0),
                 pic.variant,
             )
@@ -914,7 +964,10 @@ fn strip_tags(s: &str) -> String {
 fn load_tga(dirs: &[&Path], name: &str) -> Option<TgaImage> {
     for dir in dirs {
         for cand in crate::codec::image::candidate_names(name) {
-            if let Ok(img) = crate::codec::image::decode_file(&dir.join(cand)) {
+            // The chart's banner/pager are UI sheets authored in logical
+            // coordinates, so they must be normalized just like the settings
+            // screens rather than decoded at the window's art scale.
+            if let Ok(img) = crate::codec::image::decode_ui_file(&dir.join(cand)) {
                 return Some(img);
             }
         }
@@ -1196,6 +1249,35 @@ fn lane_chapter(id: &str) -> (i32, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnails_are_preferred_for_chart_nodes() {
+        use std::collections::HashMap;
+        let mut bg = HashMap::new();
+        bg.insert(
+            1001,
+            vec![
+                super::Pic {
+                    variant: 0,
+                    thumb: false,
+                    background: true,
+                    path: std::path::PathBuf::from("b100100.tga"),
+                },
+                super::Pic {
+                    variant: 0,
+                    thumb: true,
+                    background: false,
+                    path: std::path::PathBuf::from("tv100100.tga"),
+                },
+            ],
+        );
+        let index = super::PictureIndex { bg, cg: HashMap::new() };
+        let thumb = super::resolve_thumb(&index, (false, 1001, 0)).unwrap();
+        assert!(thumb.ends_with("tv100100.tga"), "{thumb:?}");
+        // The general resolver still prefers the full event CG.
+        let full = super::resolve(&index, (false, 1001, 0)).unwrap();
+        assert!(full.ends_with("b100100.tga"), "{full:?}");
+    }
 
     #[test]
     fn common_route_reaches_four_branches_without_subscripts() {

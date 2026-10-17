@@ -633,16 +633,32 @@ fn render_art_scale() -> u32 {
         .unwrap_or(1)
 }
 
+/// Largest useful art scale for a window: 1280x720 needs 1x, 1920x1080
+/// needs 2x, 2560x1440/4K need 4x, anything larger 8x.
+fn render_scale_for(w: i32, h: i32) -> u32 {
+    let w = w.max(1280) as u32;
+    let h = h.max(720) as u32;
+    let need = ((w + 1279) / 1280).max((h + 719) / 720);
+    if need <= 1 { 1 } else if need <= 2 { 2 } else if need <= 4 { 4 } else { 8 }
+}
+
 fn set_render_art_scale(win: &sdl2::Sdl) {
     let (w, h) = win.window_size();
-    let need = ((w.max(1280) + 1279) / 1280)
-        .max((h.max(720) + 719) / 720) as u32;
-    let scale = if need <= 1 { 1 } else if need <= 2 { 2 } else if need <= 4 { 4 } else { 8 };
-    std::env::set_var("WA2_RENDER_SCALE", scale.to_string());
-    eprintln!("art: render scale={} for window {}x{}", scale, w, h);
+    let scale = render_scale_for(w, h);
+    if render_art_scale() != scale {
+        std::env::set_var("WA2_RENDER_SCALE", scale.to_string());
+        eprintln!("art: render scale={} for window {}x{}", scale, w, h);
+    }
 }
 
 fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::TgaImage> {
+    load_background_asset(dirs, name).map(|asset| asset.img)
+}
+
+/// Load a scene asset and retain the scale represented by the decoded pixels.
+/// UI sheets are normalized by `decode_ui_file`, while art keeps the largest
+/// useful scale allowed by the current render target.
+fn load_background_asset(dirs: &[&std::path::Path], name: &str) -> Option<LoadedAsset> {
     // Build candidate names: exact, then with suffixes stripped.
     let mut candidates = vec![name.to_string()];
     let lower = name.to_ascii_lowercase();
@@ -668,7 +684,12 @@ fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::
                 codec::image::decode_art_file(&p)
             };
             if let Ok(img) = decoded {
-                return Some(img);
+                let scale = if ui_asset {
+                    1
+                } else {
+                    codec::image::source_art_scale(&p).min(render_art_scale())
+                };
+                return Some(LoadedAsset { img, art_scale: scale.max(1) });
             }
             // Older data trees were extracted with the archive's raw CP932
             // filename bytes.  On Unix those names are valid byte strings but
@@ -691,7 +712,12 @@ fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::
                                 codec::image::decode_art_file(&entry.path())
                             };
                             if let Ok(img) = decoded {
-                                return Some(img);
+                                let scale = if ui_asset {
+                                    1
+                                } else {
+                                    codec::image::source_art_scale(&entry.path()).min(render_art_scale())
+                                };
+                                return Some(LoadedAsset { img, art_scale: scale.max(1) });
                             }
                         }
                     }
@@ -1194,8 +1220,10 @@ fn run_game_at(
                 Some(e) => e,
                 None => continue,
             };
-            if let Some(img) = bank.as_mut().and_then(|b| b.get(name)).cloned() {
-                slots[i] = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img });
+            if let Some(bank) = bank.as_mut() {
+                if let Some((img, art_scale)) = bank.get(name).map(|(img, scale)| (img.clone(), scale)) {
+                    slots[i] = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img, art_scale });
+                }
             }
         }
         focus = snap.focus;
@@ -1287,6 +1315,9 @@ fn run_game_at(
         }
         'events: loop {
         win_size = win.window_size();
+        if render_scale_for(win_size.0, win_size.1) != render_art_scale() {
+            set_render_art_scale(win);
+        }
             let event = if park_wait {
                 park_wait = false;
                 vm::lscr::Event::Wait
@@ -1442,8 +1473,7 @@ fn run_game_at(
                     let mut changed = false;
                     if let Some(bank) = bank.as_mut() {
                         if let Some(name) = bank.resolve(char_id, series, variant) {
-                            if let Some(img) = bank.get(&name) {
-                                let img = img.clone();
+                            if let Some((img, art_scale)) = bank.get(&name).map(|(img, scale)| (img.clone(), scale)) {
                                 let idx = slot as usize;
                                 // One character occupies one slot. Moving them
                                 // (雪菜 from 2 to 1, and so on) has to clear
@@ -1455,7 +1485,7 @@ fn run_game_at(
                                 }
                                 if let Some(dst) = slots.get_mut(idx) {
                                     eprintln!("  sprite: {} (char {}, slot {}, {}f)", name, char_id, idx, frames);
-                                    *dst = Some(ActiveSprite { char_id, name, img });
+                                    *dst = Some(ActiveSprite { char_id, name, img, art_scale });
                                     changed = true;
                                 } else {
                                     eprintln!("  sprite: slot {} out of range", idx);
@@ -1616,10 +1646,11 @@ fn run_game_at(
                     }
                 }
                 vm::lscr::Event::Overlay { name, slot } => {
-                    if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                    if let Some(asset) = load_background_asset(&s.bg_dirs(), &name) {
+                        let img = &asset.img;
                         plates.retain(|p| p.slot != slot);
                         eprintln!("  overlay: slot {} {} ({}x{})", slot, name, img.width, img.height);
-                        plates.push(Plate { slot, name, img });
+                        plates.push(Plate { slot, name, img: asset.img, art_scale: asset.art_scale });
                         line_base = None;
                         line_done = true;
                         cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
@@ -2703,17 +2734,21 @@ fn rewind_step(
         *slots = Default::default();
         for (i, entry) in dest.slots.iter().enumerate() {
             let Some((char_id, name)) = entry else { continue };
-            let Some(img) = bank.as_mut().and_then(|b| b.get(name)).cloned() else { continue };
-            if let Some(dst) = slots.get_mut(i) {
-                *dst = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img });
+            if let Some(bank) = bank.as_mut() {
+                let Some((img, art_scale)) = bank.get(name).map(|(img, scale)| (img.clone(), scale)) else {
+                    continue;
+                };
+                if let Some(dst) = slots.get_mut(i) {
+                    *dst = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img, art_scale });
+                }
             }
         }
     }
     if plate_keys(plates) != dest.plates {
         plates.clear();
         for (slot, name) in &dest.plates {
-            if let Some(img) = load_background(&s.bg_dirs(), name) {
-                plates.push(Plate { slot: *slot, name: name.clone(), img });
+            if let Some(asset) = load_background_asset(&s.bg_dirs(), name) {
+                plates.push(Plate { slot: *slot, name: name.clone(), img: asset.img, art_scale: asset.art_scale });
             }
         }
     }
@@ -3390,7 +3425,8 @@ struct SpriteBank {
     dir: std::path::PathBuf,
     /// lowercased file names present in the directory
     index: std::collections::HashSet<String>,
-    cache: std::collections::HashMap<String, codec::tga::TgaImage>,
+    /// file name -> (decoded pixels, scale represented by those pixels)
+    cache: std::collections::HashMap<String, (codec::tga::TgaImage, u32)>,
     /// High-resolution sprites are large after WebP decode. Do not retain the
     /// entire 1,600-file library in RAM as the story advances.
     cache_limit: usize,
@@ -3426,18 +3462,25 @@ impl SpriteBank {
         }
     }
 
-    fn get(&mut self, name: &str) -> Option<&codec::tga::TgaImage> {
+    /// Returns the decoded pixels and the art scale they represent. A cached
+    /// image keeps the scale it was decoded with, so resizing the window never
+    /// mixes pixel scales between already-loaded and newly loaded sprites.
+    fn get(&mut self, name: &str) -> Option<(&codec::tga::TgaImage, u32)> {
         let key = name.to_ascii_lowercase();
         if !self.cache.contains_key(&key) {
-            let img = codec::image::decode_art_file(&self.dir.join(&key)).ok()?;
+            let path = self.dir.join(&key);
+            let img = codec::image::decode_art_file(&path).ok()?;
+            let art_scale = codec::image::source_art_scale(&path)
+                .min(render_art_scale())
+                .max(1);
             if self.cache.len() >= self.cache_limit {
                 if let Some(old) = self.cache.keys().next().cloned() {
                     self.cache.remove(&old);
                 }
             }
-            self.cache.insert(key.clone(), img);
+            self.cache.insert(key.clone(), (img, art_scale));
         }
-        self.cache.get(&key)
+        self.cache.get(&key).map(|(img, scale)| (&*img, *scale))
     }
 
     /// Resolve `(char, series, variant)` to a real sprite file name.
@@ -3499,11 +3542,19 @@ impl SpriteBank {
 }
 
 /// A character currently on screen.
+struct LoadedAsset {
+    img: codec::tga::TgaImage,
+    /// Effective scale of the decoded pixels relative to 1280x720 layout
+    /// coordinates. UI assets have already been normalized and use 1.
+    art_scale: u32,
+}
+
 struct ActiveSprite {
     char_id: u32,
     #[allow(dead_code)]
     name: String,
     img: codec::tga::TgaImage,
+    art_scale: u32,
 }
 
 /// An ACT176 plate (item, effect, or a layer of a composite CG).
@@ -3511,6 +3562,7 @@ struct Plate {
     slot: u32,
     name: String,
     img: codec::tga::TgaImage,
+    art_scale: u32,
 }
 
 /// How the message window and the scene behind it are drawn this frame.
@@ -3701,13 +3753,13 @@ fn note_seen(set: &mut std::collections::HashSet<String>, scene: &str, text: &st
     }
 }
 
-fn place_overlays<'a>(plates: &'a [Plate], w: u32, h: u32, art_scale: u32) -> Vec<(&'a codec::tga::TgaImage, i32, i32)> {
-    let art_scale = art_scale.max(1);
+fn place_overlays<'a>(plates: &'a [Plate], w: u32, h: u32) -> Vec<(&'a codec::tga::TgaImage, i32, i32, u32)> {
     plates
         .iter()
         .map(|p| {
-            let logical_w = (p.img.width / art_scale).max(1);
-            let logical_h = (p.img.height / art_scale).max(1);
+            let scale = p.art_scale.max(1);
+            let logical_w = (p.img.width / scale).max(1);
+            let logical_h = (p.img.height / scale).max(1);
             let (x, y) = if logical_w >= 1100 || logical_h >= 600 {
                 (0, 0)
             } else {
@@ -3716,7 +3768,7 @@ fn place_overlays<'a>(plates: &'a [Plate], w: u32, h: u32, art_scale: u32) -> Ve
                     (h as i32 - logical_h as i32) / 2,
                 )
             };
-            (&p.img, x, y)
+            (&p.img, x, y, scale)
         })
         .collect()
 }
@@ -3756,11 +3808,10 @@ fn draw_scene(
     // Vector font for the dialogue, or None to keep the bitmap atlas.
     vf: Option<&mut render::text::VectorFont>,
 ) -> render::Surface {
-    let art_scale = render_art_scale();
     // The Japanese bitmap atlas still belongs to the 1280x720 compositor. The
     // Chinese path uses vector text and can composite high-res art directly at
     // the window size without stretching the bitmap glyphs.
-    let hires = art_scale > 1 && vf.is_some();
+    let hires = vf.is_some() && (out_w > render::LAYOUT_W || out_h > render::LAYOUT_H);
     // Dim the listeners only when the speaker is actually standing there.
     // 春希 speaks thousands of times and is placed twice in the whole game:
     // he is the camera, and the person on screen is who he is talking to.
@@ -3779,8 +3830,9 @@ fn draw_scene(
             } else {
                 255
             };
-            let logical_w = (s.img.width / art_scale.max(1)).max(1);
-            let logical_h = (s.img.height / art_scale.max(1)).max(1);
+            let sprite_scale = s.art_scale.max(1);
+            let logical_w = (s.img.width / sprite_scale).max(1);
+            let logical_h = (s.img.height / sprite_scale).max(1);
             Some(render::SpriteDraw {
                 img: &s.img,
                 logical_w,
@@ -3791,7 +3843,7 @@ fn draw_scene(
             })
         })
         .collect();
-    let overlays = place_overlays(plates, render::LAYOUT_W, render::LAYOUT_H, art_scale);
+    let overlays = place_overlays(plates, render::LAYOUT_W, render::LAYOUT_H);
     // With a vector font the text is drawn after the frame is scaled, so the
     // atlas path hands the text to the compositor and the vector path does not.
     let render_w = if hires { out_w } else { render::LAYOUT_W };
@@ -3810,7 +3862,6 @@ fn draw_scene(
         look.alpha,
         look.shade,
         &overlays,
-        if hires { art_scale } else { 1 },
     );
     match vf {
         Some(vf) => {
@@ -4711,7 +4762,6 @@ fn run_title(
     script_dir: &std::path::Path,
     cn: bool,
 ) -> TitleAction {
-    set_render_art_scale(win);
     const W: u32 = 1280;
     const H: u32 = 720;
     const ITEM_W: i32 = 320;
@@ -4759,6 +4809,7 @@ fn run_title(
     // 「画面模式」 applies as soon as the option screen is left.
     let startup = menu::Settings::load();
     win.set_fullscreen(startup.win_disp == 1);
+    set_render_art_scale(win);
     let mixer = audio::Mixer::new(win);
     if let Some(ref mx) = mixer {
         menu::apply(&startup, Some(mx));
@@ -4969,6 +5020,7 @@ fn run_title(
                     menu::apply(&st, None);
                     menu::run(win, bg_dirs, &mut st, None);
                     win.set_fullscreen(st.win_disp == 1);
+                    set_render_art_scale(win);
                     notice = None;
                 }
                 3 => match run_special(
