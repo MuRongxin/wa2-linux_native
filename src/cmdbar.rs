@@ -86,7 +86,7 @@ fn load_img(dirs: &[&Path], name: &str) -> Option<TgaImage> {
     for dir in dirs {
         for cand in crate::codec::image::candidate_names(name) {
             let p = dir.join(cand);
-            if let Ok(img) = crate::codec::image::decode_file(&p) {
+            if let Ok(img) = crate::codec::image::decode_ui_file(&p) {
                 return Some(img);
             }
         }

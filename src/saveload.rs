@@ -70,7 +70,7 @@ struct Assets {
 fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
     for dir in dirs {
         for cand in crate::codec::image::candidate_names(name) {
-            if let Ok(img) = crate::codec::image::decode_file(&dir.join(cand)) {
+            if let Ok(img) = crate::codec::image::decode_ui_file(&dir.join(cand)) {
                 return Some(img);
             }
         }

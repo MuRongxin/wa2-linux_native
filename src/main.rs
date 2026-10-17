@@ -398,6 +398,8 @@ fn main() {
                 cn: is_cn_script(&script_dir),
                 bg_dir: bg_dir.clone(),
                 bg_cn: None,
+                bg_cn_original: None,
+                bg_original: None,
                 sprite_dir: find_sprite_dir(&bg_dir, &script_dir),
                 movie_dir: bg_dir.join("..").join("mv"),
                 voice_dir,
@@ -426,6 +428,8 @@ fn main() {
                     cn: is_cn_script(&script_dir),
                     bg_dir: bg_dir.clone(),
                     bg_cn: None,
+                    bg_cn_original: None,
+                    bg_original: None,
                     sprite_dir: find_sprite_dir(&bg_dir, &script_dir),
                     movie_dir: bg_dir.join("..").join("mv"),
                     voice_dir: None,
@@ -621,6 +625,23 @@ fn event_cg_name(id: i64, variant: u32) -> String {
     format!("v{:06}.tga", id * 10 + variant as i64)
 }
 
+fn render_art_scale() -> u32 {
+    std::env::var("WA2_RENDER_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&v| matches!(v, 1 | 2 | 4 | 8))
+        .unwrap_or(1)
+}
+
+fn set_render_art_scale(win: &sdl2::Sdl) {
+    let (w, h) = win.window_size();
+    let need = ((w.max(1280) + 1279) / 1280)
+        .max((h.max(720) + 719) / 720) as u32;
+    let scale = if need <= 1 { 1 } else if need <= 2 { 2 } else if need <= 4 { 4 } else { 8 };
+    std::env::set_var("WA2_RENDER_SCALE", scale.to_string());
+    eprintln!("art: render scale={} for window {}x{}", scale, w, h);
+}
+
 fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::TgaImage> {
     // Build candidate names: exact, then with suffixes stripped.
     let mut candidates = vec![name.to_string()];
@@ -640,7 +661,13 @@ fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::
     for dir in dirs {
         for cand in &candidates {
             let p = dir.join(cand);
-            if let Ok(img) = codec::image::decode_file(&p) {
+            let ui_asset = lower.starts_with("sys_") || lower.starts_with('t') || lower == "weather.tga";
+            let decoded = if ui_asset {
+                codec::image::decode_ui_file(&p)
+            } else {
+                codec::image::decode_art_file(&p)
+            };
+            if let Ok(img) = decoded {
                 return Some(img);
             }
             // Older data trees were extracted with the archive's raw CP932
@@ -657,7 +684,13 @@ fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::
                         if codec::sjis::decode(raw.as_bytes())
                             .eq_ignore_ascii_case(cand)
                         {
-                            if let Ok(img) = codec::image::decode_file(&entry.path()) {
+                            let ui_asset = lower.starts_with("sys_") || lower.starts_with('t') || lower == "weather.tga";
+                            let decoded = if ui_asset {
+                                codec::image::decode_ui_file(&entry.path())
+                            } else {
+                                codec::image::decode_art_file(&entry.path())
+                            };
+                            if let Ok(img) = decoded {
                                 return Some(img);
                             }
                         }
@@ -882,6 +915,12 @@ struct Session {
     /// `grp/` directory, which win over the same-named files inside `grp.pak`.
     /// Consulted before `bg_dir`; `None` in Japanese mode.
     bg_cn: Option<std::path::PathBuf>,
+    /// Original Chinese UI tree used as a per-file fallback while the
+    /// optional high-resolution sibling is still being generated.
+    bg_cn_original: Option<std::path::PathBuf>,
+    /// Original background tree used when the selected high-resolution file
+    /// is not present yet.
+    bg_original: Option<std::path::PathBuf>,
     /// Loose `*.tga` character sprites, or `None` to disable sprites.
     sprite_dir: Option<std::path::PathBuf>,
     /// Movies as plain `*.wmv` / `*.asf` files.
@@ -894,16 +933,28 @@ struct Session {
 
 impl Session {
     fn from_data(d: &data::Data, bgm: Option<String>) -> Session {
+        let bg_dir = d.bg();
+        let bg_original = d.root.join("bg");
+        let bg_cn = if d.cn { Some(d.bg_cn()) } else { None };
+        let bg_cn_original = if d.cn { Some(d.root.join("bg_cn")) } else { None };
+        let mut index_dirs = Vec::new();
+        if let Some(ref p) = bg_cn { index_dirs.push(p.as_path()); }
+        if let Some(ref p) = bg_cn_original { index_dirs.push(p.as_path()); }
+        index_dirs.push(bg_dir.as_path());
+        index_dirs.push(bg_original.as_path());
+        let bg_index = BgIndex::build(&index_dirs);
         Session {
             script_dir: d.script(),
             cn: d.cn,
-            bg_dir: d.bg(),
-            bg_cn: if d.cn { Some(d.bg_cn()) } else { None },
+            bg_dir,
+            bg_cn,
+            bg_cn_original,
+            bg_original: Some(bg_original),
             sprite_dir: Some(d.sprite()),
             movie_dir: d.movie(),
             voice_dir: Some(d.voice()),
             bgm,
-            bg_index: BgIndex::build(&[&d.bg()]),
+            bg_index,
         }
     }
 
@@ -913,7 +964,13 @@ impl Session {
         if let Some(cn) = self.bg_cn.as_deref() {
             v.push(cn);
         }
+        if let Some(cn) = self.bg_cn_original.as_deref() {
+            v.push(cn);
+        }
         v.push(self.bg_dir.as_path());
+        if let Some(original) = self.bg_original.as_deref() {
+            v.push(original);
+        }
         v
     }
 }
@@ -963,6 +1020,7 @@ fn run_game_at(
     resume: Option<save::SaveState>,
     start_id: &str,
 ) -> Result<Option<save::SaveState>, String> {
+    set_render_art_scale(win);
     let mut resume = resume;
     let script_dir = s.script_dir.as_path();
     let bg_dir = s.bg_dir.as_path();
@@ -3333,6 +3391,9 @@ struct SpriteBank {
     /// lowercased file names present in the directory
     index: std::collections::HashSet<String>,
     cache: std::collections::HashMap<String, codec::tga::TgaImage>,
+    /// High-resolution sprites are large after WebP decode. Do not retain the
+    /// entire 1,600-file library in RAM as the story advances.
+    cache_limit: usize,
 }
 
 impl SpriteBank {
@@ -3354,13 +3415,26 @@ impl SpriteBank {
             dir,
             index,
             cache: Default::default(),
+            // Decoded sprites are 4x larger per art-scale step; keep the cache
+            // small enough that the working set stays in the tens of MB.
+            cache_limit: match std::env::var("WA2_RENDER_SCALE").ok().as_deref() {
+                Some("8") => 8,
+                Some("4") => 16,
+                Some("2") => 24,
+                _ => 64,
+            },
         }
     }
 
     fn get(&mut self, name: &str) -> Option<&codec::tga::TgaImage> {
         let key = name.to_ascii_lowercase();
         if !self.cache.contains_key(&key) {
-            let img = codec::image::decode_file(&self.dir.join(&key)).ok()?;
+            let img = codec::image::decode_art_file(&self.dir.join(&key)).ok()?;
+            if self.cache.len() >= self.cache_limit {
+                if let Some(old) = self.cache.keys().next().cloned() {
+                    self.cache.remove(&old);
+                }
+            }
             self.cache.insert(key.clone(), img);
         }
         self.cache.get(&key)
@@ -3682,11 +3756,7 @@ fn draw_scene(
     // Vector font for the dialogue, or None to keep the bitmap atlas.
     vf: Option<&mut render::text::VectorFont>,
 ) -> render::Surface {
-    let art_scale = std::env::var("WA2_ART_SCALE")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&v| matches!(v, 2 | 4 | 8))
-        .unwrap_or(1);
+    let art_scale = render_art_scale();
     // The Japanese bitmap atlas still belongs to the 1280x720 compositor. The
     // Chinese path uses vector text and can composite high-res art directly at
     // the window size without stretching the bitmap glyphs.
@@ -3925,9 +3995,49 @@ fn browse_cg(win: &mut sdl2::Sdl, font: &render::Font, dirs: &[&std::path::Path]
 enum SpecialPick {
     Replay,
     Cg,
+    Music,
     /// An entry the original lists but this build does not open yet.
     Notice,
     Back,
+}
+
+fn crop_image(
+    image: &codec::tga::TgaImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Option<codec::tga::TgaImage> {
+    if x >= image.width || y >= image.height {
+        return None;
+    }
+    let w = w.min(image.width - x);
+    let h = h.min(image.height - y);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for row in 0..h as usize {
+        let src = ((y as usize + row) * image.width as usize + x as usize) * 4;
+        let dst = row * w as usize * 4;
+        rgba[dst..dst + w as usize * 4]
+            .copy_from_slice(&image.rgba[src..src + w as usize * 4]);
+    }
+    Some(codec::tga::TgaImage { width: w, height: h, rgba })
+}
+
+fn load_ui_asset(
+    dirs: &[&std::path::Path],
+    name: &str,
+    expected_w: u32,
+    expected_h: u32,
+) -> Option<codec::tga::TgaImage> {
+    for dir in dirs {
+        let path = dir.join(name);
+        if let Ok(img) = codec::image::decode_ui_file(&path) {
+            if img.width == expected_w && img.height == expected_h {
+                return Some(img);
+            }
+        }
+    }
+    None
 }
 
 /// Rasterize menu labels once. Each line is the system CJK font, white on
@@ -4211,6 +4321,7 @@ fn run_special(
     let pick = |sel: usize| match ROWS[sel] {
         10 => SpecialPick::Cg,
         11 => SpecialPick::Replay,
+        12 => SpecialPick::Music,
         8 => SpecialPick::Back,
         _ => SpecialPick::Notice,
     };
@@ -4300,6 +4411,164 @@ fn run_special(
         draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
         win.present(&frame);
         win.delay(16);
+    }
+}
+
+/// Music mode.  BGM files are indexed by track number; `_A` is preferred
+/// when both internal variants are present because it is the normal in-game
+/// stream.  The player keeps one looping stream alive and never decodes the
+/// whole library up front.
+fn run_music(
+    win: &mut sdl2::Sdl,
+    bg_dirs: &[&std::path::Path],
+    bgm_dir: &std::path::Path,
+    cn: bool,
+    mixer: Option<&audio::Mixer>,
+    cursor: Option<&std::path::Path>,
+) {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let mut choices: std::collections::BTreeMap<i32, (u8, std::path::PathBuf)> =
+        std::collections::BTreeMap::new();
+    if let Ok(rd) = std::fs::read_dir(bgm_dir) {
+        for ent in rd.flatten() {
+            let path = ent.path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let low = stem.to_ascii_lowercase();
+            let Some(rest) = low.strip_prefix("bgm_") else { continue };
+            let number = rest.split('_').next().and_then(|s| s.parse::<i32>().ok());
+            let Some(number) = number else { continue };
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if !ext.eq_ignore_ascii_case("ogg") { continue; }
+            let rank = if low.ends_with("_a") { 0 } else if low.ends_with("_b") { 2 } else { 1 };
+            if choices.get(&number).map(|(old, _)| rank < *old).unwrap_or(true) {
+                choices.insert(number, (rank, path));
+            }
+        }
+    }
+    let tracks: Vec<(i32, std::path::PathBuf)> = choices.into_iter().map(|(id, (_, p))| (id, p)).collect();
+    let header = load_ui_asset(bg_dirs, "sys_04000.tga", 1280, 40);
+    let logo = load_ui_asset(bg_dirs, "sys_04010.tga", 304, 168);
+    let footer = load_ui_asset(bg_dirs, "sys_04021.tga", 288, 40);
+    let info_bar = load_ui_asset(bg_dirs, "sys_04030.tga", 1024, 56);
+    let select_sheet = load_ui_asset(bg_dirs, "sys_04100.tga", 400, 128);
+    let name_sheet = load_ui_asset(bg_dirs, "sys_04101.tga", 344, 1512);
+    let backdrop = load_background(bg_dirs, "T0000.tga")
+        .map(|img| surface_from_tga(&img).scaled_to(W, H));
+    let mut selected = 0usize;
+    let mut playing: Option<(i32, usize)> = None;
+    let mut notice = String::new();
+    let labels: Vec<Option<codec::tga::TgaImage>> = tracks.iter().enumerate().map(|(i, _)| {
+        name_sheet.as_ref().and_then(|sheet| crop_image(sheet, 0, (i as u32 * 24).min(sheet.height.saturating_sub(24)), 344, 24))
+    }).collect();
+    eprintln!("music: indexed {} tracks from {}", tracks.len(), bgm_dir.display());
+
+    loop {
+        match win.poll_input() {
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => break,
+            sdl2::Input::Up => {
+                if !tracks.is_empty() {
+                    selected = (selected + tracks.len() - 1) % tracks.len();
+                    play_cursor(mixer, cursor);
+                }
+            }
+            sdl2::Input::Down => {
+                if !tracks.is_empty() {
+                    selected = (selected + 1) % tracks.len();
+                    play_cursor(mixer, cursor);
+                }
+            }
+            sdl2::Input::Advance | sdl2::Input::Choice(_) => {
+                if let Some((id, path)) = tracks.get(selected) {
+                    if let Some(mx) = mixer {
+                        if let Some((_, slot)) = playing.take() { mx.stop(slot); }
+                        let slot = mx.play_cat(&path.to_string_lossy(), 1.0, true, audio::mixer::CAT_BGM);
+                        if slot != usize::MAX {
+                            playing = Some((*id, slot));
+                            notice = format!("{}  {}", if cn { "正在播放" } else { "Playing" }, id);
+                            eprintln!("music: playing {} -> {}", id, path.display());
+                        } else {
+                            notice = if cn { "无法播放此曲目".into() } else { "Unable to play track".into() };
+                        }
+                    } else {
+                        notice = if cn { "音频设备不可用".into() } else { "Audio unavailable".into() };
+                    }
+                }
+            }
+            sdl2::Input::Pointer { x, y, pressed } => {
+                let (sx, sy) = win.surface_pos(x, y, W, H);
+                if (94..510).contains(&sy) {
+                    let col = ((sx - 42) / 400) as usize;
+                    let row = ((sy - 94) / 32) as usize;
+                    if col < 3 && row < 13 {
+                        let index = (selected / 39) * 39 + col * 13 + row;
+                        if index < tracks.len() {
+                            if selected != index {
+                                selected = index;
+                                play_cursor(mixer, cursor);
+                            }
+                            if pressed {
+                                if let Some(mx) = mixer {
+                                if let Some((_, slot)) = playing.take() { mx.stop(slot); }
+                                let (id, path) = &tracks[selected];
+                                let slot = mx.play_cat(&path.to_string_lossy(), 1.0, true, audio::mixer::CAT_BGM);
+                                if slot != usize::MAX {
+                                    playing = Some((*id, slot));
+                                    notice = format!("{}  {}", if cn { "正在播放" } else { "Playing" }, id);
+                                    eprintln!("music: playing {} -> {}", id, path.display());
+                                }
+                            }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let page_size = 39usize;
+        let top = (selected / page_size) * page_size;
+        let mut frame = backdrop.as_ref().map(clone_surf)
+            .unwrap_or_else(|| render::Surface::new(W, H, [9, 31, 43, 255]));
+        if let Some(h) = header.as_ref() { frame.blit(h, 0, 0); }
+        if let Some(l) = logo.as_ref() { frame.blit(l, 42, 48); }
+        for (row, i) in (top..(top + page_size).min(tracks.len())).enumerate() {
+            let col = row / 13;
+            let line = row % 13;
+            let x = 42 + col as i32 * 400;
+            let y = 94 + line as i32 * 32;
+            if let Some(sheet) = select_sheet.as_ref() {
+                let sy = if i == selected { 64 } else { 32 };
+                if let Some(mark) = crop_image(sheet, 0, sy, 400, 32) {
+                    frame.blit(&mark, x, y);
+                }
+            }
+            if let Some(name) = labels[i].as_ref() {
+                frame.blit(name, x + 46, y + 4);
+            } else {
+                let fallback = format!("BGM_{:03}", tracks[i].0);
+                if let Some((w, h, rgba)) = render::text::with_ui_font(22, |f| f.line_rgba(&fallback, 22)).flatten() {
+                    frame.blit_rgba(&rgba, w, h, x + 46, y + 4);
+                }
+            }
+        }
+        if tracks.is_empty() {
+            notice = if cn { "未找到 BGM 文件".into() } else { "No BGM files".into() };
+        }
+        if !notice.is_empty() {
+            if let Some((w, h, rgba)) = render::text::with_ui_font(20, |f| f.line_rgba(&notice, 20)).flatten() {
+                frame.blit_rgba(&rgba, w, h, 440, 610);
+            }
+        }
+        if let Some(bar) = info_bar.as_ref() { frame.blit(bar, 128, 532); }
+        if let Some(name) = labels.get(selected).and_then(|x| x.as_ref()) {
+            frame.blit(name, 165, 560);
+        }
+        if let Some(f) = footer.as_ref() { frame.blit(f, 496, 620); }
+        win.present(&frame);
+        win.delay(16);
+    }
+    if let Some((_, slot)) = playing {
+        if let Some(mx) = mixer { mx.stop(slot); }
     }
 }
 
@@ -4442,6 +4711,7 @@ fn run_title(
     script_dir: &std::path::Path,
     cn: bool,
 ) -> TitleAction {
+    set_render_art_scale(win);
     const W: u32 = 1280;
     const H: u32 = 720;
     const ITEM_W: i32 = 320;
@@ -4701,7 +4971,13 @@ fn run_title(
                     win.set_fullscreen(st.win_disp == 1);
                     notice = None;
                 }
-                3 => match run_special(win, bg_dirs, cn, mixer.as_ref(), cursor.as_deref()) {
+                3 => match run_special(
+                    win,
+                    bg_dirs,
+                    cn,
+                    mixer.as_ref(),
+                    cursor.as_deref(),
+                ) {
                     SpecialPick::Replay => {
                         if let Some(id) = timeline::run(win, font, bg_dirs, script_dir) {
                             return TitleAction::Jump(id);
@@ -4716,6 +4992,11 @@ fn run_title(
                             browse_cg(win, font, bg_dirs, &names);
                             notice = None;
                         }
+                    }
+                    SpecialPick::Music => {
+                        let bgm_dir = script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
+                        run_music(win, bg_dirs, &bgm_dir, cn, mixer.as_ref(), cursor.as_deref());
+                        notice = None;
                     }
                     SpecialPick::Back => notice = None,
                     SpecialPick::Notice => notice = Some(notice_text),

@@ -695,15 +695,20 @@ pub fn render_scene_ex_art(
     // Without those assets, fall back to the flat plate the tools use.
     if plate.is_some() {
         if let Some(pl) = plate {
-            let pw = (pl.width / art_scale).max(1) * w / LAYOUT_W;
-            let ph = (pl.height / art_scale).max(1) * h / LAYOUT_H;
+            // Scaled sibling trees keep every asset at art_scale x logical size.
+            // UI loaders may already have normalized a high-resolution sheet
+            // to logical dimensions; do not divide that image a second time.
+            let scale = if pl.width > 2000 { art_scale } else { 1 };
+            let pw = (pl.width / scale).max(1) * w / LAYOUT_W;
+            let ph = (pl.height / scale).max(1) * h / LAYOUT_H;
             let px = WINDOW_X.max(0) as u32 * w / LAYOUT_W;
             let py = WINDOW_Y.max(0) as u32 * h / LAYOUT_H;
             s.blit_region_scaled(pl, 0, 0, pl.width, pl.height, px as i32, py as i32, pw.max(1), ph.max(1), window_alpha);
         }
         if let Some(fr) = frame {
-            let fw = (fr.width / art_scale).max(1) * w / LAYOUT_W;
-            let fh = (fr.height / art_scale).max(1) * h / LAYOUT_H;
+            let scale = if fr.width > 2000 { art_scale } else { 1 };
+            let fw = (fr.width / scale).max(1) * w / LAYOUT_W;
+            let fh = (fr.height / scale).max(1) * h / LAYOUT_H;
             let fx = WINDOW_X.max(0) as u32 * w / LAYOUT_W;
             let fy = WINDOW_Y.max(0) as u32 * h / LAYOUT_H;
             s.blit_region_scaled(fr, 0, 0, fr.width, fr.height, fx as i32, fy as i32, fw.max(1), fh.max(1), window_alpha);

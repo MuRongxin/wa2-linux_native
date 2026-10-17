@@ -779,7 +779,12 @@ fn resolve(index: &PictureIndex, shot: (bool, i64, i32)) -> Option<PathBuf> {
                 u8::from(pic.variant != variant),
                 // The shipped background wins over a CG that reuses the number.
                 u8::from(!cg && !pic.background),
-                u8::from(!pic.thumb),
+                // Prefer the full event CG when it exists.  The original
+                // engine used `tv*` thumbnails to avoid loading large art,
+                // but this renderer can downscale the full image while
+                // keeping only the preview in memory.  Keep `tv*` as a
+                // fallback for assets that have no corresponding full file.
+                u8::from(pic.thumb),
                 u8::from(pic.variant != 0),
                 pic.variant,
             )
@@ -1244,12 +1249,12 @@ mod tests {
                 .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
                 .unwrap_or_default()
         };
-        assert_eq!(file((false, 1001, 0)), "tv100100.tga");
+        assert_eq!(file((false, 1001, 0)), "v100100.tga");
         assert_eq!(file((false, 1055, 0)), "b105503.tga");
-        assert_eq!(file((true, 10030, 0)), "tv100300.tga");
+        assert_eq!(file((true, 10030, 0)), "v100300.tga");
         // b101700 is the room. tv101700 is the event CG that shares the number.
         assert_eq!(file((false, 1017, 0)), "b101700.tga");
-        assert_eq!(file((true, 10170, 0)), "tv101700.tga");
+        assert_eq!(file((true, 10170, 0)), "v101700.tga");
         assert_ne!(name("3211").as_deref(), Some("tv101700.tga"));
     }
 

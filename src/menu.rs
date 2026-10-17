@@ -528,7 +528,7 @@ fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
     for dir in dirs {
         for cand in crate::codec::image::candidate_names(name) {
             let p = dir.join(&cand);
-            if let Ok(img) = crate::codec::image::decode_file(&p) {
+            if let Ok(img) = crate::codec::image::decode_ui_file(&p) {
                     return Some(img);
             }
         }
@@ -539,7 +539,7 @@ fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
             for e in rd.flatten() {
                 if let Ok(n) = e.file_name().into_string() {
                     if wants.iter().any(|w| n.to_ascii_lowercase() == *w) {
-                        if let Ok(img) = crate::codec::image::decode_file(&e.path()) {
+                        if let Ok(img) = crate::codec::image::decode_ui_file(&e.path()) {
                             return Some(img);
                         }
                     }
