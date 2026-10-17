@@ -15,19 +15,9 @@
 /data/bg_cn_2x
 
 # Game content as loose files. Built once from the user's own copy of the game
-# by tools/build_data_tree.py -- never commit (huge + copyrighted).
-/data/bg
-/data/sprite
-/data/bg_cn
-/data/script
-/data/script_cn
-/data/voice
-/data/bgm
-/data/se
-/data/movie
-/data/font
-/data/save
-
+# by tools/build_data_tree.py. The asset trees are tracked on purpose in this
+# private repository (the 8x WebP trees are the source of truth); derived
+# caches and proxy trees above stay out of it.
 
 # Intermediate numpy/rasterizer artifacts from tools/ experiments.
 *.npy
