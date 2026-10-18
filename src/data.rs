@@ -133,6 +133,16 @@ impl Data {
         self.sub("bgm")
     }
     pub fn movie(&self) -> PathBuf {
+        // Video remasters live in their own sibling tree (currently
+        // `movie_2x/` for the 1440p pass).  Videos are always played at their
+        // own resolution, so prefer the highest available video tree
+        // regardless of `WA2_ART_SCALE`, then fall back to the original files.
+        for scale in [8u32, 4, 2] {
+            let candidate = self.root.join(format!("movie_{}x", scale));
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
         self.sub("movie")
     }
 
@@ -159,5 +169,54 @@ impl Data {
     /// Path of the `char.pak`-era legacy layout, if the caller still passed one.
     pub fn from_explicit(root: &Path) -> Data {
         Data { root: root.to_path_buf(), cn: false, art_scale: 1 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wa2-data-{}-{}", tag, std::process::id()))
+    }
+
+    #[test]
+    fn movie_uses_scaled_sibling_when_present() {
+        let root = temp_root("movie-scaled");
+        std::fs::create_dir_all(root.join("movie_8x")).unwrap();
+        let data = Data { root: root.clone(), cn: false, art_scale: 8 };
+        assert_eq!(data.movie(), root.join("movie_8x"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn movie_prefers_video_remaster_over_art_scale() {
+        let root = temp_root("movie-remaster");
+        std::fs::create_dir_all(root.join("movie_2x")).unwrap();
+        std::fs::create_dir_all(root.join("movie")).unwrap();
+        // Even with WA2_ART_SCALE=1 the video remaster must win: videos carry
+        // their own resolution and are not downsampled by the render scale.
+        let data = Data { root: root.clone(), cn: false, art_scale: 1 };
+        assert_eq!(data.movie(), root.join("movie_2x"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn movie_prefers_highest_video_tree() {
+        let root = temp_root("movie-highest");
+        std::fs::create_dir_all(root.join("movie_2x")).unwrap();
+        std::fs::create_dir_all(root.join("movie_8x")).unwrap();
+        let data = Data { root: root.clone(), cn: false, art_scale: 8 };
+        assert_eq!(data.movie(), root.join("movie_8x"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn movie_falls_back_to_original_tree() {
+        let root = temp_root("movie-original");
+        std::fs::create_dir_all(root.join("movie")).unwrap();
+        let data = Data { root: root.clone(), cn: false, art_scale: 8 };
+        assert_eq!(data.movie(), root.join("movie"));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

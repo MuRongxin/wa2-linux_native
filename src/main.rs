@@ -668,7 +668,15 @@ fn load_background_asset(dirs: &[&std::path::Path], name: &str) -> Option<Loaded
         }
     }
     // Each sibling tree keeps the same stem but may use WebP after upscale.
-    let base = name.trim_end_matches(".tga").trim_end_matches(".TGA").trim_end_matches(".webp").trim_end_matches(".WEBP");
+    // `.bmp` sources (backgrounds extracted from the archive) keep the same
+    // stem in the WebP trees as well.
+    let base = name
+        .trim_end_matches(".tga")
+        .trim_end_matches(".TGA")
+        .trim_end_matches(".webp")
+        .trim_end_matches(".WEBP")
+        .trim_end_matches(".bmp")
+        .trim_end_matches(".BMP");
     candidates.push(format!("{}.webp", base));
     candidates.push(format!("{}.WEBP", base));
     candidates.push(format!("{}.tga", base));
@@ -1221,7 +1229,7 @@ fn run_game_at(
                 None => continue,
             };
             if let Some(bank) = bank.as_mut() {
-                if let Some((img, art_scale)) = bank.get(name).map(|(img, scale)| (img.clone(), scale)) {
+                if let Some((img, art_scale)) = bank.get(name) {
                     slots[i] = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img, art_scale });
                 }
             }
@@ -1473,7 +1481,7 @@ fn run_game_at(
                     let mut changed = false;
                     if let Some(bank) = bank.as_mut() {
                         if let Some(name) = bank.resolve(char_id, series, variant) {
-                            if let Some((img, art_scale)) = bank.get(&name).map(|(img, scale)| (img.clone(), scale)) {
+                            if let Some((img, art_scale)) = bank.get(&name) {
                                 let idx = slot as usize;
                                 // One character occupies one slot. Moving them
                                 // (雪菜 from 2 to 1, and so on) has to clear
@@ -2735,7 +2743,7 @@ fn rewind_step(
         for (i, entry) in dest.slots.iter().enumerate() {
             let Some((char_id, name)) = entry else { continue };
             if let Some(bank) = bank.as_mut() {
-                let Some((img, art_scale)) = bank.get(name).map(|(img, scale)| (img.clone(), scale)) else {
+                let Some((img, art_scale)) = bank.get(name) else {
                     continue;
                 };
                 if let Some(dst) = slots.get_mut(i) {
@@ -3426,7 +3434,7 @@ struct SpriteBank {
     /// lowercased file names present in the directory
     index: std::collections::HashSet<String>,
     /// file name -> (decoded pixels, scale represented by those pixels)
-    cache: std::collections::HashMap<String, (codec::tga::TgaImage, u32)>,
+    cache: std::collections::HashMap<String, (std::sync::Arc<codec::tga::TgaImage>, u32)>,
     /// High-resolution sprites are large after WebP decode. Do not retain the
     /// entire 1,600-file library in RAM as the story advances.
     cache_limit: usize,
@@ -3465,7 +3473,7 @@ impl SpriteBank {
     /// Returns the decoded pixels and the art scale they represent. A cached
     /// image keeps the scale it was decoded with, so resizing the window never
     /// mixes pixel scales between already-loaded and newly loaded sprites.
-    fn get(&mut self, name: &str) -> Option<(&codec::tga::TgaImage, u32)> {
+    fn get(&mut self, name: &str) -> Option<(std::sync::Arc<codec::tga::TgaImage>, u32)> {
         let key = name.to_ascii_lowercase();
         if !self.cache.contains_key(&key) {
             let path = self.dir.join(&key);
@@ -3478,9 +3486,9 @@ impl SpriteBank {
                     self.cache.remove(&old);
                 }
             }
-            self.cache.insert(key.clone(), (img, art_scale));
+            self.cache.insert(key.clone(), (std::sync::Arc::new(img), art_scale));
         }
-        self.cache.get(&key).map(|(img, scale)| (&*img, *scale))
+        self.cache.get(&key).map(|(img, scale)| (std::sync::Arc::clone(img), *scale))
     }
 
     /// Resolve `(char, series, variant)` to a real sprite file name.
@@ -3553,7 +3561,7 @@ struct ActiveSprite {
     char_id: u32,
     #[allow(dead_code)]
     name: String,
-    img: codec::tga::TgaImage,
+    img: std::sync::Arc<codec::tga::TgaImage>,
     art_scale: u32,
 }
 

@@ -149,7 +149,9 @@ pub fn candidate_names(name: &str) -> Vec<String> {
         .trim_end_matches(".tga")
         .trim_end_matches(".TGA")
         .trim_end_matches(".webp")
-        .trim_end_matches(".WEBP");
+        .trim_end_matches(".WEBP")
+        .trim_end_matches(".bmp")
+        .trim_end_matches(".BMP");
     vec![
         format!("{}.webp", base),
         format!("{}.WEBP", base),
