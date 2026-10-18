@@ -107,7 +107,8 @@ def main() -> int:
     parser.add_argument("--notes-file", default="")
     parser.add_argument("--dir", required=True, help="directory with manifest.json / SHA256SUMS / parts")
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN", ""))
-    parser.add_argument("--allow-public", action="store_true")
+    parser.add_argument("--allow-public", action="store_true",
+                        help="allow publishing on a public repository (copyright risk!)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--publish", action="store_true", help="publish the release after uploading")
     args = parser.parse_args()
@@ -132,10 +133,17 @@ def main() -> int:
 
     if not args.dry_run:
         repo_info = api("GET", f"/repos/{args.repo}", args.token)
-        if not repo_info.get("private") and not args.allow_public:
-            raise SystemExit(
-                "REFUSED: repository is public. Game assets are copyrighted and must not be "
-                "published publicly; make the repository private or pass --allow-public."
+        is_private = bool(repo_info.get("private"))
+        if not is_private:
+            # A draft release is NOT visible to the public, even in a public
+            # repository, so it is safe to upload assets into a draft and make
+            # the repository private before publishing.  Only the final
+            # --publish step needs the private repository (or an explicit
+            # override for the copyright risk).
+            print(
+                "WARNING: repository is public. Assets will be uploaded to a DRAFT "
+                "release (not publicly visible); publishing requires a private "
+                "repository unless --allow-public is passed."
             )
         release = get_release(args.repo, args.tag, args.token)
         if release is None:
@@ -155,6 +163,12 @@ def main() -> int:
                 continue
             upload_asset(args.repo, release["id"], path, args.token)
         if args.publish:
+            if not is_private and not args.allow_public:
+                raise SystemExit(
+                    "REFUSED to publish: repository is still public. Game assets are "
+                    "copyrighted; make the repository private first (the draft release "
+                    "with all uploaded assets is kept) or pass --allow-public."
+                )
             api("PATCH", f"/repos/{args.repo}/releases/{release['id']}", args.token, {"draft": False})
             print(f"published release {args.tag}")
         else:
