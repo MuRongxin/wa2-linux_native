@@ -192,16 +192,22 @@ impl Sdl {
         if window.is_null() {
             return None;
         }
-        // Prefer the software renderer: it blits via CPU into an SHM surface,
-        // which works under X11/Wayland uniformly and is capturable. Fall back
-        // to accelerated if software is unavailable.
-        let mut renderer = f_create_renderer(window, -1, SDL_RENDERER_SOFTWARE);
+        // The compositor already produces a full RGBA frame.  Uploading that
+        // frame through SDL's software renderer makes every 1080p/4K frame a
+        // second CPU-side copy.  Prefer the GPU path and keep software as a
+        // fallback for Xvfb/llvmpipe setups and for explicit headless tests.
+        let force_software = std::env::var_os("WA2_SOFTWARE").is_some();
+        let mut renderer = if force_software {
+            f_create_renderer(window, -1, SDL_RENDERER_SOFTWARE)
+        } else {
+            f_create_renderer(window, -1, SDL_RENDERER_ACCELERATED)
+        };
         if renderer.is_null() {
-            renderer = f_create_renderer(
-                window,
-                -1,
-                SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC,
-            );
+            renderer = if force_software {
+                f_create_renderer(window, -1, SDL_RENDERER_ACCELERATED)
+            } else {
+                f_create_renderer(window, -1, SDL_RENDERER_SOFTWARE)
+            };
         }
         if renderer.is_null() {
             return None;
@@ -237,6 +243,8 @@ impl Sdl {
 
     /// Upload `surf` pixels to the texture and present, scaled to the window.
     pub fn present(&mut self, surf: &Surface) {
+        Self::dump_frame(surf);
+        let t0 = if Self::timing() { Some(std::time::Instant::now()) } else { None };
         unsafe {
             if surf.width != self.tex_w || surf.height != self.tex_h {
                 (self.f_destroy_texture)(self.texture);
@@ -260,6 +268,38 @@ impl Sdl {
             (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), std::ptr::null());
             (self.f_render_present)(self.renderer);
         }
+        if let Some(t0) = t0 {
+            eprintln!(
+                "  [timing] present {}x{}: {:.1} ms",
+                surf.width,
+                surf.height,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    /// WA2_FRAME_DUMP=path writes every presented frame as a TGA.
+    ///
+    /// X11 screen grabbers are unreliable here (ffmpeg -f x11grab hangs and
+    /// import can come back empty), so the renderer exports its own frames.
+    fn dump_frame(surf: &Surface) {
+        static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        let Some(path) = PATH
+            .get_or_init(|| std::env::var_os("WA2_FRAME_DUMP").map(std::path::PathBuf::from))
+            .as_ref()
+        else {
+            return;
+        };
+        let tmp = path.with_extension("tga.tmp");
+        if surf.save_tga(&tmp.to_string_lossy()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    /// Whether scene-switch profiling is on (WA2_TIMING=1).
+    fn timing() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var_os("WA2_TIMING").is_some())
     }
 
     /// Upload a raw RGBA buffer (w*h*4 bytes) to the texture and present,

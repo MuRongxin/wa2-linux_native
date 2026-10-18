@@ -37,7 +37,8 @@ pub fn dir_art_scale(path: &Path) -> u32 {
     1
 }
 
-fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+/// Width and height straight from the file header - never decodes pixels.
+pub fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if ext == "tga" {
         let mut file = std::fs::File::open(path).ok()?;
@@ -127,6 +128,12 @@ fn ui_cache_path(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 pub fn decode_ui_file(path: &Path) -> Result<TgaImage, String> {
+    // Probing by decoding was expensive: a missing .webp candidate used to
+    // spawn dwebp and then ffmpeg before failing, which cost tens of ms per
+    // probe and dominated the startup cost of every UI sheet.
+    if !path.is_file() {
+        return Err(format!("missing {}", path.display()));
+    }
     if let Some(cache) = ui_cache_path(path) {
         if let Ok(img) = decode_file(&cache) {
             return Ok(img);
@@ -161,6 +168,9 @@ pub fn candidate_names(name: &str) -> Vec<String> {
 }
 
 pub fn decode_file(path: &Path) -> Result<TgaImage, String> {
+    if !path.is_file() {
+        return Err(format!("missing {}", path.display()));
+    }
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "tga" => {
@@ -172,17 +182,31 @@ pub fn decode_file(path: &Path) -> Result<TgaImage, String> {
     }
 }
 
+/// The scale a file is stored at, and the scale decode_art_file will decode it
+/// to for the current window. artcache keys every cache entry by the second
+/// value, so a window resize can never mix pixel scales.
+pub fn art_scales(path: &Path) -> (u32, u32) {
+    let source = source_art_scale(path);
+    // Unset means the window has not asked for a scale yet; the renderer lays
+    // art out on the 1280x720 grid, so 1x is the right default. Defaulting to
+    // the source scale made a 1280x720 window decode a whole 59 MP 8x WebP.
+    let requested = std::env::var("WA2_RENDER_SCALE")
+        .ok().and_then(|v| v.parse::<u32>().ok()).filter(|&v| v >= 1).unwrap_or(1);
+    (source, requested.min(source))
+}
+
 /// Decode an art asset from a scaled sibling tree at the resolution needed by
 /// the current window. The source file can remain 8x while the decoded pixel
-/// buffer is only 1x/2x/4x/8x according to `WA2_RENDER_SCALE`.
+/// buffer is only 1x/2x/4x/8x according to WA2_RENDER_SCALE.
+///
+/// Callers that can reuse decoded pixels should go through artcache::load
+/// instead: this is the slow path (a 59 MP lossless WebP costs a quarter of a
+/// second to over a second) and is only for cache misses.
 pub fn decode_art_file(path: &Path) -> Result<TgaImage, String> {
-    let source = source_art_scale(path);
+    let (source, target) = art_scales(path);
     if source <= 1 {
         return decode_file(path);
     }
-    let requested = std::env::var("WA2_RENDER_SCALE")
-        .ok().and_then(|v| v.parse::<u32>().ok()).filter(|&v| v >= 1).unwrap_or(source);
-    let target = requested.min(source);
     if target >= source {
         return decode_file(path);
     }

@@ -1,4 +1,5 @@
 mod archive;
+mod artcache;
 mod audio;
 mod codec;
 mod cmdbar;
@@ -381,7 +382,8 @@ fn main() {
                     d.describe(), start_id
                 );
                 let session = Session::from_data(&d, None);
-                if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
+                let mut rt = Runtime::new(&win, &session);
+                if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
                     eprintln!("run error: {}", e);
                 }
                 return;
@@ -407,7 +409,8 @@ fn main() {
                 bg_index: BgIndex::build(&[&bg_dir]),
             };
             eprintln!("wa2-native run: start={} (Space/Click=next, Left=back, 1-9=choice, Esc/q=quit)", start_id);
-            if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
+            let mut rt = Runtime::new(&win, &session);
+            if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
                 eprintln!("run error: {}", e);
             }
         }
@@ -446,22 +449,23 @@ fn main() {
                 eprintln!("wa2-native title: data={}", d.describe());
                 (font, session, start_id, bg_dir)
             };
+            let mut rt = Runtime::new(&win, &session);
             match run_title(&mut win, &font, &session.bg_dirs(), &session.script_dir, session.bg_cn.is_some()) {
                 TitleAction::Start => {
                     eprintln!("title: starting scene {}", start_id);
-                    if let Err(e) = run_game(&mut win, &font, &session, &start_id) {
+                    if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
                         eprintln!("run error: {}", e);
                     }
                 }
                 TitleAction::Jump(id) => {
                     eprintln!("title: timeline jump {}", id);
-                    if let Err(e) = run_game(&mut win, &font, &session, &id) {
+                    if let Err(e) = run_game(&mut win, &font, &session, &id, &mut rt) {
                         eprintln!("run error: {}", e);
                     }
                 }
                 TitleAction::Load(snap) => {
                     eprintln!("title: loading scene {}", snap.scene);
-                    if let Err(e) = run_game_from(&mut win, &font, &session, snap) {
+                    if let Err(e) = run_game_from(&mut win, &font, &session, snap, &mut rt) {
                         eprintln!("run error: {}", e);
                     }
                 }
@@ -625,6 +629,18 @@ fn event_cg_name(id: i64, variant: u32) -> String {
     format!("v{:06}.tga", id * 10 + variant as i64)
 }
 
+/// Scene-switch profiling. `WA2_TIMING=1` prints the cost of each decode,
+/// composite and upload so a stall can be attributed to one of them.
+fn timing_enabled() -> bool {
+    std::env::var_os("WA2_TIMING").is_some()
+}
+
+fn tlog(label: &str, t0: std::time::Instant) {
+    if timing_enabled() {
+        eprintln!("  [timing] {label}: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 fn render_art_scale() -> u32 {
     std::env::var("WA2_RENDER_SCALE")
         .ok()
@@ -643,10 +659,18 @@ fn render_scale_for(w: i32, h: i32) -> u32 {
 }
 
 fn set_render_art_scale(win: &sdl2::Sdl) {
+    // An explicitly set WA2_RENDER_SCALE wins over the window size.
+    static OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OVERRIDE.get_or_init(|| std::env::var_os("WA2_RENDER_SCALE").is_some()) {
+        return;
+    }
     let (w, h) = win.window_size();
     let scale = render_scale_for(w, h);
     if render_art_scale() != scale {
         std::env::set_var("WA2_RENDER_SCALE", scale.to_string());
+        // Pictures decoded for the old window size are the wrong pixel size
+        // now; dropping them keeps the compositor from mixing scales.
+        artcache::drop_other_scales(scale);
         eprintln!("art: render scale={} for window {}x{}", scale, w, h);
     }
 }
@@ -655,11 +679,87 @@ fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::
     load_background_asset(dirs, name).map(|asset| asset.img)
 }
 
-/// Load a scene asset and retain the scale represented by the decoded pixels.
-/// UI sheets are normalized by `decode_ui_file`, while art keeps the largest
-/// useful scale allowed by the current render target.
+/// load_background_asset_inner with a WA2_TIMING profile line.
 fn load_background_asset(dirs: &[&std::path::Path], name: &str) -> Option<LoadedAsset> {
-    // Build candidate names: exact, then with suffixes stripped.
+    let t0 = std::time::Instant::now();
+    let out = load_background_asset_inner(dirs, name);
+    tlog(&format!("load {name}"), t0);
+    out
+}
+
+/// Load a scene asset and retain the scale represented by the decoded pixels.
+/// UI sheets are normalized by decode_ui_file, while art keeps the largest
+/// useful scale allowed by the current render target.
+fn load_background_asset_inner(dirs: &[&std::path::Path], name: &str) -> Option<LoadedAsset> {
+    let t0 = std::time::Instant::now();
+    let is_ui =
+        name.starts_with("sys_") || name.starts_with("SYS_") || name.starts_with('t') || name.starts_with('T')
+            || name.eq_ignore_ascii_case("weather.tga");
+    let found = resolve_asset_path(dirs, name);
+    tlog("resolve", t0);
+    let t1 = std::time::Instant::now();
+    // UI sheets are consumed at their 1280x720 logical size and the tool
+    // pre-renders them under data/cache/ui, so they only need the decoder as a
+    // fallback. Scene art goes through the derived cache: an 8x WebP is decoded
+    // once and every later load of it is a file read or a memory hit.
+    for (path, cp932) in found {
+        let decoded = if is_ui {
+            codec::image::decode_ui_file(&path).ok()
+        } else {
+            artcache::load(&path).map(|img| (*img).clone())
+        };
+        if let Some(img) = decoded {
+            let art_scale = if is_ui { 1 } else { codec::image::art_scales(&path).1.max(1) };
+            tlog(if cp932 { "decode (cp932 name)" } else { "decode" }, t1);
+            return Some(LoadedAsset { img, art_scale });
+        }
+    }
+    None
+}
+
+/// Find the file backing one logical asset name without decoding anything.
+///
+/// Candidate names are tried against every tree with a plain existence check,
+/// which is what the extracted data tree answers directly. Only when nothing
+/// matches does it fall back to the CP932 name scan needed by trees extracted
+/// before the extractor normalized filenames - and that scan is indexed once
+/// per directory, because reading 1200 directory entries per candidate was
+/// measurably slower than decoding the image afterwards.
+///
+/// Returns every existing file the name could mean, best first, each flagged
+/// with whether it came from the CP932 fallback. The caller decodes them in
+/// order, so a file that fails to decode still falls through to the next
+/// candidate - which is what the old decode-as-you-search loop did.
+fn resolve_asset_path(dirs: &[&std::path::Path], name: &str) -> Vec<(std::path::PathBuf, bool)> {
+    let candidates = asset_candidates(name);
+    let mut out = Vec::new();
+    for dir in dirs {
+        for cand in &candidates {
+            let p = dir.join(cand);
+            if p.is_file() {
+                out.push((p, false));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        for dir in dirs {
+            for (decoded, path) in cp932_entries(dir).iter() {
+                for cand in &candidates {
+                    if decoded.eq_ignore_ascii_case(cand) {
+                        out.push((path.clone(), true));
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dirs;
+    out
+}
+
+/// The names one logical asset may be stored under.
+fn asset_candidates(name: &str) -> Vec<String> {
     let mut candidates = vec![name.to_string()];
     let lower = name.to_ascii_lowercase();
     for sfx in ["_bg", "_chr", "_chreff", "_ev", "_fg", "_eff"] {
@@ -668,7 +768,7 @@ fn load_background_asset(dirs: &[&std::path::Path], name: &str) -> Option<Loaded
         }
     }
     // Each sibling tree keeps the same stem but may use WebP after upscale.
-    // `.bmp` sources (backgrounds extracted from the archive) keep the same
+    // .bmp sources (backgrounds extracted from the archive) keep the same
     // stem in the WebP trees as well.
     let base = name
         .trim_end_matches(".tga")
@@ -681,61 +781,35 @@ fn load_background_asset(dirs: &[&std::path::Path], name: &str) -> Option<Loaded
     candidates.push(format!("{}.WEBP", base));
     candidates.push(format!("{}.tga", base));
     candidates.push(format!("{}.TGA", base));
-
-    for dir in dirs {
-        for cand in &candidates {
-            let p = dir.join(cand);
-            let ui_asset = lower.starts_with("sys_") || lower.starts_with('t') || lower == "weather.tga";
-            let decoded = if ui_asset {
-                codec::image::decode_ui_file(&p)
-            } else {
-                codec::image::decode_art_file(&p)
-            };
-            if let Ok(img) = decoded {
-                let scale = if ui_asset {
-                    1
-                } else {
-                    codec::image::source_art_scale(&p).min(render_art_scale())
-                };
-                return Some(LoadedAsset { img, art_scale: scale.max(1) });
-            }
-            // Older data trees were extracted with the archive's raw CP932
-            // filename bytes.  On Unix those names are valid byte strings but
-            // are not the UTF-8 path produced by the script decoder.  Match a
-            // directory entry after CP932-decoding it so existing data keeps
-            // working; newly extracted trees use normalized UTF-8 names.
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                if let Ok(rd) = std::fs::read_dir(dir) {
-                    for entry in rd.flatten() {
-                        let raw = entry.file_name();
-                        if codec::sjis::decode(raw.as_bytes())
-                            .eq_ignore_ascii_case(cand)
-                        {
-                            let ui_asset = lower.starts_with("sys_") || lower.starts_with('t') || lower == "weather.tga";
-                            let decoded = if ui_asset {
-                                codec::image::decode_ui_file(&entry.path())
-                            } else {
-                                codec::image::decode_art_file(&entry.path())
-                            };
-                            if let Ok(img) = decoded {
-                                let scale = if ui_asset {
-                                    1
-                                } else {
-                                    codec::image::source_art_scale(&entry.path()).min(render_art_scale())
-                                };
-                                return Some(LoadedAsset { img, art_scale: scale.max(1) });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    candidates
 }
 
+/// Directory entries with their names CP932-decoded, indexed once per directory.
+#[cfg(unix)]
+fn cp932_entries(dir: &std::path::Path) -> std::sync::Arc<Vec<(String, std::path::PathBuf)>> {
+    use std::collections::HashMap;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static IDX: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Vec<(String, std::path::PathBuf)>>>>> =
+        OnceLock::new();
+    let mut m = match IDX.get_or_init(Default::default).lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    if let Some(v) = m.get(dir) {
+        return Arc::clone(v);
+    }
+    let mut v = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let raw = entry.file_name();
+            v.push((codec::sjis::decode(raw.as_bytes()), entry.path()));
+        }
+    }
+    let v = Arc::new(v);
+    m.insert(dir.to_path_buf(), Arc::clone(&v));
+    v
+}
 /// Exact voice lookup by the identifiers from ACT137 and ACT138.
 struct VoiceIndex {
     map: std::collections::HashMap<(u32, u32, u32), std::path::PathBuf>,
@@ -743,6 +817,7 @@ struct VoiceIndex {
 
 impl VoiceIndex {
     fn build(dir: &std::path::Path) -> VoiceIndex {
+        let t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -756,6 +831,7 @@ impl VoiceIndex {
                 }
             }
         }
+        tlog("voice index", t0);
         eprintln!("voice: indexed {} clips from {}", map.len(), dir.display());
         VoiceIndex { map }
     }
@@ -934,6 +1010,125 @@ impl BgIndex {
     }
 }
 
+/// Pictures a scenario will ask for later, in program order.
+///
+/// Scanning the bytecode is cheap and lets the prefetch thread decode the next
+/// backgrounds and sprites while the player is still reading the line on
+/// screen, which is what removes the wait at a scene change. The scan mirrors
+/// the interpreter record handling: K30 with three ints followed by a K16
+/// ACT154/155 is a sprite, ACT146/147 a background, ACT148/201 a CG.
+fn upcoming_art(
+    p: &vm::lscr::Program,
+    bg: &BgIndex,
+    bank: Option<&SpriteBank>,
+) -> (Vec<String>, Vec<String>) {
+    use vm::lscr::Op;
+    let mut bgs: Vec<String> = Vec::new();
+    let mut sprites: Vec<String> = Vec::new();
+    let mut ints: Vec<i32> = Vec::new();
+    let (mut kind, mut tok_hit, mut act_hit) = (0u32, false, false);
+    let mut pending: Option<(u32, u32, u32)> = None;
+    for (i, op) in p.ops.iter().enumerate() {
+        match op {
+            Op::Rec { kind: k, .. } => {
+                if kind == 30 && !tok_hit && !act_hit && ints.len() == 3 {
+                    let cid = ints[0];
+                    let variant = ints[1];
+                    let flag = ints[2];
+                    if (0..40).contains(&cid)
+                        && (0..1000).contains(&variant)
+                        && flag % 1000 == 0
+                        && (1000..=30000).contains(&flag)
+                        && p.ops[i..]
+                            .iter()
+                            .take(10)
+                            .any(|o| matches!(o, Op::Act { id, .. } if *id == 154 || *id == 155))
+                    {
+                        pending = Some((cid as u32, (flag / 1000) as u32, variant as u32));
+                    }
+                }
+                ints.clear();
+                kind = *k;
+                tok_hit = false;
+                act_hit = false;
+            }
+            Op::Tok { .. } => tok_hit = true,
+            Op::Int { v, .. } => ints.push(*v),
+            Op::Act { id, .. } => {
+                act_hit = true;
+                match *id {
+                    146 | 147 => {
+                        if ints.len() >= 4 && ints[1] > 0 {
+                            if let Some(n) = bg.resolve(ints[1] as i64, ints[2].max(0) as u32) {
+                                if !bgs.contains(&n) {
+                                    bgs.push(n);
+                                }
+                            }
+                        }
+                    }
+                    148 => {
+                        if ints.len() >= 4 && ints[1] > 0 {
+                            let n = event_cg_name(ints[1] as i64, ints[2].max(0) as u32);
+                            if !bgs.contains(&n) {
+                                bgs.push(n);
+                            }
+                        }
+                    }
+                    201 => {
+                        if ints.len() >= 3 && ints[0] > 0 && ints[2] != 0 {
+                            let n = event_cg_name(ints[0] as i64, ints[1].max(0) as u32);
+                            if !bgs.contains(&n) {
+                                bgs.push(n);
+                            }
+                        }
+                    }
+                    154 | 155 => {
+                        if let (Some((cid, series, variant)), Some(bank)) = (pending.take(), bank) {
+                            if let Some(n) = bank.resolve(cid, series, variant) {
+                                if !sprites.contains(&n) {
+                                    sprites.push(n);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    (bgs, sprites)
+}
+
+/// How many pictures of each kind to queue ahead of the script.
+const PREFETCH_BG: usize = 6;
+const PREFETCH_SPRITE: usize = 8;
+
+/// Turn the names the script will ask for into file paths for the prefetch
+/// thread. Missing files are dropped here rather than in the worker.
+fn prefetch_paths(
+    dirs: &[&std::path::Path],
+    bgs: &[String],
+    sprite_dir: Option<&std::path::Path>,
+    sprites: &[String],
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for name in bgs.iter().take(PREFETCH_BG) {
+        if let Some((p, _)) = resolve_asset_path(dirs, name).into_iter().next() {
+            out.push(p);
+        }
+    }
+    if let Some(dir) = sprite_dir {
+        for name in sprites.iter().take(PREFETCH_SPRITE) {
+            let p = dir.join(name);
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Where every kind of media comes from for one play session.
 ///
 /// Built either from the loose-file data tree (`Session::from_data`) or from
@@ -1009,6 +1204,73 @@ impl Session {
     }
 }
 
+/// Everything that outlives a single scene.
+///
+/// Quick-loading a save used to rebuild all of this inside run_game_at: the
+/// audio device was closed and reopened, the 46k-clip voice directory was
+/// scanned again, and the UI sheets were decoded again. Keeping them here means
+/// a scene change only replaces what the scene actually owns.
+pub struct Runtime {
+    /// Vector font for Chinese dialogue (None in Japanese mode).
+    vfont: Option<render::text::VectorFont>,
+    bar: cmdbar::CmdBar,
+    msg_plate: Option<codec::tga::TgaImage>,
+    msg_frame: Option<codec::tga::TgaImage>,
+    voices: Option<VoiceIndex>,
+    mixer: Option<audio::Mixer>,
+    bank: Option<SpriteBank>,
+}
+
+impl Runtime {
+    pub fn new(win: &sdl2::Sdl, s: &Session) -> Runtime {
+        let choice = render::text::font_choice();
+        let mut vfont = if s.cn {
+            render::text::VectorFont::open(&choice.path, render::DIALOG_FONT_720)
+        } else {
+            None
+        };
+        if let Some(vf) = vfont.as_ref() {
+            render::text::apply_choice(vf, &choice);
+        }
+        if s.cn && vfont.is_none() {
+            eprintln!("dialog: no vector font, falling back to the bitmap atlas");
+        }
+        let bar = cmdbar::CmdBar::load(&s.bg_dirs());
+        let msg_plate = load_background(&s.bg_dirs(), "sys_00001.tga");
+        let msg_frame = load_background(&s.bg_dirs(), "sys_00000.tga");
+        let voices = s.voice_dir.as_deref().map(VoiceIndex::build);
+        let wants_audio = s.bgm.is_some()
+            || s.voice_dir.is_some()
+            || s.script_dir
+                .parent()
+                .map(|p| p.join("bgm").is_dir() || p.join("se").is_dir())
+                .unwrap_or(false);
+        let mixer = if wants_audio {
+            match audio::Mixer::new(win) {
+                Some(mx) => {
+                    if let Some(bgm) = s.bgm.as_deref() {
+                        let _ = mx.play(bgm, 0.6, true);
+                        eprintln!("BGM: {}", bgm);
+                    }
+                    Some(mx)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let bank = s.sprite_dir.as_ref().filter(|p| p.is_dir()).map(|dir| {
+            eprintln!("sprites: {}", dir.display());
+            SpriteBank::new(dir.clone())
+        });
+        if bank.is_none() {
+            eprintln!("note: no sprite directory - character sprites disabled");
+        }
+        Runtime { vfont, bar, msg_plate, msg_frame, voices, mixer, bank }
+    }
+}
+
+
 /// Full game loop: play scenes starting from `start_id`, following CATCH jumps
 /// and presenting choices to the player.
 /// Play from the start of a scene.
@@ -1017,12 +1279,13 @@ pub fn run_game(
     font: &render::Font,
     s: &Session,
     start_id: &str,
+    rt: &mut Runtime,
 ) -> Result<(), String> {
     // Loop so that loading a save slot from the command bar restarts the run
     // at the loaded position instead of ending the game.
     let mut resume: Option<save::SaveState> = None;
     loop {
-        match run_game_at(win, font, s, resume, start_id)? {
+        match run_game_at(win, font, s, resume, start_id, rt)? {
             None => return Ok(()),
             Some(snap) => resume = Some(snap),
         }
@@ -1035,55 +1298,40 @@ pub fn run_game_from(
     font: &render::Font,
     s: &Session,
     snap: save::SaveState,
+    rt: &mut Runtime,
 ) -> Result<(), String> {
     let mut resume = Some(snap);
     let scene = resume.as_ref().unwrap().scene.clone();
     loop {
-        match run_game_at(win, font, s, resume, &scene)? {
+        match run_game_at(win, font, s, resume, &scene, rt)? {
             None => return Ok(()),
             Some(st) => resume = Some(st),
         }
     }
 }
-
-/// `resume` rebuilds the state of a save slot before the first scene runs.
 fn run_game_at(
     win: &mut sdl2::Sdl,
     font: &render::Font,
     s: &Session,
     resume: Option<save::SaveState>,
     start_id: &str,
+    rt: &mut Runtime,
 ) -> Result<Option<save::SaveState>, String> {
     set_render_art_scale(win);
     let mut resume = resume;
     let script_dir = s.script_dir.as_path();
-    let bg_dir = s.bg_dir.as_path();
-    let voice_dir = s.voice_dir.as_deref();
-    let bgm_path = s.bgm.as_deref();
     const W: u32 = 1280;
     const H: u32 = 720;
     // The art is laid out at 1280x720 and stretched to the window; the
     // dialogue is rasterized at the window's own size so it stays sharp.
     let mut win_size = win.window_size();
-    // Chinese script text only reads correctly after the patch's glyph table
-    // has been applied to it, and that text needs a real font to draw.
-    // Japanese keeps the game's own bitmap atlas.
-    let choice = render::text::font_choice();
-    let mut vfont = if s.cn {
-        render::text::VectorFont::open(&choice.path, render::DIALOG_FONT_720)
-    } else {
-        None
-    };
-    if let Some(vf) = vfont.as_ref() {
-        render::text::apply_choice(vf, &choice);
-    }
-    if s.cn && vfont.is_none() {
-        eprintln!("dialog: no vector font, falling back to the bitmap atlas");
-    }
-    // Function buttons (sys_00010) and the message-window frame (sys_00000).
-    let bar = cmdbar::CmdBar::load(&s.bg_dirs());
-    let msg_plate = load_background(&s.bg_dirs(), "sys_00001.tga");
-    let msg_frame = load_background(&s.bg_dirs(), "sys_00000.tga");
+    // The vector font, the command bar, the message-window sheets, the voice
+    // index, the mixer and the sprite bank all live in the Runtime, so a
+    // quick load replaces the scene state instead of the whole engine.
+    let vfont = &mut rt.vfont;
+    let bar = &rt.bar;
+    let msg_plate = &rt.msg_plate;
+    let msg_frame = &rt.msg_frame;
     let mut cmd_auto = false;
     let mut cmd_skip = false;
     // Lines already shown, for the 履历 (backlog) screen.
@@ -1102,30 +1350,15 @@ fn run_game_at(
     // prologue's "sepia.AMP" is a color-filter LUT, not a background image).
     let mut bg = solid_bg(W, H, [0, 0, 0]);
 
-    // Start BGM if requested (and keep mixer for voice playback).
-    let mixer = if bgm_path.is_some() || voice_dir.is_some() || s.script_dir.parent().map(|p| p.join("bgm").is_dir() || p.join("se").is_dir()).unwrap_or(false) {
-        match audio::Mixer::new(win) {
-            Some(mx) => {
-                if let Some(bgm) = bgm_path {
-                    let _ = mx.play(bgm, 0.6, true);
-                    eprintln!("BGM: {}", bgm);
-                }
-                Some(mx)
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
+    let mixer = &rt.mixer;
 
     // WA2_AUTO       : advance text *and* pick choices automatically (unattended runs)
     // WA2_AUTO_TEXT  : advance text only, stop at choices (interactive verification)
     let auto_pick = std::env::var_os("WA2_AUTO").is_some();
     let auto_text = auto_pick || std::env::var_os("WA2_AUTO_TEXT").is_some();
 
-    // Voice files are indexed once: the directory holds ~39k entries and the
-    // old code scanned it for every single line.
-    let voices = voice_dir.map(VoiceIndex::build);
+    // Indexed once by the Runtime: the directory holds 46k clips.
+    let voices = &rt.voices;
     // Player settings (option screen / wa2.ini).
     let mut settings = menu::Settings::load();
     menu::apply(&settings, mixer.as_ref());
@@ -1144,13 +1377,7 @@ fn run_game_at(
     let mut fading_se = std::collections::HashMap::<i32, usize>::new();
 
     let mut cur_surf = render::render_scene(&bg, "", font, W, H);
-    let mut bank = s.sprite_dir.as_ref().filter(|p| p.is_dir()).map(|dir| {
-        eprintln!("sprites: {}", dir.display());
-        SpriteBank::new(dir.clone())
-    });
-    if bank.is_none() {
-        eprintln!("note: no sprite directory - character sprites disabled");
-    }
+    let mut bank = &mut rt.bank;
     // Standing sprites live in numbered stage slots (K16's first value): slot 0
     // left, 1 centre, 2 right. Slots are reused as characters move around.
     let mut slots: [Option<ActiveSprite>; SPRITE_SLOTS] = Default::default();
@@ -1314,6 +1541,16 @@ fn run_game_at(
             prog.entry
         );
         let mut it = vm::lscr::Interp::new(&prog);
+        // Decode what this scene will ask for while the player reads the
+        // first lines, so the script never waits on a 59 MP WebP.
+        {
+            let (bgs, sprites) = upcoming_art(&prog, &s.bg_index, bank.as_ref());
+            let queued = prefetch_paths(&s.bg_dirs(), &bgs, s.sprite_dir.as_deref(), &sprites);
+            if !queued.is_empty() {
+                eprintln!("prefetch: {} pictures", queued.len());
+                artcache::prefetch(queued);
+            }
+        }
         // The saved position belongs to the first scene only; a later scene
         // change means the player moved on, so it starts from its entry point.
         if let Some(vm) = rewind_vm.take() {
@@ -2556,13 +2793,15 @@ fn run_game_at(
                     }
                     current_id = target;
                     line_no = 0;
-                    // new scene: standing sprites do not carry over
+                    // New scene: standing sprites do not carry over, but keep
+                    // the decoded sprite bank.  Clearing it here forces every
+                    // character in the next scene through WebP/TGA decoding
+                    // again and made ordinary scene jumps look like a load.
                     slots = Default::default();
                     plates.clear();
                     line_base = None;
                     line_done = true;
                     focus = None;
-                    bank.as_mut().map(|b| b.cache.clear());
                     break;
                 }
                 vm::lscr::Event::End => {
@@ -3477,10 +3716,10 @@ impl SpriteBank {
         let key = name.to_ascii_lowercase();
         if !self.cache.contains_key(&key) {
             let path = self.dir.join(&key);
-            let img = codec::image::decode_art_file(&path).ok()?;
-            let art_scale = codec::image::source_art_scale(&path)
-                .min(render_art_scale())
-                .max(1);
+            // Shared with the background loader, so a sprite the prefetch
+            // thread already decoded costs nothing here.
+            let img = (*artcache::load(&path)?).clone();
+            let art_scale = codec::image::art_scales(&path).1.max(1);
             if self.cache.len() >= self.cache_limit {
                 if let Some(old) = self.cache.keys().next().cloned() {
                     self.cache.remove(&old);
@@ -3503,7 +3742,7 @@ impl SpriteBank {
     ///
     /// The neutral-pose fallback (`...101`) is only tried after the whole
     /// neighbourhood search has failed.
-    fn resolve(&mut self, cid: u32, series: u32, variant: u32) -> Option<String> {
+    fn resolve(&self, cid: u32, series: u32, variant: u32) -> Option<String> {
         let prefixes: Vec<String> = sprite_prefixes(cid).iter().map(|s| s.to_string()).collect();
         const DELTAS: [i32; 5] = [0, -1, 1, -2, 2];
         let s_base = series as i32;
@@ -3795,6 +4034,104 @@ fn sprite_x_for(idx: usize, count: usize, w: u32) -> i32 {
     center - (w as i32 / 2)
 }
 
+/// The composited picture without the dialogue, kept between lines.
+///
+/// Advancing the text used to stretch the background, blend the sprites, apply
+/// the colour filter and stamp the message window again for every line. Only a
+/// stage change (background, sprite, overlay, filter, window size) really needs
+/// that work; printing a line only has to repaint the text on a copy.
+struct SceneLayer {
+    key: u64,
+    w: u32,
+    h: u32,
+    surf: render::Surface,
+}
+
+fn scene_layer_store() -> &'static std::sync::Mutex<Option<SceneLayer>> {
+    static LAYER: std::sync::OnceLock<std::sync::Mutex<Option<SceneLayer>>> = std::sync::OnceLock::new();
+    LAYER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// FNV-1a over everything the picture is made of. Image identity is the pixel
+/// buffer address: the same decoded picture keeps its address for as long as
+/// the scene holds it, and a new load necessarily has a different one.
+fn hash_u64(state: &mut u64, value: u64) {
+    *state = (*state ^ value).wrapping_mul(0x100_0000_01b3);
+}
+
+fn scene_art_key(
+    bg: &codec::tga::TgaImage,
+    draws: &[render::SpriteDraw],
+    tint: Option<&[u8]>,
+    window: bool,
+    plate: Option<&codec::tga::TgaImage>,
+    frame: Option<&codec::tga::TgaImage>,
+    look: &Look,
+    overlays: &[(&codec::tga::TgaImage, i32, i32, u32)],
+    w: u32,
+    h: u32,
+) -> u64 {
+    let mut key = 0xcbf2_9ce4_8422_2325u64;
+    hash_u64(&mut key, bg.rgba.as_ptr() as usize as u64);
+    hash_u64(&mut key, bg.width as u64);
+    for sp in draws {
+        hash_u64(&mut key, sp.img.rgba.as_ptr() as usize as u64);
+        hash_u64(&mut key, sp.logical_w as u64);
+        hash_u64(&mut key, sp.x as u64);
+        hash_u64(&mut key, sp.y as u64);
+        hash_u64(&mut key, sp.alpha as u64);
+    }
+    hash_u64(&mut key, tint.map(|t| t.as_ptr() as usize as u64).unwrap_or(0));
+    hash_u64(&mut key, tint.map(|t| t.len() as u64).unwrap_or(0));
+    hash_u64(&mut key, window as u64);
+    hash_u64(&mut key, plate.map(|p| p.rgba.as_ptr() as usize as u64).unwrap_or(0));
+    hash_u64(&mut key, frame.map(|p| p.rgba.as_ptr() as usize as u64).unwrap_or(0));
+    hash_u64(&mut key, look.alpha as u64);
+    hash_u64(&mut key, look.shade as u64);
+    for (img, x, y, scale) in overlays {
+        hash_u64(&mut key, img.rgba.as_ptr() as usize as u64);
+        hash_u64(&mut key, *x as u64);
+        hash_u64(&mut key, *y as u64);
+        hash_u64(&mut key, *scale as u64);
+    }
+    hash_u64(&mut key, w as u64);
+    hash_u64(&mut key, h as u64);
+    key
+}
+
+/// Composite the scene picture, reusing the previous frame when nothing about
+/// the stage has changed.
+#[allow(clippy::too_many_arguments)]
+fn scene_art(
+    bg: &codec::tga::TgaImage,
+    draws: &[render::SpriteDraw],
+    tint: Option<&[u8]>,
+    window: bool,
+    plate: Option<&codec::tga::TgaImage>,
+    frame: Option<&codec::tga::TgaImage>,
+    look: &Look,
+    overlays: &[(&codec::tga::TgaImage, i32, i32, u32)],
+    w: u32,
+    h: u32,
+    key: u64,
+) -> render::Surface {
+    let mut store = match scene_layer_store().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if let Some(layer) = store.as_ref() {
+        if layer.key == key && layer.w == w && layer.h == h {
+            return clone_surf(&layer.surf);
+        }
+    }
+    let surf = render::compose_scene_art(
+        bg, w, h, draws, tint, window, plate, frame, look.alpha, look.shade, overlays,
+    );
+    *store = Some(SceneLayer { key, w, h, surf: clone_surf(&surf) });
+    surf
+}
+
+
 /// Composite background + sprites + dialog box + text.
 fn draw_scene(
     bg: &codec::tga::TgaImage,
@@ -3816,6 +4153,7 @@ fn draw_scene(
     // Vector font for the dialogue, or None to keep the bitmap atlas.
     vf: Option<&mut render::text::VectorFont>,
 ) -> render::Surface {
+    let t0 = std::time::Instant::now();
     // The Japanese bitmap atlas still belongs to the 1280x720 compositor. The
     // Chinese path uses vector text and can composite high-res art directly at
     // the window size without stretching the bitmap glyphs.
@@ -3856,22 +4194,20 @@ fn draw_scene(
     // atlas path hands the text to the compositor and the vector path does not.
     let render_w = if hires { out_w } else { render::LAYOUT_W };
     let render_h = if hires { out_h } else { render::LAYOUT_H };
-    let mut s = render::render_scene_ex_art(
-        bg,
-        if vf.is_some() { "" } else { text },
-        font,
-        render_w,
-        render_h,
-        &draws,
-        tint,
-        window,
-        plate,
-        frame,
-        look.alpha,
-        look.shade,
-        &overlays,
+    let key = scene_art_key(
+        bg, &draws, tint, window, plate, frame, &look, &overlays, render_w, render_h,
     );
-    match vf {
+    let t_art = std::time::Instant::now();
+    let mut s = scene_art(
+        bg, &draws, tint, window, plate, frame, &look, &overlays, render_w, render_h, key,
+    );
+    tlog("scene art", t_art);
+    // The bitmap atlas stamps its glyphs onto this layer; the vector path
+    // draws later, after the frame has been scaled to the window.
+    if !vf.is_some() && window {
+        render::draw_dialog_text(&mut s, font, text, plate.is_some(), render_w, render_h, usize::MAX);
+    }
+    let out = match vf {
         Some(vf) => {
             let mut s = if !hires && (out_w, out_h) != (render::LAYOUT_W, render::LAYOUT_H) {
                 s.scaled_to(out_w, out_h)
@@ -3882,6 +4218,7 @@ fn draw_scene(
                 // The name sits on the upper rim of the oval, not inside 【】
                 // in the line, and only the game's own window has a rim.
                 let name = if plate.is_some() { speaker } else { None };
+                let td = std::time::Instant::now();
                 render::draw_dialog_vector(
                     &mut s,
                     vf,
@@ -3891,6 +4228,7 @@ fn draw_scene(
                     out_h as i32,
                     usize::MAX,
                 );
+                tlog("dialog text", td);
             }
             s
         }
@@ -3905,7 +4243,9 @@ fn draw_scene(
             }
             s
         }
-    }
+    };
+    tlog("draw_scene", t0);
+    out
 }
 
 /// Draw the dialogue body onto a frame that is already composited, at the size

@@ -170,6 +170,27 @@ fn decode_impl(data: &[u8], font_palette: bool) -> Result<TgaImage, String> {
     })
 }
 
+/// Encode RGBA pixels as a 32-bit uncompressed TGA, top-down.
+///
+/// This is the exact format decode reads back, so the derived art cache can
+/// store already-scaled pictures without a second image codec.
+pub fn encode(img: &TgaImage) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18 + img.rgba.len());
+    let w = img.width as u16;
+    let h = img.height as u16;
+    out.extend_from_slice(&[
+        0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        (w & 0xFF) as u8, (w >> 8) as u8,
+        (h & 0xFF) as u8, (h >> 8) as u8,
+        32, 0x28,
+    ]);
+    // TGA truecolor is stored B,G,R,A.
+    for px in img.rgba.chunks_exact(4) {
+        out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

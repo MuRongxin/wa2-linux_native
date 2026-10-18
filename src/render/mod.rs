@@ -112,6 +112,17 @@ impl Surface {
             return;
         }
         let i = ((y as u32) * self.width + (x as u32)) as usize * 4;
+        // Most game art pixels are opaque.  The old path built two temporary
+        // arrays and ran the general alpha blender even for those pixels;
+        // background and standing-sprite composition calls this once per
+        // output pixel, so the shortcut is a substantial part of the hot path.
+        if c[3] == 0 {
+            return;
+        }
+        if c[3] == 255 {
+            self.pixels[i..i + 4].copy_from_slice(&c);
+            return;
+        }
         let cur = [self.pixels[i], self.pixels[i + 1], self.pixels[i + 2], self.pixels[i + 3]];
         let b = blend(&cur, &c);
         self.pixels[i..i + 4].copy_from_slice(&b);
@@ -234,6 +245,49 @@ impl Surface {
                 let a = (img.rgba[si + 3] as u32 * alpha as u32 / 255) as u8;
                 let c = [img.rgba[si], img.rgba[si + 1], img.rgba[si + 2], a];
                 self.put(dx + col, dy + row, c);
+            }
+        }
+    }
+
+    /// Nearest-neighbour scale of a whole image.  This is kept separate from
+    /// `blit_region_scaled` because the scene background is opaque in normal
+    /// play and covers almost every output pixel.  It avoids the per-pixel
+    /// one-pixel `blit_region` call that used to dominate scene composition.
+    pub fn blit_scaled_nearest(
+        &mut self,
+        img: &TgaImage,
+        dx: i32,
+        dy: i32,
+        dw: u32,
+        dh: u32,
+    ) {
+        if dw == 0 || dh == 0 || img.width == 0 || img.height == 0 {
+            return;
+        }
+        for row in 0..dh {
+            let sy = (row as u64 * img.height as u64 / dh as u64) as u32;
+            for col in 0..dw {
+                let x = dx + col as i32;
+                let y = dy + row as i32;
+                if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+                    continue;
+                }
+                let sx = (col as u64 * img.width as u64 / dw as u64) as u32;
+                let si = ((sy.min(img.height - 1) * img.width + sx.min(img.width - 1)) * 4) as usize;
+                let di = ((y as u32 * self.width + x as u32) * 4) as usize;
+                let a = img.rgba[si + 3];
+                if a == 0 {
+                    continue;
+                }
+                if a == 255 {
+                    self.pixels[di..di + 4].copy_from_slice(&img.rgba[si..si + 4]);
+                } else {
+                    let ia = 255 - a as u32;
+                    self.pixels[di] = ((img.rgba[si] as u32 * a as u32 + self.pixels[di] as u32 * ia) / 255) as u8;
+                    self.pixels[di + 1] = ((img.rgba[si + 1] as u32 * a as u32 + self.pixels[di + 1] as u32 * ia) / 255) as u8;
+                    self.pixels[di + 2] = ((img.rgba[si + 2] as u32 * a as u32 + self.pixels[di + 2] as u32 * ia) / 255) as u8;
+                    self.pixels[di + 3] = 255;
+                }
             }
         }
     }
@@ -626,10 +680,15 @@ pub fn render_scene_ex(
 /// 1280x720, while the returned surface can be the actual window size. Each
 /// overlay carries the scale represented by its decoded pixels, so mixed 1x,
 /// 2x, 4x and 8x assets share the same logical placement.
-pub fn render_scene_ex_art(
+/// Everything except the dialogue: background, sprites, overlays, the colour
+/// filter and the message window itself.
+///
+/// Split out of render_scene_ex_art so the frontend can keep this layer
+/// between lines and only repaint the text on top of a copy. Compositing
+/// it costs a full-frame stretch of an 8x background plus a LUT pass,
+/// which is far too much to redo for every character printed.
+pub fn compose_scene_art(
     bg: &TgaImage,
-    text: &str,
-    font: &Font,
     w: u32,
     h: u32,
     sprites: &[SpriteDraw],
@@ -647,13 +706,7 @@ pub fn render_scene_ex_art(
     let scale = (w as f32 / bw).min(h as f32 / bh);
     let (dw, dh) = ((bw * scale) as u32, (bh * scale) as u32);
     let (ox, oy) = ((w - dw) / 2, (h - dh) / 2);
-    for y in 0..dh {
-        for x in 0..dw {
-            let sx = (x as f32 / scale) as i32;
-            let sy = (y as f32 / scale) as i32;
-            s.blit_region(bg, sx, sy, 1, 1, ox as i32 + x as i32, oy as i32 + y as i32);
-        }
-    }
+    s.blit_scaled_nearest(bg, ox as i32, oy as i32, dw, dh);
 
     // Standing character sprites (bottom-anchored), below the dialog box.
     for sp in sprites {
@@ -715,6 +768,29 @@ pub fn render_scene_ex_art(
         s.fill_rect(30, box_y, w - 60, 2, [180, 200, 255, 220]);
         s.fill_rect(30, box_y + box_h as i32 - 2, w - 60, 2, [180, 200, 255, 220]);
     }
+    s
+}
+
+/// compose_scene_art plus the dialogue text. Kept for the tools and for the
+/// Japanese bitmap path, which stamps glyphs onto the 1280x720 layer.
+pub fn render_scene_ex_art(
+    bg: &TgaImage,
+    text: &str,
+    font: &Font,
+    w: u32,
+    h: u32,
+    sprites: &[SpriteDraw],
+    lut: Option<&[u8]>,
+    window: bool,
+    plate: Option<&TgaImage>,
+    frame: Option<&TgaImage>,
+    window_alpha: u8,
+    shade: u8,
+    overlays: &[(&TgaImage, i32, i32, u32)],
+) -> Surface {
+    let mut s = compose_scene_art(
+        bg, w, h, sprites, lut, window, plate, frame, window_alpha, shade, overlays,
+    );
     draw_dialog_text(&mut s, font, text, plate.is_some(), w, h, usize::MAX);
     s
 }
@@ -930,13 +1006,7 @@ pub fn render_scene_sysfont(bg: &TgaImage, text: &str, w: u32, h: u32) -> Surfac
     let scale = (w as f32 / bw).min(h as f32 / bh);
     let (dw, dh) = ((bw * scale) as u32, (bh * scale) as u32);
     let (ox, oy) = ((w - dw) / 2, (h - dh) / 2);
-    for y in 0..dh {
-        for x in 0..dw {
-            let sx = (x as f32 / scale) as i32;
-            let sy = (y as f32 / scale) as i32;
-            s.blit_region(bg, sx, sy, 1, 1, ox as i32 + x as i32, oy as i32 + y as i32);
-        }
-    }
+    s.blit_scaled_nearest(bg, ox as i32, oy as i32, dw, dh);
     let box_h = (h / 4).max(140);
     let box_y = (h - box_h - 24) as i32;
     s.fill_rect(30, box_y, w - 60, box_h, [10, 10, 24, 200]);
