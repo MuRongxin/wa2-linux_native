@@ -10,7 +10,7 @@
 
 use crate::codec::tga::TgaImage;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 
 pub mod font;
 pub mod text;
@@ -528,7 +528,7 @@ impl Surface {
     }
 
     pub fn save_tga(&self, path: &str) -> io::Result<()> {
-        let mut f = File::create(path)?;
+        let mut f = BufWriter::new(File::create(path)?);
         let w = self.width as u16;
         let h = self.height as u16;
         let header = [
@@ -536,17 +536,19 @@ impl Surface {
             (h & 0xFF) as u8, (h >> 8) as u8, 32u8, 0x28u8,
         ];
         f.write_all(&header)?;
+        // One row of BGRA at a time: a frame is 1280x720, and writing each
+        // pixel with its own write() turned every WA2_FRAME_DUMP capture into
+        // a minute of syscalls.
+        let mut row = Vec::with_capacity(self.width as usize * 4);
         for y in 0..self.height as usize {
-            for x in 0..self.width as usize {
-                let i = (y * self.width as usize + x) * 4;
-                let r = self.pixels[i];
-                let g = self.pixels[i + 1];
-                let b = self.pixels[i + 2];
-                let a = self.pixels[i + 3];
-                f.write_all(&[b, g, r, a])?;
+            row.clear();
+            let src = &self.pixels[y * self.width as usize * 4..(y + 1) * self.width as usize * 4];
+            for px in src.chunks_exact(4) {
+                row.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
             }
+            f.write_all(&row)?;
         }
-        Ok(())
+        f.flush()
     }
 }
 
@@ -633,6 +635,9 @@ pub const WINDOW_Y: i32 = 496;
 /// so the cell origin sits that far above the white strokes.
 pub const NAME_X: i32 = 245;
 pub const NAME_Y: i32 = 505;
+/// Height of the name's line box. The name is one short line on the rim and
+/// gets its own box - it must not share the body's baseline maths.
+pub const NAME_LINE: i32 = 28;
 /// Dialogue line under the top glow. Measured off the original window:
 /// white ink at game (270, 553), cell padding (6, 7), pitch 28.
 pub const DIALOG_TEXT_X: i32 = 264;
@@ -863,9 +868,11 @@ pub fn draw_dialog_text(
 /// at a 28px pitch, which puts the strokes at about 26px.
 pub const DIALOG_FONT_720: u32 = 26;
 
-/// Scale a 720-layout measurement into window pixels.
+/// Scale a 720-layout measurement into window pixels, rounding to nearest:
+/// truncating here made the dialog font size jitter by a pixel between window
+/// heights that are not multiples of 720.
 pub fn layout_px(v: i32, wh: i32) -> i32 {
-    v * wh.max(1) / 720
+    (v * wh.max(1) + 360) / 720
 }
 
 /// Split scenario text into the lines the player reads: literal backslash-n
@@ -928,36 +935,56 @@ pub fn draw_dialog_vector(
     if vf.size() != size {
         let _ = vf.set_size(size);
     }
-    let sx = |v: i32| v * ww.max(1) / 1280;
-    let sy = |v: i32| v * wh.max(1) / 720;
+    // Round to nearest rather than truncate: a truncated baseline or line
+    // pitch jitters by a pixel when the window is resized or moved between
+    // monitors.
+    let sx = |v: i32| (v * ww.max(1) + 640) / 1280;
+    let sy = |v: i32| (v * wh.max(1) + 360) / 720;
+    let name_style = text::TextStyle::for_role(text::TextRole::Name);
+    let body_style = text::TextStyle::for_role(text::TextRole::Body);
     if let Some(name) = speaker {
         if !name.is_empty() {
-            let baseline = sy(NAME_Y) + vf.ascent();
-            vf.draw(s, name, sx(NAME_X), baseline);
+            // The name sits on the window's rim, so it gets its own line box
+            // instead of sharing the body's.
+            let baseline = vf.baseline_in_box(sy(NAME_Y), sy(NAME_LINE));
+            vf.draw_styled(s, name, sx(NAME_X), baseline, &name_style);
         }
     }
     let body: String = dialog_lines(text).join("\n");
     let shown: String = body.chars().take(limit).collect();
     let x0 = sx(DIALOG_TEXT_X);
     let x_max = sx(DIALOG_TEXT_RIGHT);
-    let mut baseline = sy(DIALOG_TEXT_Y) + vf.ascent();
     let line_h = sy(DIALOG_LINE).max(1);
+    // Three line boxes fit the oval; the check is on the box top, so the
+    // centred baseline of the third line still counts as inside it.
+    let y_limit = sy(DIALOG_TEXT_Y + DIALOG_LINE * 3);
+    let mut line_top = sy(DIALOG_TEXT_Y);
     for line in shown.lines() {
-        let mut pen = x0;
-        for ch in line.chars() {
-            let advance = vf.measure_char(ch);
-            // The script pre-wraps its lines; anything past the right edge of
-            // the oval is dropped rather than reflowed.
-            if pen + advance > x_max {
-                break;
-            }
-            vf.draw_char(s, ch, pen, baseline);
-            pen += advance;
-        }
-        baseline += line_h;
-        if baseline > sy(DIALOG_TEXT_Y + DIALOG_LINE * 3) {
+        if line_top >= y_limit {
             break;
         }
+        let baseline = vf.baseline_in_box(line_top, line_h);
+        // The pen stays in 26.6 fixed point across the whole line: Latin
+        // advances are fractional, and rounding each one before adding the
+        // next let a 30-character mixed line drift a couple of pixels.
+        let mut pen = (x0 as i32) << 6;
+        let x_max_266 = (x_max as i32) << 6;
+        let mut prev: Option<char> = None;
+        for ch in line.chars() {
+            // The script pre-wraps its lines; anything whose ink would cross
+            // the right edge of the oval is dropped rather than reflowed. The
+            // check looks at the glyph's ink, not at the advance the next pen
+            // position would start from, so a narrow last glyph still fits.
+            let (dx, iw) = vf.char_ink(ch);
+            if pen + ((dx + iw) as i32) * 64 > x_max_266 {
+                break;
+            }
+            let pen_px = (pen + 32) >> 6;
+            vf.draw_char_styled(s, ch, pen_px, baseline, &body_style);
+            pen += vf.advance_266(prev, ch);
+            prev = Some(ch);
+        }
+        line_top += line_h;
     }
 }
 

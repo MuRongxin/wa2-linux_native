@@ -91,6 +91,49 @@ fn main() {
             if let Err(e) = surf.save_tga(&args[4]) { eprintln!("error writing {}: {}", args[4], e); std::process::exit(1); }
             println!("rendered {} chars of sample text -> {}", sample.chars().count(), args[4]);
         }
+        "font-sample" => {
+            // font-sample <out.tga> [w] [h]  : fixed vector-font specimen sheet
+            // (body, dense glyphs, punctuation, Latin mix, and the real dialog
+            // path with a name and three lines), drawn with the WA2_FONT*
+            // settings in force so two configurations can be compared.
+            if args.len() < 3 { eprintln!("usage: wa2-native font-sample <out.tga> [w] [h]"); return; }
+            let out = args[2].clone();
+            let w: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1280);
+            let h: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(720);
+            let choice = render::text::font_choice();
+            let mut vf = match render::text::VectorFont::open_face(&choice.path, render::DIALOG_FONT_720, choice.face) {
+                Some(f) => f,
+                None => { eprintln!("font-sample: cannot open {} (face {})", choice.path, choice.face); return; }
+            };
+            render::text::apply_choice(&vf, &choice);
+            eprintln!("font: {}", vf.describe());
+            let mut s = render::Surface::new(w, h, [20, 20, 28, 255]);
+            let px = |v: i32| (v * h as i32 + 360) / 720;
+            let size = px(render::DIALOG_FONT_720 as i32).max(8) as u32;
+            let _ = vf.set_size(size);
+            let body = render::text::TextStyle::body();
+            let label = render::text::TextStyle::name();
+            let mut y = px(40);
+            let step = px(56);
+            vf.draw_styled(&mut s, &vf.describe(), px(40), y, &label);
+            y += step;
+            for (tag, text) in [
+                ("正文", "春希、雪菜、冬马和纱，路边的树木叶子差不多已经落尽"),
+                ("复杂", "鬱邊體樂觀發臺裏骨直着国门广发"),
+                ("标点", "，。！？「」『』\u{201c}\u{201d}\u{2018}\u{2019}……——"),
+                ("混排", "WHITE ALBUM 2 100% 2026"),
+            ] {
+                vf.draw_styled(&mut s, tag, px(40), y, &label);
+                vf.draw_styled(&mut s, text, px(140), y, &body);
+                y += step;
+            }
+            // The dialog itself, through the same path the game uses: a name on
+            // the rim and three body lines in the oval.
+            let dialog = "已经，什么都无所谓了。\n无论是白色季节里的雪色，\n还是渐渐残碎的约定。";
+            render::draw_dialog_vector(&mut s, &mut vf, dialog, Some("冬马和纱"), w as i32, h as i32, usize::MAX);
+            if let Err(e) = s.save_tga(&out) { eprintln!("error writing {}: {}", out, e); std::process::exit(1); }
+            println!("font-sample: {}x{} -> {}", w, h, out);
+        }
         "scene" => {
             if args.len() < 7 {
                 eprintln!("usage: wa2-native scene <scenario.txt> <font.tga> <charset.txt> <bg.tga> <out.tga>");
@@ -1225,12 +1268,16 @@ impl Runtime {
     pub fn new(win: &sdl2::Sdl, s: &Session) -> Runtime {
         let choice = render::text::font_choice();
         let mut vfont = if s.cn {
-            render::text::VectorFont::open(&choice.path, render::DIALOG_FONT_720)
+            render::text::VectorFont::open_face(&choice.path, render::DIALOG_FONT_720, choice.face)
         } else {
             None
         };
         if let Some(vf) = vfont.as_ref() {
             render::text::apply_choice(vf, &choice);
+            // Which face of the .ttc actually opened, and with what knobs: the
+            // file name alone does not say, and a .ttc defaults to its first
+            // (Japanese) face.
+            eprintln!("font: {}", vf.describe());
         }
         if s.cn && vfont.is_none() {
             eprintln!("dialog: no vector font, falling back to the bitmap atlas");
@@ -5549,6 +5596,8 @@ fn print_usage() {
     println!("  wa2-native sjis <file>          decode CP932 bytes to UTF-8");
     println!("  wa2-native text-info <txt>      parse a scenario text page");
     println!("  wa2-native scene <txt> <font> <charset> <bg.tga> <out.tga>  render a scene");
+    println!("  wa2-native font-test <font.tga> <charset.txt> <out.tga> [text]  atlas glyph sheet");
+    println!("  wa2-native font-sample <out.tga> [w] [h]  vector-font specimen sheet (WA2_FONT*)");
 }
 
 #[cfg(test)]
