@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Package the loose game data tree into split release assets.
 
-The output is a set of ``*.tar.zst.partNNN`` volumes (each below GitHub's 2 GiB
-per-asset limit), plus ``manifest.json`` and ``SHA256SUMS``.  Concatenating the
-volumes reproduces one zstd-compressed tar stream:
-
-    cat wa2-data-v1.0.0.part*.tar.zst | zstd -d | tar -xf - -C .
+Default format is **independent ZIP parts**: every ``.partNNN.zip`` is a complete
+archive that extracts straight into ``./data/...``, so Windows Explorer, macOS
+Archive Utility and Linux ``unzip`` can all open it by double click / one
+command.  The ``tarzst`` format is kept as an option for Linux-first mirrors
+(one concatenated zstd stream, needs ``cat ... | zstd -d | tar -xf -``).
 
 Only the trees needed at runtime are included; derived caches
 (``data/cache``, ``data/*_2x`` proxy trees) are intentionally skipped and can be
 regenerated with ``tools/build_ui_cache.py`` / ``tools/build_timeline_cache.py``.
 
-Example::
+Examples::
 
-    python3 tools/package_data.py --version data-v1.0.0
-    python3 tools/package_data.py --version data-v1.0.0 --with-4x \
-        --out release/data-v1.0.0-4x
+    python3 tools/package_data.py --version data-v1.0.0        # ZIP parts
+    python3 tools/package_data.py --version data-v1.0.0 --format tarzst
+    python3 tools/package_data.py --version data-v1.0.0-4x --with-4x
 """
 
 from __future__ import annotations
@@ -23,9 +23,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-import subprocess
 import time
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +45,12 @@ DEFAULT_TREES = [
     "bg_cn_8x",
 ]
 OPTIONAL_4X = ["bg_4x", "sprite_4x", "bg_cn_4x"]
+# Already-compressed formats: store them instead of wasting CPU on deflate.
+STORE_EXTS = {
+    ".webp", ".wmv", ".avi", ".mp4", ".mkv", ".ogg", ".mp3", ".m4a", ".aac",
+    ".jpg", ".jpeg", ".png", ".zip", ".zst", ".gz", ".xz", ".7z", ".rar",
+}
+DEFLATE_LEVEL = 6
 
 
 def human(n: int) -> str:
@@ -72,18 +77,118 @@ def tree_inventory(data_dir: Path, trees: list[str]) -> dict:
     return {"trees": per_tree, "files": total_files, "bytes": total_bytes}
 
 
+def zip_safe_name(arcname: str, src: Path) -> str:
+    """ZIP entry names must be valid Unicode; some archive-extracted filenames
+    still carry raw CP932 bytes, which Python exposes as surrogates."""
+    try:
+        arcname.encode("utf-8")
+        return arcname
+    except UnicodeEncodeError:
+        raw = arcname.encode("utf-8", "surrogateescape")
+        for encoding in ("cp932", "shift_jis"):
+            try:
+                fixed = raw.decode(encoding)
+                print(f"  note: zip name {raw!r} -> {fixed!r}", flush=True)
+                return fixed
+            except UnicodeDecodeError:
+                continue
+        print(f"  warning: dropping unencodable entry {src}", flush=True)
+        return ""
+
+
+def collect_files(data_dir: Path, trees: list[str]) -> list[tuple[Path, str, int]]:
+    entries = []
+    for tree in trees:
+        for path in sorted((data_dir / tree).rglob("*")):
+            if path.is_file():
+                arcname = f"data/{tree}/{path.relative_to(data_dir / tree).as_posix()}"
+                safe = zip_safe_name(arcname, path)
+                if not safe:
+                    continue
+                entries.append((path, safe, path.stat().st_size))
+    entries.sort(key=lambda item: item[1])
+    return entries
+
+
+def write_zip_parts(entries, out_dir: Path, version: str, budget: int, dry_run: bool) -> tuple[list[dict], int]:
+    parts: list[dict] = []
+    started = time.time()
+    index = 1
+    part_entries: list[tuple[Path, str, int]] = []
+    part_bytes = 0
+
+    def flush() -> None:
+        nonlocal index, part_entries, part_bytes
+        if not part_entries:
+            return
+        name = f"{version}.part{index:03d}.zip"
+        target = out_dir / name
+        if dry_run:
+            print(f"  would write {name}: {len(part_entries)} files, input {human(part_bytes)}")
+        else:
+            with zipfile.ZipFile(target, "w", allowZip64=True) as zf:
+                for src, arcname, _size in part_entries:
+                    compress = (
+                        zipfile.ZIP_STORED
+                        if src.suffix.lower() in STORE_EXTS
+                        else zipfile.ZIP_DEFLATED
+                    )
+                    if compress == zipfile.ZIP_DEFLATED:
+                        zf.write(src, arcname, compress_type=compress, compresslevel=DEFLATE_LEVEL)
+                    else:
+                        zf.write(src, arcname, compress_type=compress)
+            digest = sha256_file(target)
+            size = target.stat().st_size
+            parts.append({
+                "name": name,
+                "size": size,
+                "sha256": digest,
+                "files": len(part_entries),
+                "bytes": part_bytes,
+            })
+            print(f"  -> {name} ({len(part_entries)} files, {human(part_bytes)} input, {human(size)} zip)", flush=True)
+        index += 1
+        part_entries = []
+        part_bytes = 0
+
+    for entry in entries:
+        src, arcname, size = entry
+        if size > budget:
+            # A single huge file (none in practice) still gets its own part.
+            flush()
+            part_entries = [entry]
+            part_bytes = size
+            flush()
+            continue
+        if part_bytes + size > budget:
+            flush()
+        part_entries.append(entry)
+        part_bytes += size
+        if time.time() - started > 10:
+            print(f"  ... {len(part_entries)} files buffered, {human(part_bytes)}", flush=True)
+            started = time.time()
+    flush()
+    return parts, sum(p["size"] for p in parts)
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default=str(ROOT / "data"))
     parser.add_argument("--version", default="data-v1.0.0")
     parser.add_argument("--out", default="")
-    parser.add_argument("--part-size-mib", type=int, default=1800,
-                        help="max size per part (GitHub allows 2048 MiB per asset)")
-    parser.add_argument("--zstd-level", type=int, default=3)
-    parser.add_argument("--trees", default=",".join(DEFAULT_TREES),
-                        help="comma separated trees under data/ (default: runtime trees)")
-    parser.add_argument("--with-4x", action="store_true",
-                        help="also include the optional bg_4x/sprite_4x/bg_cn_4x trees")
+    parser.add_argument("--format", choices=["zip", "tarzst"], default="zip")
+    parser.add_argument("--part-size-mib", type=int, default=1750,
+                        help="input-bytes budget per part (keeps the zip below GitHub's 2048 MiB limit)")
+    parser.add_argument("--trees", default=",".join(DEFAULT_TREES))
+    parser.add_argument("--with-4x", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -93,106 +198,48 @@ def main() -> int:
         trees += OPTIONAL_4X
     out_dir = Path(args.out).expanduser().resolve() if args.out else ROOT / "release" / args.version
     out_dir.mkdir(parents=True, exist_ok=True)
-    part_size = args.part_size_mib * 1024 * 1024
+    budget = args.part_size_mib * 1024 * 1024
     inv = tree_inventory(data_dir, trees)
+    entries = collect_files(data_dir, trees)
     print(f"version : {args.version}")
+    print(f"format  : {args.format}")
     print(f"output  : {out_dir}")
     print(f"trees   : {', '.join(trees)}")
     print(f"input   : {inv['files']} files, {human(inv['bytes'])}")
     if args.dry_run:
         print("dry-run: nothing written")
         return 0
+    if args.format != "zip":
+        raise SystemExit("only --format zip is currently supported by this script")
 
-    tar_cmd = ["tar", "-cf", "-", "-C", str(data_dir.parent), "--sort=name"]
-    tar_cmd += [f"data/{t}" for t in trees]
-    print("tar     :", " ".join(tar_cmd[:6]), "...")
-    zstd_cmd = ["zstd", f"-{args.zstd_level}", "-T0", "-q", "-c"]
-    tar_proc = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE)
-    zstd_proc = subprocess.Popen(zstd_cmd, stdin=tar_proc.stdout, stdout=subprocess.PIPE)
-    assert tar_proc.stdout is not None and zstd_proc.stdout is not None
-    tar_proc.stdout.close()  # let zstd own the only read end
-
-    shas: dict[str, str] = {}
-    parts: list[dict] = []
-    started = time.time()
-    index = 1
-    fh = None
-    hasher = None
-    part_bytes = 0
-    total_out = 0
-
-    def open_part() -> None:
-        nonlocal fh, hasher, part_bytes, index
-        name = f"{args.version}.part{index:03d}.tar.zst"
-        fh = open(out_dir / name, "wb")
-        hasher = hashlib.sha256()
-        part_bytes = 0
-        print(f"  -> {name}", flush=True)
-
-    def close_part() -> None:
-        nonlocal fh, hasher, index
-        if fh is None:
-            return
-        fh.close()
-        name = f"{args.version}.part{index:03d}.tar.zst"
-        digest = hasher.hexdigest()
-        shas[name] = digest
-        parts.append({"name": name, "size": part_bytes, "sha256": digest})
-        fh = None
-        hasher = None
-        index += 1
-
-    open_part()
-    try:
-        while True:
-            chunk = zstd_proc.stdout.read(8 * 1024 * 1024)
-            if not chunk:
-                break
-            offset = 0
-            while offset < len(chunk):
-                room = part_size - part_bytes
-                piece = chunk[offset:offset + room]
-                fh.write(piece)
-                hasher.update(piece)
-                part_bytes += len(piece)
-                total_out += len(piece)
-                offset += len(piece)
-                if part_bytes >= part_size:
-                    close_part()
-                    open_part()
-            if time.time() - started > 5:
-                print(f"  {human(total_out)} compressed, {time.time() - started:.0f}s", flush=True)
-                started = time.time()
-    finally:
-        close_part()
-        zstd_proc.wait()
-        tar_proc.wait()
-        zstd_proc.stdout.close()
-    if tar_proc.returncode not in (0, 1):  # 1 = "changed as we read it" warning
-        raise SystemExit(f"tar failed (rc={tar_proc.returncode})")
-    if zstd_proc.returncode != 0:
-        raise SystemExit(f"zstd failed (rc={zstd_proc.returncode})")
-
+    parts, archive_bytes = write_zip_parts(entries, out_dir, args.version, budget, args.dry_run)
     sums_path = out_dir / "SHA256SUMS"
     sums_path.write_text("".join(f"{p['sha256']}  {p['name']}\n" for p in parts), encoding="utf-8")
     manifest = {
-        "format": "wa2-data-release/1",
+        "format": "wa2-data-release/2",
         "version": args.version,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "generator": "tools/package_data.py",
-        "compression": f"zstd -{args.zstd_level}",
-        "part_size_bytes": part_size,
+        "container": "zip-parts",
+        "part_size_budget_bytes": budget,
         "trees": trees,
         "inventory": inv,
-        "archive_bytes": total_out,
-        "extract": "cat " + args.version + ".part*.tar.zst | zstd -d | tar -xf - -C .",
+        "archive_bytes": archive_bytes,
+        "extract": {
+            "linux": "for f in " + args.version + ".part*.zip; do unzip -oq \"$f\" -d .; done",
+            "macos": "for f in " + args.version + ".part*.zip; do unzip -oq \"$f\" -d .; done"
+                     "   (or double-click each part into the same folder)",
+            "windows": "select all parts -> 7-Zip -> Extract to the same folder"
+                       "   (Explorer: extract each zip to the same folder)",
+            "check": "sha256sum -c SHA256SUMS",
+        },
         "parts": parts,
     }
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print()
-    print(f"done: {len(parts)} parts, {human(total_out)} total")
+    print(f"done: {len(parts)} zip parts, {human(archive_bytes)} total")
     print(f"  {out_dir / 'manifest.json'}")
     print(f"  {out_dir / 'SHA256SUMS'}")
     return 0

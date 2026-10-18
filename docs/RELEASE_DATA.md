@@ -42,26 +42,34 @@
 
 ## 二、下载与解压
 
-### 方式 A：使用仓库自带工具（推荐，支持私有 Release）
+发布物是 **21 个独立 ZIP 分卷，合计 34.14 GB**（`data-v1.0.0.part001.zip` … `part021.zip`），
+**每一个分卷都是完整可解压的压缩包**，解压到同一目录就会合并成 `data/` 树——
+不需要拼接、不需要 zstd/tar。
+
+### Windows
+
+1. 下载全部分卷到同一个文件夹
+2. 全选 → 右键 → **7-Zip → 解压到 "data-v1.0.0\\"**（7-Zip 支持一次解压多个 zip 到同一目录）
+3. 或逐个用资源管理器"全部解压缩"到同一目标文件夹
+
+### macOS
+
+1. 下载全部分卷
+2. 逐个双击（归档实用工具）解压到同一文件夹；或终端：
+   ```bash
+   for f in data-v1.0.0.part*.zip; do unzip -oq "$f" -d .; done
+   ```
+
+### Linux / WSL
 
 ```bash
-# 私有仓库需要带 repo 权限的 token
+for f in data-v1.0.0.part*.zip; do unzip -oq "$f" -d .; done
+# 或使用自动下载/校验/解压工具：
 GITHUB_TOKEN=ghp_xxx python3 tools/fetch_data.py \
-    --repo MuRongxin/wa2-linux_native \
-    --tag data-v1.0.0 \
-    --dest .
+    --repo MuRongxin/wa2-linux_native --tag data-v1.0.0 --dest .
 ```
 
-工具会：下载全部分卷 → 校验 SHA256 → 解压到 `./data/` → 对照 manifest 校验文件数/字节数。
-
-### 方式 B：手动下载
-
-下载 `data-v1.0.0.part*.tar.zst`、`manifest.json`、`SHA256SUMS` 后：
-
-```bash
-sha256sum -c SHA256SUMS
-cat data-v1.0.0.part*.tar.zst | zstd -d | tar -xf - -C .
-```
+> `unzip` 一次只接受一个压缩包，所以要用上面的循环（或 `tools/fetch_data.py`）。
 
 ## 三、运行
 
@@ -84,10 +92,11 @@ python3 tools/build_timeline_cache.py
 
 ## 四、分卷与校验
 
-- 单卷 < 1.8 GiB（GitHub Release 单文件上限 2 GiB）
-- `SHA256SUMS`：每卷的 SHA-256
+- 共 21 个分卷，合计 34.14 GB；每卷 ≤ 1.71 GiB（GitHub Release 单文件上限 2 GiB），各自独立可解压
+- `SHA256SUMS`：每个分卷的 SHA-256，下载后可用 `sha256sum -c SHA256SUMS` 校验
 - `manifest.json`：版本、目录清单、文件数/字节数、分卷校验和、解压命令
-- 下载后必须校验；解压后 `tools/fetch_data.py --check-only` 可复核目录完整性
+- 解压后对照 `manifest.json` 的 `inventory` 检查文件数/字节数
+- 旧的 tar.zst 拼接流格式已废弃（2026-10-18 起改为 ZIP 分卷）
 
 ## 五、可选：4x 素材包（data-v1.0.0-4x）
 
@@ -100,7 +109,7 @@ python3 tools/build_timeline_cache.py
 | `data/bg_cn_4x/` | 31 | 27 MB |
 | 合计 | 2,851 | 约 7.3 GB |
 
-如需要，可按同样方式单独打包为 `data-v1.0.0-4x` Release（`tools/package_data.py --with-4x`）。
+如需要，可用 `tools/package_data.py --version data-v1.0.0-4x --with-4x` 单独打包。
 
 ## 六、构建信息
 

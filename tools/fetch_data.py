@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -164,12 +165,24 @@ def main() -> int:
     print("all parts verified")
 
     print(f"extracting into {dest} ...")
-    zstd = shutil.which("zstd")
-    tar = shutil.which("tar")
-    if not zstd or not tar:
-        raise SystemExit("zstd and tar must be installed")
-    cmd = f"cat {parts_dir}/{manifest['version']}.part*.tar.zst | zstd -d | tar -xf - -C {dest}"
-    subprocess.run(["sh", "-c", cmd], check=True)
+    if manifest.get("container") == "zip-parts":
+        dest_resolved = dest.resolve()
+        for part in parts:
+            zpath = parts_dir / part["name"]
+            print(f"  unzip {part['name']}")
+            with zipfile.ZipFile(zpath) as zf:
+                for info in zf.infolist():
+                    target = (dest / info.filename).resolve()
+                    if target != dest_resolved and dest_resolved not in target.parents:
+                        raise SystemExit(f"unsafe path in {part['name']}: {info.filename}")
+                zf.extractall(dest)
+    else:
+        zstd = shutil.which("zstd")
+        tar = shutil.which("tar")
+        if not zstd or not tar:
+            raise SystemExit("zstd and tar must be installed")
+        cmd = f"cat {parts_dir}/{manifest['version']}.part*.tar.zst | zstd -d | tar -xf - -C {dest}"
+        subprocess.run(["sh", "-c", cmd], check=True)
     print("verifying extracted tree ...")
     ok = verify_manifest_files(dest, manifest)
     return 0 if ok else 1
