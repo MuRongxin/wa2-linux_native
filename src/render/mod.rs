@@ -40,6 +40,42 @@ fn blend(dst: &[u8; 4], src: &[u8; 4]) -> [u8; 4] {
     ]
 }
 
+/// Box-filter one source rectangle down to a single pixel.
+///
+/// Used when a decoded asset is larger than the destination: a 2x background
+/// on a 1920x1080 window, or an 8x sprite on anything smaller than 8x. Nearest
+/// neighbour throws away whole rows and columns when shrinking and makes the
+/// AI-upscaled art look noisy; averaging the covered source rectangle keeps the
+/// detail instead. Colour is averaged weighted by alpha so transparent sprite
+/// pixels do not darken the edge, and the result carries the average alpha.
+fn area_sample(img: &TgaImage, x0: i32, y0: i32, x1: i32, y1: i32) -> [u8; 4] {
+    let iw = img.width as i32;
+    let ih = img.height as i32;
+    if iw <= 0 || ih <= 0 {
+        return [0, 0, 0, 0];
+    }
+    let x0 = x0.max(0).min(iw - 1);
+    let x1 = x1.max(x0 + 1).min(iw);
+    let y0 = y0.max(0).min(ih - 1);
+    let y1 = y1.max(y0 + 1).min(ih);
+    let (mut sa, mut sr, mut sg, mut sb, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = ((y as u32 * img.width + x as u32) * 4) as usize;
+            let a = img.rgba[i + 3] as u64;
+            sa += a;
+            sr += img.rgba[i] as u64 * a;
+            sg += img.rgba[i + 1] as u64 * a;
+            sb += img.rgba[i + 2] as u64 * a;
+            n += 1;
+        }
+    }
+    if n == 0 || sa == 0 {
+        return [0, 0, 0, 0];
+    }
+    [(sr / sa) as u8, (sg / sa) as u8, (sb / sa) as u8, (sa / n) as u8]
+}
+
 impl Surface {
     pub fn new(width: u32, height: u32, bg: [u8; 4]) -> Surface {
         Surface {
@@ -234,16 +270,29 @@ impl Surface {
         if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
             return;
         }
+        // Shrinking (a 2x sprite on a 1080p window) averages the covered source
+        // rectangle; enlarging keeps the cheap nearest sample.
+        let shrink = sw > dw || sh > dh;
         for row in 0..dh as i32 {
             for col in 0..dw as i32 {
-                let sxp = sx + col * sw as i32 / dw as i32;
-                let syp = sy + row * sh as i32 / dh as i32;
-                if sxp < 0 || syp < 0 || sxp >= img.width as i32 || syp >= img.height as i32 {
-                    continue;
-                }
-                let si = ((syp as u32) * img.width + (sxp as u32)) as usize * 4;
-                let a = (img.rgba[si + 3] as u32 * alpha as u32 / 255) as u8;
-                let c = [img.rgba[si], img.rgba[si + 1], img.rgba[si + 2], a];
+                let c = if shrink {
+                    let x0 = sx + col * sw as i32 / dw as i32;
+                    let x1 = sx + (col + 1) * sw as i32 / dw as i32;
+                    let y0 = sy + row * sh as i32 / dh as i32;
+                    let y1 = sy + (row + 1) * sh as i32 / dh as i32;
+                    let mut c = area_sample(img, x0, y0, x1, y1);
+                    c[3] = (c[3] as u32 * alpha as u32 / 255) as u8;
+                    c
+                } else {
+                    let sxp = sx + col * sw as i32 / dw as i32;
+                    let syp = sy + row * sh as i32 / dh as i32;
+                    if sxp < 0 || syp < 0 || sxp >= img.width as i32 || syp >= img.height as i32 {
+                        continue;
+                    }
+                    let si = ((syp as u32) * img.width + (sxp as u32)) as usize * 4;
+                    let a = (img.rgba[si + 3] as u32 * alpha as u32 / 255) as u8;
+                    [img.rgba[si], img.rgba[si + 1], img.rgba[si + 2], a]
+                };
                 self.put(dx + col, dy + row, c);
             }
         }
@@ -264,28 +313,42 @@ impl Surface {
         if dw == 0 || dh == 0 || img.width == 0 || img.height == 0 {
             return;
         }
+        // A decoded asset that is larger than the destination (2x art on a
+        // 1920x1080 window, 8x art on anything smaller) is box-filtered instead
+        // of point-sampled: nearest would keep one source pixel out of every
+        // `scale^2` and alias the AI-upscaled detail badly.
+        let shrink = img.width > dw || img.height > dh;
         for row in 0..dh {
-            let sy = (row as u64 * img.height as u64 / dh as u64) as u32;
             for col in 0..dw {
                 let x = dx + col as i32;
                 let y = dy + row as i32;
                 if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
                     continue;
                 }
-                let sx = (col as u64 * img.width as u64 / dw as u64) as u32;
-                let si = ((sy.min(img.height - 1) * img.width + sx.min(img.width - 1)) * 4) as usize;
-                let di = ((y as u32 * self.width + x as u32) * 4) as usize;
-                let a = img.rgba[si + 3];
-                if a == 0 {
+                let c = if shrink {
+                    let x0 = (col as u64 * img.width as u64 / dw as u64) as i32;
+                    let x1 = ((col as u64 + 1) * img.width as u64 / dw as u64) as i32;
+                    let y0 = (row as u64 * img.height as u64 / dh as u64) as i32;
+                    let y1 = ((row as u64 + 1) * img.height as u64 / dh as u64) as i32;
+                    area_sample(img, x0, y0, x1, y1)
+                } else {
+                    let sy = (row as u64 * img.height as u64 / dh as u64) as u32;
+                    let sx = (col as u64 * img.width as u64 / dw as u64) as u32;
+                    let si = ((sy.min(img.height - 1) * img.width + sx.min(img.width - 1)) * 4) as usize;
+                    [img.rgba[si], img.rgba[si + 1], img.rgba[si + 2], img.rgba[si + 3]]
+                };
+                if c[3] == 0 {
                     continue;
                 }
-                if a == 255 {
-                    self.pixels[di..di + 4].copy_from_slice(&img.rgba[si..si + 4]);
+                let di = ((y as u32 * self.width + x as u32) * 4) as usize;
+                if c[3] == 255 {
+                    self.pixels[di..di + 4].copy_from_slice(&c);
                 } else {
-                    let ia = 255 - a as u32;
-                    self.pixels[di] = ((img.rgba[si] as u32 * a as u32 + self.pixels[di] as u32 * ia) / 255) as u8;
-                    self.pixels[di + 1] = ((img.rgba[si + 1] as u32 * a as u32 + self.pixels[di + 1] as u32 * ia) / 255) as u8;
-                    self.pixels[di + 2] = ((img.rgba[si + 2] as u32 * a as u32 + self.pixels[di + 2] as u32 * ia) / 255) as u8;
+                    let a = c[3] as u32;
+                    let ia = 255 - a;
+                    self.pixels[di] = ((c[0] as u32 * a + self.pixels[di] as u32 * ia) / 255) as u8;
+                    self.pixels[di + 1] = ((c[1] as u32 * a + self.pixels[di + 1] as u32 * ia) / 255) as u8;
+                    self.pixels[di + 2] = ((c[2] as u32 * a + self.pixels[di + 2] as u32 * ia) / 255) as u8;
                     self.pixels[di + 3] = 255;
                 }
             }
@@ -1085,6 +1148,29 @@ mod tests {
         assert_eq!(dst, [50, 10, 10, 255]);
         lerp_pixels(&mut dst, &from, &to, 2, 2);
         assert_eq!(dst, to);
+    }
+
+    /// Shrinking an asset must average the covered source pixels. A 2x
+    /// background on a 1080p window, or an 8x sprite on anything smaller, goes
+    /// through this path; point sampling would keep one pixel in four and make
+    /// the upscaled art look noisy.
+    #[test]
+    fn downscale_box_filters_instead_of_point_sampling() {
+        use crate::codec::tga::TgaImage;
+        let img = TgaImage {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                0, 0, 0, 255, // black
+                255, 255, 255, 255, // white
+                255, 255, 255, 255, // white
+                0, 0, 0, 255, // black
+            ],
+        };
+        let mut s = Surface::new(1, 1, [0, 0, 0, 255]);
+        s.blit_scaled_nearest(&img, 0, 0, 1, 1);
+        let v = s.pixels[0];
+        assert!(v > 100 && v < 160, "2x2 average should be mid grey, got {v}");
     }
 
     #[test]

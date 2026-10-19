@@ -80,7 +80,10 @@ impl Data {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&v| matches!(v, 1 | 2 | 4 | 8))
-            .unwrap_or(1);
+            // The 8x WebP trees are the default source. A checkout that only
+            // has the original TGA tree falls back to 1x below, so running from
+            // the bare binary behaves the same as ./run.sh.
+            .unwrap_or(8);
         let art_scale = if requested_scale > 1 {
             let suffix = format!("{}x", requested_scale);
             let ready = root.join(format!("bg_{}", suffix)).is_dir()
@@ -94,6 +97,10 @@ impl Data {
             1
         };
         if art_scale > 1 {
+            // Publish the effective source scale so diagnostics (the startup
+            // "art: source Nx, decode Mx" line) see the same value the loader
+            // uses. The fallback below already pins the variable to 1.
+            std::env::set_var("WA2_ART_SCALE", art_scale.to_string());
             eprintln!("art: using {}x sibling directories when present", art_scale);
         } else if requested_scale > 1 {
             // The renderer reads the effective scale for layout decisions too;

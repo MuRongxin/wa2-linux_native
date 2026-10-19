@@ -709,6 +709,20 @@ fn set_render_art_scale(win: &sdl2::Sdl) {
     }
     let (w, h) = win.window_size();
     let scale = render_scale_for(w, h);
+    // Always state the two scales once. "bg x.tga" in the scene log is the
+    // resolved *file* name, so without this line it is impossible to tell an
+    // 8x-source run that decodes at 1x from a run that never left the 1x tree.
+    static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    REPORTED.get_or_init(|| {
+        let source = std::env::var("WA2_ART_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        eprintln!(
+            "art: source {}x, decode {}x for window {}x{} (resize the window or go fullscreen for a higher decode scale)",
+            source, scale, w, h
+        );
+    });
     if render_art_scale() != scale {
         std::env::set_var("WA2_RENDER_SCALE", scale.to_string());
         // Pictures decoded for the old window size are the wrong pixel size
@@ -1609,6 +1623,26 @@ fn run_game_at(
         win_size = win.window_size();
         if render_scale_for(win_size.0, win_size.1) != render_art_scale() {
             set_render_art_scale(win);
+            // Re-decode the picture on screen at the new scale. Waiting for the
+            // next background change would show the current scene stretched up
+            // from the old resolution.
+            let dirs = s.bg_dirs();
+            let reload = match bg_id {
+                Some((id, variant)) => s.bg_index.resolve(id, variant),
+                None if !bg_label.eq_ignore_ascii_case("BLACK") => Some(bg_label.clone()),
+                None => None,
+            };
+            if let Some(name) = reload {
+                if let Some(asset) = load_background_asset(&dirs, &name) {
+                    bg = asset.img;
+                    bg_label = name;
+                    eprintln!(
+                        "art: reloaded {} at decode scale {}x",
+                        bg_label,
+                        render_art_scale()
+                    );
+                }
+            }
         }
             let event = if park_wait {
                 park_wait = false;
@@ -2359,6 +2393,7 @@ fn run_game_at(
                                                     other,
                                                     win,
                                                     font,
+                                                    vfont.as_mut(),
                                                     s,
                                                     &mut settings,
                                                     mixer.as_ref(),
@@ -2634,6 +2669,10 @@ fn run_game_at(
                                             menu::run(win, &dirs, &mut st, mixer.as_ref());
                                             settings = menu::Settings::load();
                                             menu::apply(&settings, mixer.as_ref());
+                                            // 「画面模式」 must take effect without a
+                                            // trip back to the title screen.
+                                            win.set_fullscreen(settings.win_disp == 1);
+                                            set_render_art_scale(win);
                                         }
                                         2 => {
                                             let st = make_save(
@@ -2720,6 +2759,7 @@ fn run_game_at(
                                                 other,
                                                 win,
                                                 font,
+                                                vfont.as_mut(),
                                                 s,
                                                 &mut settings,
                                                 mixer.as_ref(),
@@ -3316,6 +3356,9 @@ fn handle_cmd(
     cmd: cmdbar::Cmd,
     win: &mut sdl2::Sdl,
     font: &render::Font,
+    // The history screen is the last modal that still drew from the atlas;
+    // the vector font rides along so it matches the dialog it replays.
+    vfont: Option<&mut render::text::VectorFont>,
     s: &Session,
     settings: &mut menu::Settings,
     mixer: Option<&audio::Mixer>,
@@ -3406,10 +3449,12 @@ fn handle_cmd(
             menu::run(win, &s.bg_dirs(), &mut st, mixer);
             *settings = menu::Settings::load();
             menu::apply(settings, mixer);
+            win.set_fullscreen(settings.win_disp == 1);
+            set_render_art_scale(win);
             CmdOutcome::Stay
         }
         cmdbar::Cmd::Backlog => {
-            show_backlog(win, font, backlog, frame, &s.bg_dirs());
+            show_backlog(win, font, vfont, backlog, frame, &s.bg_dirs());
             CmdOutcome::Stay
         }
         // toggles are handled by the caller
@@ -3417,8 +3462,18 @@ fn handle_cmd(
     }
 }
 
-/// One visual row of the text history. An empty string is a gap between lines.
-fn backlog_rows(lines: &[String]) -> Vec<String> {
+/// One visual row of the text history. An empty text is the gap between two
+/// logged lines; a name row is drawn with the speaker style so the history
+/// reads like the dialog it came from.
+struct BacklogRow {
+    text: String,
+    name: bool,
+}
+
+/// Wrap the history into rows. With a vector font the wrap follows the font's
+/// own advances instead of the atlas cell pitch, so a Chinese line stops using
+/// the Japanese layout's 28px-per-character rhythm.
+fn backlog_rows(lines: &[String], vf: Option<&render::text::VectorFont>) -> Vec<BacklogRow> {
     let max_w = 1080;
     let mut rows = Vec::new();
     for line in lines {
@@ -3427,44 +3482,57 @@ fn backlog_rows(lines: &[String]) -> Vec<String> {
             _ => (None, line.as_str()),
         };
         if let Some(n) = name {
-            push_wrapped(&mut rows, n, max_w);
+            push_wrapped(&mut rows, n, max_w, vf, true);
         }
         if body.is_empty() {
-            rows.push(String::new());
+            rows.push(BacklogRow { text: String::new(), name: false });
         } else {
             for part in body.split('\n') {
-                push_wrapped(&mut rows, part, max_w);
+                push_wrapped(&mut rows, part, max_w, vf, false);
             }
         }
-        rows.push(String::new());
+        rows.push(BacklogRow { text: String::new(), name: false });
     }
     rows
 }
 
-fn push_wrapped(rows: &mut Vec<String>, text: &str, max_w: i32) {
+fn push_wrapped(
+    rows: &mut Vec<BacklogRow>,
+    text: &str,
+    max_w: i32,
+    vf: Option<&render::text::VectorFont>,
+    name: bool,
+) {
     let mut buf = String::new();
     let mut x = 0i32;
     for ch in text.chars() {
         if ch == '\r' {
             continue;
         }
-        let adv = if (ch as u32) < 128 { 14 } else { 28 };
+        let adv = match vf {
+            Some(f) => f.measure_char(ch),
+            None if (ch as u32) < 128 => 14,
+            None => 28,
+        };
         if x + adv > max_w && !buf.is_empty() {
-            rows.push(std::mem::take(&mut buf));
+            rows.push(BacklogRow { text: std::mem::take(&mut buf), name });
             x = 0;
         }
         buf.push(ch);
         x += adv;
     }
     if !buf.is_empty() {
-        rows.push(buf);
+        rows.push(BacklogRow { text: buf, name });
     }
 }
 
 fn paint_backlog(
     scene: &render::Surface,
     font: &render::Font,
-    rows: &[String],
+    // Chinese mode draws the history with the vector font; Japanese keeps the
+    // bitmap atlas, whose cell pitch the row layout below is built around.
+    mut vf: Option<&mut render::text::VectorFont>,
+    rows: &[BacklogRow],
     top: usize,
     per_page: usize,
     header: Option<&codec::tga::TgaImage>,
@@ -3490,9 +3558,25 @@ fn paint_backlog(
         surf.blit(h, 0, 0);
     }
     let mut y = TEXT_Y;
+    // The history screen is authored at 1280x720 like the rest of its panels,
+    // so the vector text stays at the layout size rather than scaling with the
+    // window.
+    if let Some(f) = vf.as_mut() {
+        let _ = f.set_size(render::DIALOG_FONT_720);
+    }
+    let body_style = render::text::TextStyle::for_role(render::text::TextRole::Body);
+    let name_style = render::text::TextStyle::for_role(render::text::TextRole::Name);
     for row in rows.iter().skip(top).take(per_page) {
-        if !row.is_empty() {
-            font.draw_pitch(&mut surf, row, TEXT_X, y, render::DIALOG_PITCH);
+        if !row.text.is_empty() {
+            match vf.as_mut() {
+                Some(f) => {
+                    let f = &mut **f;
+                    let style = if row.name { name_style } else { body_style };
+                    let baseline = f.baseline_in_box(y, LINE_H);
+                    f.draw_styled(&mut surf, &row.text, TEXT_X, baseline, &style);
+                }
+                None => font.draw_pitch(&mut surf, &row.text, TEXT_X, y, render::DIALOG_PITCH),
+            }
         }
         y += LINE_H;
         if y >= TEXT_BOTTOM {
@@ -3529,6 +3613,7 @@ fn paint_backlog(
 fn show_backlog(
     win: &mut sdl2::Sdl,
     font: &render::Font,
+    mut vf: Option<&mut render::text::VectorFont>,
     lines: &[String],
     scene: &render::Surface,
     dirs: &[&std::path::Path],
@@ -3542,7 +3627,7 @@ fn show_backlog(
     const BAR_Y: i32 = 40;
     const BAR_H: i32 = 640;
     const COL_W: i32 = 32;
-    let rows = backlog_rows(lines);
+    let rows = backlog_rows(lines, vf.as_deref());
     let per_page = ((TEXT_BOTTOM - TEXT_Y) / LINE_H) as usize;
     let total = rows.len();
     let max_top = total.saturating_sub(per_page);
@@ -3558,6 +3643,7 @@ fn show_backlog(
         let surf = paint_backlog(
             scene,
             font,
+            vf.as_deref_mut(),
             &rows,
             top,
             per_page,
@@ -5703,13 +5789,15 @@ mod backlog_paint {
             "春希：不我".to_string(),
             "春希：不我".to_string(),
         ];
-        let rows = super::backlog_rows(&lines);
+        let rows = super::backlog_rows(&lines, None);
         assert!(rows.len() > 2, "a name and a body should not collapse into one row");
+        assert!(rows.iter().any(|r| r.name), "the speaker should be its own row");
         let per_page = 19;
         let top = rows.len().saturating_sub(per_page);
         let surf = super::paint_backlog(
             &scene,
             &font,
+            None,
             &rows,
             top,
             per_page,
@@ -5723,6 +5811,64 @@ mod backlog_paint {
         assert!(surf.pixels[i + 2] > surf.pixels[i], "banner should be cyan, not grey");
         let _ = std::fs::create_dir_all("/tmp/wa2btn");
         let _ = surf.save_tga("/tmp/wa2btn/backlog.tga");
+    }
+
+    /// The history is the last screen that still reached for the atlas. In
+    /// Chinese mode it draws with the vector font, and the two renders have to
+    /// differ - that is the whole point of the change.
+    #[test]
+    fn history_paints_the_lines_with_the_vector_font() {
+        let Some(mut vf) = crate::render::text::VectorFont::open(
+            crate::render::text::DEFAULT_FONT,
+            crate::render::DIALOG_FONT_720,
+        ) else {
+            return;
+        };
+        let dirs = [
+            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let header = super::load_background(&dirs, "sys_00032.tga");
+        let scroll = super::load_background(&dirs, "sys_00030.tga");
+        let scene = crate::render::Surface::new(1280, 720, [80, 120, 160, 255]);
+        let lines = vec![
+            "春希：不我".to_string(),
+            "冬马和纱：白色的季节里".to_string(),
+        ];
+        let rows = super::backlog_rows(&lines, Some(&vf));
+        assert!(rows.iter().any(|r| r.name), "speaker row is missing");
+        let painted = super::paint_backlog(
+            &scene,
+            &crate::render::Font::from_cell_map(
+                crate::codec::tga::decode_font(
+                    &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
+                )
+                .unwrap(),
+                40,
+                std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
+            )
+            .unwrap(),
+            Some(&mut vf),
+            &rows,
+            0,
+            19,
+            header.as_ref(),
+            scroll.as_ref(),
+            false,
+            false,
+        );
+        // Ink where the lines are, in the text column and below the banner.
+        let mut ink = 0usize;
+        for y in 52..680 {
+            for x in 72..1160 {
+                let i = ((y * 1280 + x) * 4) as usize;
+                if painted.pixels[i] > 200 {
+                    ink += 1;
+                }
+            }
+        }
+        assert!(ink > 200, "vector history drew no glyphs ({ink} px)");
+        let _ = painted.save_tga("/tmp/wa2btn/backlog_vector.tga");
     }
 
     #[test]
