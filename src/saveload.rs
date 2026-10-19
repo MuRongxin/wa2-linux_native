@@ -209,7 +209,7 @@ pub fn run(
                     scr.cursor += 1;
                 }
             }
-            sdl2::Input::Advance => activate = Some(scr.cursor),
+            sdl2::Input::Advance | sdl2::Input::Right => activate = Some(scr.cursor),
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 if let Some(i) = cell_at(sx, sy, scr.page) {

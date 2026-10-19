@@ -98,6 +98,9 @@ pub enum Input {
     None,
     Advance,
     Back,
+    /// Right arrow. The timeline uses it to step forward along the scenario
+    /// graph; every other screen treats it as Advance.
+    Right,
     /// Menu navigation (arrow up / down).
     Up,
     Down,
@@ -369,7 +372,8 @@ impl Sdl {
                         SDLK_LEFT => out = Input::Back,
                         SDLK_UP => out = Input::Up,
                         SDLK_PAGEUP => out = Input::Rewind,
-                        SDLK_SPACE | SDLK_RETURN | SDLK_RIGHT => out = Input::Advance,
+                        SDLK_SPACE | SDLK_RETURN => out = Input::Advance,
+                        SDLK_RIGHT => out = Input::Right,
                         SDLK_DOWN => out = Input::Down,
                         SDLK_1 => out = Input::Choice(1),
                         SDLK_2 => out = Input::Choice(2),

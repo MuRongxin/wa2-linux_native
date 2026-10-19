@@ -8,8 +8,8 @@ use super::*;
 
 /// Movement smaller than this stays a click. Past it, the chart follows the cursor.
 pub(super) const DRAG_SLOP: i32 = 5;
-pub(super) const ZOOM_MIN: f32 = 0.4;
-pub(super) const ZOOM_MAX: f32 = 2.4;
+pub(crate) const ZOOM_MIN: f32 = 0.4;
+pub(crate) const ZOOM_MAX: f32 = 2.4;
 
 pub(super) struct Hold {
     pub(super) ax: i32,
@@ -159,7 +159,18 @@ pub(super) fn step(chart: &Chart, sel: usize, dir: i32) -> usize {
         let target = &chart.nodes[edge.to];
         if (target.col > node.col && dir > 0) || (target.col < node.col && dir < 0) {
             let score = (target.col - node.col).abs();
-            if best_target.map(|b| score < (chart.nodes[b].col - node.col).abs()).unwrap_or(true) {
+            let better = match best_target {
+                None => true,
+                Some(best) => {
+                    let best_score = (chart.nodes[best].col - node.col).abs();
+                    // Branch fan-outs put their targets in equal columns. Ties
+                    // go to the lower scenario id, so Right from 2019 walks to
+                    // 2020 (the main continuation) instead of a random sibling.
+                    score < best_score
+                        || (score == best_score && target.id.as_str() < chart.nodes[best].id.as_str())
+                }
+            };
+            if better {
                 best_target = Some(edge.to);
             }
         }
@@ -189,22 +200,43 @@ pub(super) fn step(chart: &Chart, sel: usize, dir: i32) -> usize {
     best.map(|(_, i)| i).unwrap_or(sel)
 }
 
-/// Up/down: nearest node in an adjacent lane, preferring the same columns.
+/// Up/down: nearest node in another lane *in the same x region*.
+///
+/// Candidates are ranked by (distance from the current column to the
+/// candidate chapter's band, |lane delta|, |column delta|). The band term is
+/// what keeps a vertical step inside the chapter that spans the current
+/// column: ranking by (|lane|, |column|) alone could jump from a CODA scene
+/// to an early route thumbnail merely because it happened to sit in the next
+/// lane and nearby.
 pub(super) fn step_lane(chart: &Chart, sel: usize, dir: i32) -> usize {
     let col = chart.nodes[sel].col;
     let lane = chart.nodes[sel].lane;
-    let mut best: Option<(i32, i32, usize)> = None;
+    let mut best: Option<((i32, i32, i32), usize)> = None;
     for (i, n) in chart.nodes.iter().enumerate() {
         let dl = n.lane - lane;
         if dir < 0 && dl >= 0 || dir > 0 && dl <= 0 {
             continue;
         }
-        let score = (dl.abs(), (n.col - col).abs());
-        if best.map(|(a, b, _)| score < (a, b)).unwrap_or(true) {
-            best = Some((score.0, score.1, i));
+        let band = band_gap(chart, n.chapter, col).unwrap_or((n.col - col).abs());
+        let score = (band, dl.abs(), (n.col - col).abs());
+        if best.map(|(current, _)| score < current).unwrap_or(true) {
+            best = Some((score, i));
         }
     }
-    best.map(|(_, _, i)| i).unwrap_or(sel)
+    best.map(|(_, i)| i).unwrap_or(sel)
+}
+
+/// How far the column is outside the chapter's band; 0 when the band covers
+/// it. None when the chapter draws no band (a fallback node).
+fn band_gap(chart: &Chart, chapter: &Chapter, col: i32) -> Option<i32> {
+    let band = chart.bands.iter().find(|b| std::ptr::eq(b.chapter, chapter))?;
+    Some(if col < band.first_col {
+        band.first_col - col
+    } else if col > band.last_col {
+        col - band.last_col
+    } else {
+        0
+    })
 }
 
 /// Tab: jump to the next chapter band (wrapping).
@@ -405,5 +437,160 @@ mod tests {
         assert_eq!(hit_node(&chart, &view, x + w / 2, y + h / 2), Some(0));
         assert_eq!(hit_node(&chart, &view, x + w / 2, y - 20), None);
         let _ = (HashMap::<u8, u8>::new(), DRAG_SLOP, ZOOM_MIN, ZOOM_MAX);
+    }
+
+    // ---- synthetic charts for the graph-first movement rules ----
+
+    fn chapter(key: &str) -> &'static Chapter {
+        chapters::CHAPTERS
+            .iter()
+            .find(|c| c.key == key)
+            .unwrap_or_else(|| panic!("chapter {key} is not in the table"))
+    }
+
+    fn chapter_node(id: &str, col: i32, lane: i32, chapter: &'static Chapter) -> Node {
+        Node {
+            id: id.into(),
+            chapter,
+            col,
+            lane,
+            next: Vec::new(),
+            root: false,
+            ending: false,
+            shot: Vec::new(),
+        }
+    }
+
+    fn band(chapter: &'static Chapter, first_col: i32, last_col: i32) -> Band {
+        Band { chapter, first_col, last_col, min_lane: 0, max_lane: 5 }
+    }
+
+    fn chart_of_nodes(nodes: Vec<Node>, bands: Vec<Band>) -> Chart {
+        Chart { nodes, here: None, bands }
+    }
+
+    #[test]
+    fn right_follows_the_nearest_branch_edge() {
+        // Three exits, two of them to the right: the near one wins.
+        let mut a = node("a", 0, 0, vec![1, 2, 3]);
+        a.next = vec![
+            Edge { to: 1, kind: EdgeKind::Branch, label: "far".into() },
+            Edge { to: 2, kind: EdgeKind::Branch, label: "near".into() },
+            Edge { to: 3, kind: EdgeKind::Branch, label: "back".into() },
+        ];
+        let chart = chart_of(vec![
+            a,
+            node("far", 8, 0, vec![]),
+            node("near", 2, 0, vec![]),
+            node("back", -3, 0, vec![]),
+        ]);
+        assert_eq!(chart.nodes[step(&chart, 0, 1)].id, "near");
+        // Only the backward edge points left, so that is the step.
+        assert_eq!(chart.nodes[step(&chart, 0, -1)].id, "back");
+        // At the rightmost node of the lane there is nowhere further right.
+        assert_eq!(step(&chart, 1, 1), 1);
+    }
+
+    #[test]
+    fn up_prefers_the_band_that_spans_the_current_column() {
+        // Real chart shape: a CODA·雪菜 scene sits above the main CODA row.
+        // Pressing up must stay in the CODA band that covers the current
+        // column, not jump to an early CC 共通 scene that happens to have the
+        // nearest thumbnail. The band term is the first tie-break.
+        let coda_setsuna = chapter("coda_setsuna");
+        let coda = chapter("coda");
+        let common = chapter("cc_common");
+        let nodes = vec![
+            chapter_node("3201", 40, coda_setsuna.lane, coda_setsuna),
+            chapter_node("2019", 39, common.lane, common),
+            chapter_node("3001", 38, coda.lane, coda),
+            chapter_node("3024", 52, coda.lane, coda),
+        ];
+        let bands = vec![band(common, 39, 39), band(coda, 38, 52)];
+        let chart = chart_of_nodes(nodes, bands);
+        let up = step_lane(&chart, 0, -1);
+        assert_eq!(chart.nodes[up].chapter.key, "coda", "landed on {}", chart.nodes[up].id);
+        assert_ne!(chart.nodes[up].chapter.key, "cc_common");
+        // Inside the winning band the nearest scene of that lane is chosen.
+        assert_eq!(chart.nodes[up].id, "3001");
+    }
+
+    #[test]
+    fn a_vertical_step_prefers_the_nearest_lane() {
+        // Both candidates' bands cover the current column, so the lane gap and
+        // then the column distance decide.
+        let nodes = vec![
+            chapter_node("cur", 10, chapter("coda").lane, chapter("coda")),
+            chapter_node("lane1", 12, chapter("cc_koharu").lane, chapter("cc_koharu")),
+            chapter_node("lane0", 10, chapter("cc_chiaki").lane, chapter("cc_chiaki")),
+        ];
+        let bands = vec![band(chapter("cc_koharu"), 5, 15), band(chapter("cc_chiaki"), 5, 15)];
+        let chart = chart_of_nodes(nodes, bands);
+        assert_eq!(chart.nodes[step_lane(&chart, 0, -1)].id, "lane1", "one lane away beats two");
+
+        // Down goes to the nearer lane on the other side.
+        let nodes = vec![
+            chapter_node("cur", 10, chapter("coda").lane, chapter("coda")),
+            chapter_node("lane3", 9, chapter("coda_setsuna").lane, chapter("coda_setsuna")),
+            chapter_node("lane4", 10, chapter("coda_kazusa").lane, chapter("coda_kazusa")),
+        ];
+        let bands = vec![band(chapter("coda_setsuna"), 0, 25), band(chapter("coda_kazusa"), 0, 25)];
+        let chart = chart_of_nodes(nodes, bands);
+        assert_eq!(chart.nodes[step_lane(&chart, 0, 1)].id, "lane3");
+    }
+
+    #[test]
+    fn a_vertical_step_prefers_the_nearest_column() {
+        // Same lane and the same band for both candidates, so the column
+        // distance is the last tie-break.
+        let koharu = chapter("cc_koharu");
+        let nodes = vec![
+            chapter_node("cur", 10, chapter("coda").lane, chapter("coda")),
+            chapter_node("near", 7, koharu.lane, koharu),
+            chapter_node("far", 20, koharu.lane, koharu),
+        ];
+        let chart = chart_of_nodes(nodes, vec![band(koharu, 0, 25)]);
+        assert_eq!(chart.nodes[step_lane(&chart, 0, -1)].id, "near");
+    }
+
+    #[test]
+    fn a_vertical_step_stays_put_at_the_edge() {
+        let chart = chart_of_nodes(
+            vec![chapter_node("only", 3, 0, chapter("coda"))],
+            Vec::new(),
+        );
+        assert_eq!(step_lane(&chart, 0, -1), 0);
+        assert_eq!(step_lane(&chart, 0, 1), 0);
+    }
+
+    #[test]
+    fn home_end_and_reset_follow_the_story() {
+        let mut a = chapter_node("a", 4, 1, chapter("ic"));
+        a.root = true;
+        let mut b = chapter_node("b", 10, 1, chapter("cc_common"));
+        b.ending = true;
+        let mut c = chapter_node("c", 7, 0, chapter("ic"));
+        c.root = true;
+        let chart = chart_of_nodes(vec![a, b, c], Vec::new());
+        assert_eq!(chart.nodes[home(&chart)].id, "a", "Home is the earliest root");
+        assert_eq!(chart.nodes[end(&chart, 1)].id, "b");
+        let mut view = View { zoom: 2.0, target_zoom: 2.0, scroll_x: 500.0, scroll_y: 200.0 };
+        reset_view(&chart, &mut view);
+        assert_eq!((view.zoom, view.target_zoom, view.scroll_x), (1.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn focus_view_brings_the_selection_inside_the_safe_area() {
+        let chart = chart_of_nodes(
+            vec![chapter_node("far", 40, chapter("coda").lane, chapter("coda"))],
+            Vec::new(),
+        );
+        let mut view = View { zoom: 1.0, target_zoom: 1.0, scroll_x: 0.0, scroll_y: 0.0 };
+        let (x, _, _, _) = place(&chart.nodes[0], &view);
+        assert!(x > W, "the node starts off screen at {x}");
+        focus_view(&chart, 0, &mut view);
+        let (x, y, w, h) = place(&chart.nodes[0], &view);
+        assert!(x >= 0 && x + w <= W, "x {x}..{x}+{w} outside {W}");
+        assert!(y >= CHART_TOP && y + h <= PREVIEW_TOP, "y {y}..{y}+{h} outside the chart");
     }
 }

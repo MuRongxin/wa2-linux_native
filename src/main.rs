@@ -312,7 +312,7 @@ fn main() {
                 win.present(&surf);
                 loop {
                     match win.poll_input() {
-                        sdl2::Input::Advance => { if idx < n - 1 { idx += 1; } break; }
+                        sdl2::Input::Advance | sdl2::Input::Right => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Back => { if idx > 0 { idx -= 1; } break; }
                         sdl2::Input::Up => { if idx > 0 { idx -= 1; } break; }
                         sdl2::Input::Down => { if idx < n - 1 { idx += 1; } break; }
@@ -421,7 +421,7 @@ fn main() {
                 // wait for input
                 loop {
                     match win.poll_input() {
-                        sdl2::Input::Advance => { if idx < n - 1 { idx += 1; } break; }
+                        sdl2::Input::Advance | sdl2::Input::Right => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Back => { if idx > 0 { idx -= 1; } break; }
                         sdl2::Input::Up => { if idx > 0 { idx -= 1; } break; }
                         sdl2::Input::Down => { if idx < n - 1 { idx += 1; } break; }
@@ -3093,7 +3093,7 @@ fn run_game_at(
                                         }
                                     }
                                 },
-                                sdl2::Input::Advance => {
+                                sdl2::Input::Advance | sdl2::Input::Right => {
                                     if cmd_rewind || rewind_left > 0 {
                                         cmd_rewind = false;
                                         rewind_left = 0;
@@ -3595,6 +3595,7 @@ fn show_toast(
             sdl2::Input::Quit => return false,
             sdl2::Input::Pointer { pressed: true, .. }
             | sdl2::Input::Advance
+            | sdl2::Input::Right
             | sdl2::Input::Back => return true,
             _ => win.delay(16),
         }
@@ -3956,7 +3957,7 @@ fn show_backlog(
         );
         win.present(&surf);
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::Back | sdl2::Input::RightClick | sdl2::Input::Advance => {
+            sdl2::Input::Quit | sdl2::Input::Back | sdl2::Input::RightClick | sdl2::Input::Advance | sdl2::Input::Right => {
                 return;
             }
             sdl2::Input::Up => top = top.saturating_sub(1),
@@ -4371,7 +4372,7 @@ fn present_rewind_frame(
 fn rewind_cruise_stop(win: &mut sdl2::Sdl, bar: &cmdbar::CmdBar, hover: &mut Option<cmdbar::Cmd>) -> Cruise {
     match win.poll_input() {
         sdl2::Input::Quit => Cruise::Quit,
-        sdl2::Input::Advance | sdl2::Input::Rewind | sdl2::Input::RightClick => Cruise::Stop,
+        sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Rewind | sdl2::Input::RightClick => Cruise::Stop,
         sdl2::Input::Wheel { y } if y < 0 => Cruise::Stop,
         sdl2::Input::Release { x, y } => {
             let (sx, sy) = win.surface_pos(x, y, 1280, 720);
@@ -4856,7 +4857,7 @@ fn browse_cg(win: &mut sdl2::Sdl, font: &render::Font, dirs: &[&std::path::Path]
         win.present(&surf);
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
-            sdl2::Input::Advance | sdl2::Input::Down => i = (i + 1) % names.len(),
+            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Down => i = (i + 1) % names.len(),
             sdl2::Input::Up => i = (i + names.len() - 1) % names.len(),
             sdl2::Input::Pointer { x, y, pressed: true } => {
                 let (sx, _) = win.surface_pos(x, y, W, H);
@@ -5218,8 +5219,7 @@ fn run_special(
         bar_y = (Y0 + p as i32 * PITCH) as f32;
     }
     loop {
-        if auto_pick.is_some() {
-            auto_pick = None;
+        if auto_pick.take().is_some() {
             win.delay(400);
             return pick(sel);
         }
@@ -5235,7 +5235,7 @@ fn run_special(
                 sel = (sel + 1) % N;
                 play_cursor(mixer, cursor);
             }
-            sdl2::Input::Advance | sdl2::Input::Choice(_) => return pick(sel),
+            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Choice(_) => return pick(sel),
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 if let Some(i) = (0..N).find(|i| {
@@ -5373,7 +5373,7 @@ fn run_music(
                     play_cursor(mixer, cursor);
                 }
             }
-            sdl2::Input::Advance | sdl2::Input::Choice(_) => {
+            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Choice(_) => {
                 if let Some((id, path)) = tracks.get(selected) {
                     if let Some(mx) = mixer {
                         if let Some((_, slot)) = playing.take() { mx.stop(slot); }
@@ -5692,7 +5692,7 @@ fn run_title(
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
                     play_cursor(mixer.as_ref(), cursor.as_deref());
                 }
-                sdl2::Input::Advance => confirm = true,
+                sdl2::Input::Advance | sdl2::Input::Right => confirm = true,
                 sdl2::Input::Choice(k) => {
                     sel = ((k as usize).saturating_sub(1)).min(N - 1);
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);

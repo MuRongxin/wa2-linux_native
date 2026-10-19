@@ -179,8 +179,23 @@ pub fn run(
         .collect();
     eprintln!("timeline: {} scenes, {} chapters", chart.nodes.len(), chart.bands.len());
 
+    // Verification hooks (same spirit as WA2_TITLE_AUTO): open the chart on a
+    // given scene / zoom so a headless screenshot can pin one visual state.
     let mut sel = chart.here.unwrap_or(0);
-    let mut view = View { zoom: 1.0, target_zoom: 1.0, scroll_x: 0.0, scroll_y: 0.0 };
+    if let Some(want) = std::env::var_os("WA2_TIMELINE_SEL") {
+        let want = want.to_string_lossy().into_owned();
+        if let Some(i) = chart.nodes.iter().position(|node| node.id == want) {
+            sel = i;
+        } else {
+            eprintln!("timeline: WA2_TIMELINE_SEL={want} is not a chart node");
+        }
+    }
+    let start_zoom = std::env::var("WA2_TIMELINE_ZOOM")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(1.0)
+        .clamp(nav::ZOOM_MIN, nav::ZOOM_MAX);
+    let mut view = View { zoom: start_zoom, target_zoom: start_zoom, scroll_x: 0.0, scroll_y: 0.0 };
     nav::focus_view(&chart, sel, &mut view);
     let mut hover: Option<usize> = None;
     let mut hold: Option<nav::Hold> = None;
@@ -221,6 +236,10 @@ pub fn run(
             sdl2::Input::Advance => return Some(chart.nodes[sel].id.clone()),
             sdl2::Input::Back => {
                 sel = nav::step(&chart, sel, -1);
+                nav::focus_view(&chart, sel, &mut view);
+            }
+            sdl2::Input::Right => {
+                sel = nav::step(&chart, sel, 1);
                 nav::focus_view(&chart, sel, &mut view);
             }
             sdl2::Input::Up => {

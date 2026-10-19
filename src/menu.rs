@@ -1999,7 +1999,7 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                 }
             }
             sdl2::Input::Back => activate = Some(Act::Close),
-            sdl2::Input::Advance => activate = Some(Act::Close),
+            sdl2::Input::Advance | sdl2::Input::Right => activate = Some(Act::Close),
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 let hots = page_hots(scr.page);
