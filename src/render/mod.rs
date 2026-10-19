@@ -731,8 +731,9 @@ pub fn render_scene_ex(
     frame: Option<&TgaImage>,
     // 0..=255 scale applied on top of the plate's own alpha.
     window_alpha: u8,
-    // 0..=255 darken of the scene art (background, sprites, overlays) before
-    // the dialog box is drawn.
+    // 0..=255 darken of the background art in novel scenes (the original's
+    // バックグラウンド不透明度). Characters and overlays keep full brightness;
+    // the default setting is 0 (no dim).
     shade: u8,
     // Extra plates (ACT176): items, effect layers, composite CG pieces.
     // Already positioned in surface space, drawn under the dialog box.
@@ -776,6 +777,14 @@ pub fn compose_scene_art(
     let (ox, oy) = ((w - dw) / 2, (h - dh) / 2);
     s.blit_scaled_nearest(bg, ox as i32, oy as i32, dw, dh);
 
+    // 「バックグラウンド不透明度（ノベルシーン時）」: the original darkens the
+    // background art in normal scenes so the message window reads, but the
+    // characters on stage are not background and keep full brightness.
+    // Applying the dim here (after the background, before the sprites and
+    // overlays) matches that: standing sprites used to go dark with it, which
+    // made every character look unlit.
+    s.dim(shade);
+
     // Standing character sprites (bottom-anchored), below the dialog box.
     for sp in sprites {
         let dx = (sp.x as i64 * w as i64 / LAYOUT_W as i64) as i32;
@@ -802,7 +811,6 @@ pub fn compose_scene_art(
     if let Some(lut) = lut {
         s.apply_lut(lut);
     }
-    s.dim(shade);
 
     // Dialog box near the bottom. The lowest 44 px of the screen are left free
     // for the command button row, so the box is shorter than it used to be.
@@ -1240,5 +1248,43 @@ mod tests {
         assert!(mid > 40 && mid < 220, "mid {mid}");
         assert_eq!(up.pixels[0], 0);
         assert_eq!(up.pixels[12], 255);
+    }
+
+    /// The 「バックグラウンド不透明度」 dim belongs to the background only: the
+    /// characters on stage must keep full brightness (they used to go dark
+    /// with the background, which made every sprite look unlit).
+    #[test]
+    fn background_dim_leaves_sprites_bright() {
+        use super::{compose_scene_art, SpriteDraw};
+        use crate::codec::tga::TgaImage;
+        let bg = TgaImage {
+            width: LAYOUT_W,
+            height: LAYOUT_H,
+            rgba: [200u8, 200, 200, 255].repeat((LAYOUT_W * LAYOUT_H) as usize),
+        };
+        let sprite = TgaImage { width: 64, height: 64, rgba: [250u8, 250, 250, 255].repeat(64 * 64) };
+        let draws = [SpriteDraw {
+            img: &sprite,
+            logical_w: 64,
+            logical_h: 64,
+            x: 608,
+            y: 656,
+            alpha: 255,
+        }];
+        let undimmed = compose_scene_art(&bg, LAYOUT_W, LAYOUT_H, &draws, None, false, None, None, 255, 0, &[]);
+        let dimmed = compose_scene_art(&bg, LAYOUT_W, LAYOUT_H, &draws, None, false, None, None, 255, 90, &[]);
+        let px = |s: &Surface, x: u32, y: u32| {
+            let i = ((y * s.width + x) * 4) as usize;
+            s.pixels[i]
+        };
+        assert_eq!(px(&undimmed, 10, 10), 200);
+        assert!(px(&dimmed, 10, 10) < 150, "background should dim, got {}", px(&dimmed, 10, 10));
+        // Inside the 64x64 character at (608,656).
+        assert_eq!(px(&undimmed, 640, 690), 250);
+        assert_eq!(
+            px(&undimmed, 640, 690),
+            px(&dimmed, 640, 690),
+            "the background dim must not darken the character"
+        );
     }
 }

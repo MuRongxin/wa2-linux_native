@@ -152,7 +152,10 @@ impl Default for Settings {
             effect: 1,
             alpha_novel: LEVELS,
             alpha_cg: LEVELS,
-            alpha_back: LEVELS,
+            // 「バックグラウンド不透明度（ノベルシーン時）」 defaults to 0 in
+            // the original exe (WA2.exe reads win_color with default 0), i.e.
+            // the background is not dimmed unless the player raises it.
+            alpha_back: 0,
             alpha_command: LEVELS,
             yes_no: 1,
             r_click: 1,
@@ -1077,13 +1080,13 @@ fn page_labs(page: usize) -> Vec<Lab> {
             v.push(row(48, 226, 240, 28, "画面特效", ""));
             v.push(btn(458, 222, 252, 36, "瞬间显示", "Fast"));
             v.push(btn(714, 222, 252, 36, "普通显示", "Normal"));
-            v.push(row(40, 254, 220, 22, "窗口透明度", ""));
+            v.push(row(40, 254, 220, 22, "窗口不透明度", ""));
             v.push(note(48, 278, 180, "（普通场景）"));
-            v.push(row(40, 296, 220, 22, "窗口透明度", ""));
+            v.push(row(40, 296, 220, 22, "窗口不透明度", ""));
             v.push(note(56, 320, 160, "（CG场景）"));
-            v.push(row(40, 336, 220, 22, "背景透明度", ""));
+            v.push(row(40, 336, 220, 22, "背景不透明度", ""));
             v.push(note(48, 360, 180, "（小说场景）"));
-            v.push(row(40, 386, 260, 26, "指令图标透明度", ""));
+            v.push(row(40, 386, 260, 26, "指令图标不透明度", ""));
             for sl in [SL_ANOVEL, SL_ACG, SL_ABACK, SL_ACMD] {
                 let row_y = sl.y + BAR_H + 4;
                 v.push(tiny(BAR_X0 - 16, row_y, 44, 11, "0%"));
