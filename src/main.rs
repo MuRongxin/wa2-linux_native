@@ -5885,6 +5885,35 @@ impl TitleSnow {
     }
 }
 
+/// The title page music. WA2.exe arms BGM(31, 0, 1, 255, 0, 0) once when the
+/// title screen comes up (call at 0x426701) and the special page re-arms the
+/// same track on entering (0x427611), so one looping stream covers both pages
+/// and the title-origin screens in between.
+const TITLE_BGM_ID: i32 = 31;
+
+fn title_bgm_path(bg_dirs: &[&std::path::Path]) -> Option<std::path::PathBuf> {
+    let dir = bg_dirs.iter().find_map(|d| d.parent())?.join("bgm");
+    let stem = format!("BGM_{:03}", TITLE_BGM_ID);
+    [format!("{}.OGG", stem), format!("{}_A.OGG", stem)]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Play the title/special track on the title screen's own mixer. That mixer
+/// lives exactly as long as the title loop, so leaving the title (starting or
+/// loading the game, quitting) drops every stream with it.
+fn start_title_bgm(mixer: Option<&audio::Mixer>, bg_dirs: &[&std::path::Path]) -> Option<usize> {
+    let (mixer, path) = (mixer?, title_bgm_path(bg_dirs)?);
+    let slot = mixer.play_cat(&path.to_string_lossy(), 1.0, true, audio::mixer::CAT_BGM);
+    if slot == usize::MAX {
+        None
+    } else {
+        eprintln!("BGM: title {} -> {}", TITLE_BGM_ID, path.display());
+        Some(slot)
+    }
+}
+
 /// Original title screen. The logo, highlight bar and copyright stay the
 /// game's art. The five item labels are the system font, white at rest and
 /// gold when selected, so a player font can replace them later.
@@ -5900,6 +5929,12 @@ impl TitleSnow {
 /// slides between items and flashes its bright frame while it moves. Arrow
 /// keys move, Space/Enter confirms, Esc quits; items whose subsystems do not
 /// exist yet answer with a notice.
+///
+/// The original starts BGM track 31 when this page comes up (WA2.exe arms it
+/// once at 0x426701) and the special page re-arms the same track, so a single
+/// looping stream carries the title and the special page. It is parked while
+/// the music player owns the BGM category. Leaving the title drops the title
+/// mixer, and with it the stream.
 ///
 /// `WA2_TITLE_AUTO=<n>` pre-selects item `n` and confirms it (verification runs).
 fn run_title(
@@ -5961,6 +5996,7 @@ fn run_title(
     if let Some(ref mx) = mixer {
         menu::apply(&startup, Some(mx));
     }
+    let mut bgm_slot = start_title_bgm(mixer.as_ref(), bg_dirs);
     let cursor = cursor_se_path(bg_dirs);
 
     let item_y = |i: usize| (Y0 + i as i32 * PITCH) as f32;
@@ -6193,8 +6229,14 @@ fn run_title(
                         }
                     }
                     SpecialPick::Music => {
+                        // The music player drives the BGM category itself;
+                        // park the title/special track while it runs.
+                        if let (Some(mx), Some(slot)) = (mixer.as_ref(), bgm_slot.take()) {
+                            mx.stop(slot);
+                        }
                         let bgm_dir = script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
                         run_music(win, bg_dirs, &bgm_dir, cn, mixer.as_ref(), cursor.as_deref());
+                        bgm_slot = start_title_bgm(mixer.as_ref(), bg_dirs);
                         notice = None;
                     }
                     SpecialPick::Back => notice = None,
