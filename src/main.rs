@@ -684,12 +684,97 @@ fn tlog(label: &str, t0: std::time::Instant) {
     }
 }
 
-fn render_art_scale() -> u32 {
-    std::env::var("WA2_RENDER_SCALE")
+fn source_art_scale() -> u32 {
+    std::env::var("WA2_ART_SCALE")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|&v| matches!(v, 1 | 2 | 4 | 8))
         .unwrap_or(1)
+}
+
+/// How the decode scale is chosen. Decided once, before any call writes a
+/// number into `WA2_RENDER_SCALE`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScaleMode {
+    /// `WA2_RENDER_SCALE=auto`: decode only as much as the window can show.
+    Window,
+    /// Numeric `WA2_RENDER_SCALE`: exactly that scale.
+    Forced(u32),
+    /// No override: never below 4x, more only when the window needs it.
+    Default,
+}
+
+fn scale_mode() -> ScaleMode {
+    static MODE: std::sync::OnceLock<ScaleMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("WA2_RENDER_SCALE") {
+        Ok(v) if v.eq_ignore_ascii_case("auto") => ScaleMode::Window,
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(n) if matches!(n, 1 | 2 | 4 | 8) => ScaleMode::Forced(n),
+            _ => ScaleMode::Default,
+        },
+        Err(_) => ScaleMode::Default,
+    })
+}
+
+/// Decode scale wanted for a window under the current mode.
+///
+/// The 8x source tree has headroom to spare, so the default never drops below
+/// 4x even in a 1280x720 window: decoding at 4x and box-filtering down is
+/// visibly cleaner than decoding at the window's own 1x/2x. 8x is only used
+/// when the window itself needs more than 4x (a 5K+ canvas).
+fn decode_scale_for_window(w: i32, h: i32) -> u32 {
+    match scale_mode() {
+        ScaleMode::Forced(n) => n,
+        ScaleMode::Window => render_scale_for(w, h),
+        ScaleMode::Default => render_scale_for(w, h).max(4),
+    }
+}
+
+/// How many pixels one decoded art asset stores per 1280x720 layout pixel.
+fn render_art_scale() -> u32 {
+    if let ScaleMode::Forced(n) = scale_mode() {
+        return n;
+    }
+    std::env::var("WA2_RENDER_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| matches!(v, 1 | 2 | 4 | 8))
+        .unwrap_or_else(source_art_scale)
+}
+
+/// Report and apply the decode scale for the current window.
+fn set_render_art_scale(win: &sdl2::Sdl) {
+    let (w, h) = win.window_size();
+    let want = decode_scale_for_window(w, h);
+    static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    REPORTED.get_or_init(|| {
+        let why = match scale_mode() {
+            ScaleMode::Forced(n) => format!("forced {}x by WA2_RENDER_SCALE", n),
+            ScaleMode::Window => "auto: window-sized decoding".to_string(),
+            ScaleMode::Default => {
+                "default: minimum 4x; WA2_RENDER_SCALE=auto for window-sized decoding"
+                    .to_string()
+            }
+        };
+        eprintln!(
+            "art: source {}x, decode {}x for window {}x{} ({})",
+            source_art_scale(),
+            want,
+            w,
+            h,
+            why
+        );
+    });
+    let current = std::env::var("WA2_RENDER_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    if current != Some(want) {
+        std::env::set_var("WA2_RENDER_SCALE", want.to_string());
+        // Pictures decoded for the old scale are the wrong pixel size now;
+        // dropping them keeps the compositor from mixing scales.
+        artcache::drop_other_scales(want);
+        eprintln!("art: render scale={} for window {}x{}", want, w, h);
+    }
 }
 
 /// Largest useful art scale for a window: 1280x720 needs 1x, 1920x1080
@@ -699,54 +784,6 @@ fn render_scale_for(w: i32, h: i32) -> u32 {
     let h = h.max(720) as u32;
     let need = ((w + 1279) / 1280).max((h + 719) / 720);
     if need <= 1 { 1 } else if need <= 2 { 2 } else if need <= 4 { 4 } else { 8 }
-}
-
-fn set_render_art_scale(win: &sdl2::Sdl) {
-    // An explicitly set WA2_RENDER_SCALE wins over the window size.
-    static OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OVERRIDE.get_or_init(|| std::env::var_os("WA2_RENDER_SCALE").is_some()) {
-        // Still say what the forced scale is: the scene log names the resolved
-        // file only, and a forced override never reaches the auto-report below.
-        static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        REPORTED.get_or_init(|| {
-            let source = std::env::var("WA2_ART_SCALE")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(1);
-            let (w, h) = win.window_size();
-            eprintln!(
-                "art: source {}x, decode {}x for window {}x{} (forced by WA2_RENDER_SCALE)",
-                source,
-                render_art_scale(),
-                w,
-                h
-            );
-        });
-        return;
-    }
-    let (w, h) = win.window_size();
-    let scale = render_scale_for(w, h);
-    // Always state the two scales once. "bg x.tga" in the scene log is the
-    // resolved *file* name, so without this line it is impossible to tell an
-    // 8x-source run that decodes at 1x from a run that never left the 1x tree.
-    static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    REPORTED.get_or_init(|| {
-        let source = std::env::var("WA2_ART_SCALE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(1);
-        eprintln!(
-            "art: source {}x, decode {}x for window {}x{} (resize the window or go fullscreen for a higher decode scale)",
-            source, scale, w, h
-        );
-    });
-    if render_art_scale() != scale {
-        std::env::set_var("WA2_RENDER_SCALE", scale.to_string());
-        // Pictures decoded for the old window size are the wrong pixel size
-        // now; dropping them keeps the compositor from mixing scales.
-        artcache::drop_other_scales(scale);
-        eprintln!("art: render scale={} for window {}x{}", scale, w, h);
-    }
 }
 
 fn load_background(dirs: &[&std::path::Path], name: &str) -> Option<codec::tga::TgaImage> {
@@ -1638,7 +1675,7 @@ fn run_game_at(
         }
         'events: loop {
         win_size = win.window_size();
-        if render_scale_for(win_size.0, win_size.1) != render_art_scale() {
+        if decode_scale_for_window(win_size.0, win_size.1) != render_art_scale() {
             set_render_art_scale(win);
             // Re-decode the picture on screen at the new scale. Waiting for the
             // next background change would show the current scene stretched up

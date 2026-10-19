@@ -187,11 +187,19 @@ pub fn decode_file(path: &Path) -> Result<TgaImage, String> {
 /// value, so a window resize can never mix pixel scales.
 pub fn art_scales(path: &Path) -> (u32, u32) {
     let source = source_art_scale(path);
-    // Unset means the window has not asked for a scale yet; the renderer lays
-    // art out on the 1280x720 grid, so 1x is the right default. Defaulting to
-    // the source scale made a 1280x720 window decode a whole 59 MP 8x WebP.
+    // Decode target. WA2_RENDER_SCALE wins when set (a number, or the value
+    // `set_render_art_scale` writes in `auto` mode). Unset means "decode at the
+    // source tree's own scale": an 8x WebP decodes at 8x and the compositor
+    // box-filters it down to the window, so every window gets full-resolution
+    // source pixels. WA2_RENDER_SCALE=auto brings back the old window-sized
+    // decoding for small machines.
     let requested = std::env::var("WA2_RENDER_SCALE")
-        .ok().and_then(|v| v.parse::<u32>().ok()).filter(|&v| v >= 1).unwrap_or(1);
+        .ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|&v| v >= 1)
+        .or_else(|| {
+            std::env::var("WA2_ART_SCALE")
+                .ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|&v| v >= 1)
+        })
+        .unwrap_or(1);
     (source, requested.min(source))
 }
 

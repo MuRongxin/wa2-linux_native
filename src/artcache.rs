@@ -62,7 +62,15 @@ fn worth_caching(src: &Path, target: u32, source: u32) -> bool {
     {
         return false;
     }
-    if target > 4 {
+    // The default decode is 4x now, and a 4x background TGA is 57.6 MB. Writing
+    // every visited background to disk would cost tens of GB for a playthrough,
+    // so only scales up to WA2_ART_DISK_SCALE (default 2x) are cached on disk;
+    // 4x/8x stay in the memory cache, which is sized from available RAM.
+    let max_disk = std::env::var("WA2_ART_DISK_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2);
+    if target > max_disk {
         return false;
     }
     let webp = src
@@ -95,15 +103,35 @@ struct Mem {
     clock: u64,
 }
 
+/// Memory cache budget for decoded art, in MB.
+///
+/// 8x backgrounds are ~236 MB each, so a fixed 512 MB default would only hold
+/// two of them. Take a quarter of what the kernel says is available, clamped so
+/// a tiny box still gets a working cache and a big one does not hoard RAM.
+fn default_budget_mb() -> usize {
+    if let Ok(info) = std::fs::read_to_string("/proc/meminfo") {
+        for line in info.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<usize>().ok()) {
+                    return (kb / 1024 / 4).clamp(512, 6144);
+                }
+            }
+        }
+    }
+    512
+}
+
 fn mem() -> &'static Mutex<Mem> {
     static MEM: OnceLock<Mutex<Mem>> = OnceLock::new();
     MEM.get_or_init(|| {
-        // 1x backgrounds are 3.7 MB each; 512 MB holds a whole scene's worth of
-        // 1x art or a handful of 8x frames, which is all the renderer needs.
+        // Default: decode-at-source means an 8x background is 236 MB in memory,
+        // where the old 512 MB budget held only two of them and the prefetcher
+        // thrashed. Derive the budget from available RAM instead: a quarter of
+        // MemAvailable, clamped to [512 MB, 6 GB]. WA2_ART_CACHE_MB overrides.
         let budget = std::env::var("WA2_ART_CACHE_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512)
+            .unwrap_or_else(default_budget_mb)
             * 1024
             * 1024;
         Mutex::new(Mem { map: HashMap::new(), bytes: 0, budget, clock: 0 })
