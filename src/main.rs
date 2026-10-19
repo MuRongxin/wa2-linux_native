@@ -705,6 +705,23 @@ fn set_render_art_scale(win: &sdl2::Sdl) {
     // An explicitly set WA2_RENDER_SCALE wins over the window size.
     static OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *OVERRIDE.get_or_init(|| std::env::var_os("WA2_RENDER_SCALE").is_some()) {
+        // Still say what the forced scale is: the scene log names the resolved
+        // file only, and a forced override never reaches the auto-report below.
+        static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        REPORTED.get_or_init(|| {
+            let source = std::env::var("WA2_ART_SCALE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1);
+            let (w, h) = win.window_size();
+            eprintln!(
+                "art: source {}x, decode {}x for window {}x{} (forced by WA2_RENDER_SCALE)",
+                source,
+                render_art_scale(),
+                w,
+                h
+            );
+        });
         return;
     }
     let (w, h) = win.window_size();
