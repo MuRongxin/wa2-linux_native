@@ -992,6 +992,13 @@ pub fn with_ui_font<R>(size: u32, f: impl FnOnce(&VectorFont) -> R) -> Option<R>
         if slot.is_none() {
             let choice = font_choice();
             *slot = VectorFont::open_face(&choice.path, size.max(8), choice.face);
+            // The title menu, settings, save/load and timeline labels all come
+            // from this instance, which is separate from the dialogue font the
+            // runtime opens. Without a line here there is nothing in the log to
+            // tell which face those screens drew with.
+            if let Some(vf) = slot.as_ref() {
+                eprintln!("ui font: {}", vf.describe());
+            }
         }
         let vf = slot.as_ref()?;
         if !vf.set_size(size) {
