@@ -458,10 +458,16 @@ pub fn set_fullscreen(&self, on: bool) {
         }
     }
     self.pump();
+    IS_FULLSCREEN.store(on, std::sync::atomic::Ordering::Relaxed);
     if std::env::var_os("WA2_DEBUG_INPUT").is_some() {
         let (w, h) = self.window_size();
         eprintln!("sdl: fullscreen {} -> {}x{}", on, w, h);
     }
+}
+
+/// True between `set_fullscreen(true)` and the next windowed request.
+pub fn is_fullscreen(&self) -> bool {
+    IS_FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn remember_windowed(&self) {
@@ -677,6 +683,9 @@ struct AudioFns {
 
 static AUDIO: OnceLock<AudioFns> = OnceLock::new();
 static FULLSCREEN: OnceLock<unsafe extern "C" fn(*mut c_void, u32) -> c_int> = OnceLock::new();
+/// Last requested display mode. The artwork decoder picks the 8x master in
+/// fullscreen and the 4x tree in a window, so it needs to know.
+static IS_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Position and size to restore when leaving fullscreen. Absent while windowed.
 static WINDOWED_GEOM: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 

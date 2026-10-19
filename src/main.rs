@@ -134,6 +134,21 @@ fn main() {
             if let Err(e) = s.save_tga(&out) { eprintln!("error writing {}: {}", out, e); std::process::exit(1); }
             println!("font-sample: {}x{} -> {}", w, h, out);
         }
+        "menu-clean" => {
+            // menu-clean: bake the caption-free option pages once, so the
+            // settings screen stops repairing pixels on every state change.
+            let Some(d) = data::Data::resolve() else { return };
+            // Same search order the settings screen uses: the Chinese overlay
+            // sheets first, then the original.
+            let cn = d.bg_cn();
+            let bg = d.bg();
+            let dirs: Vec<&std::path::Path> = if cn.is_dir() { vec![&cn, &bg] } else { vec![&bg] };
+            let out = std::path::Path::new(&std::env::var("WA2_DATA").unwrap_or_else(|_| "data".into()))
+                .join("cache/ui/menu");
+            let pages = menu::bake_clean_pages(&dirs, &out);
+            eprintln!("menu-clean: {} page(s) -> {}", pages.len(), out.display());
+            println!("wrote {} clean page(s) to {}", pages.len(), out.display());
+        }
         "scene" => {
             if args.len() < 7 {
                 eprintln!("usage: wa2-native scene <scenario.txt> <font.tga> <charset.txt> <bg.tga> <out.tga>");
@@ -441,11 +456,13 @@ fn main() {
             let session = Session {
                 script_dir: script_dir.clone(),
                 cn: is_cn_script(&script_dir),
-                bg_dir: bg_dir.clone(),
-                bg_cn: None,
+                bg_trees: vec![(1, bg_dir.clone())],
+                bg_cn_trees: Vec::new(),
                 bg_cn_original: None,
                 bg_original: None,
-                sprite_dir: find_sprite_dir(&bg_dir, &script_dir),
+                sprite_trees: find_sprite_dir(&bg_dir, &script_dir)
+                    .map(|d| vec![(1, d)])
+                    .unwrap_or_default(),
                 movie_dir: bg_dir.join("..").join("mv"),
                 voice_dir,
                 bgm: bgm_path,
@@ -472,11 +489,13 @@ fn main() {
                 let session = Session {
                     script_dir: script_dir.clone(),
                     cn: is_cn_script(&script_dir),
-                    bg_dir: bg_dir.clone(),
-                    bg_cn: None,
+                    bg_trees: vec![(1, bg_dir.clone())],
+                    bg_cn_trees: Vec::new(),
                     bg_cn_original: None,
                     bg_original: None,
-                    sprite_dir: find_sprite_dir(&bg_dir, &script_dir),
+                    sprite_trees: find_sprite_dir(&bg_dir, &script_dir)
+                        .map(|d| vec![(1, d)])
+                        .unwrap_or_default(),
                     movie_dir: bg_dir.join("..").join("mv"),
                     voice_dir: None,
                     bgm: None,
@@ -493,7 +512,7 @@ fn main() {
                 (font, session, start_id, bg_dir)
             };
             let mut rt = Runtime::new(&win, &session);
-            match run_title(&mut win, &font, &session.bg_dirs(), &session.script_dir, session.bg_cn.is_some()) {
+            match run_title(&mut win, &font, &session.bg_dirs(), &session.script_dir, !session.bg_cn_trees.is_empty()) {
                 TitleAction::Start => {
                     eprintln!("title: starting scene {}", start_id);
                     if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
@@ -716,17 +735,24 @@ fn scale_mode() -> ScaleMode {
     })
 }
 
-/// Decode scale wanted for a window under the current mode.
+/// Decode scale wanted under the current mode.
 ///
-/// The 8x source tree has headroom to spare, so the default never drops below
-/// 4x even in a 1280x720 window: decoding at 4x and box-filtering down is
-/// visibly cleaner than decoding at the window's own 1x/2x. 8x is only used
-/// when the window itself needs more than 4x (a 5K+ canvas).
-fn decode_scale_for_window(w: i32, h: i32) -> u32 {
+/// Default: windowed decodes at 4x (the 4x tree is read directly), fullscreen
+/// decodes at 8x (the master tree, even on a 1080p panel where the extra
+/// pixels are supersampling). `WA2_RENDER_SCALE=auto` keeps the old
+/// window-sized decoding, a number forces one scale.
+fn decode_scale_for_window(win: &sdl2::Sdl) -> u32 {
+    let (w, h) = win.window_size();
     match scale_mode() {
         ScaleMode::Forced(n) => n,
         ScaleMode::Window => render_scale_for(w, h),
-        ScaleMode::Default => render_scale_for(w, h).max(4),
+        ScaleMode::Default => {
+            if win.is_fullscreen() {
+                8
+            } else {
+                render_scale_for(w, h).max(4)
+            }
+        }
     }
 }
 
@@ -745,14 +771,14 @@ fn render_art_scale() -> u32 {
 /// Report and apply the decode scale for the current window.
 fn set_render_art_scale(win: &sdl2::Sdl) {
     let (w, h) = win.window_size();
-    let want = decode_scale_for_window(w, h);
+    let want = decode_scale_for_window(win);
     static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     REPORTED.get_or_init(|| {
         let why = match scale_mode() {
             ScaleMode::Forced(n) => format!("forced {}x by WA2_RENDER_SCALE", n),
             ScaleMode::Window => "auto: window-sized decoding".to_string(),
             ScaleMode::Default => {
-                "default: minimum 4x; WA2_RENDER_SCALE=auto for window-sized decoding"
+                "default: windowed 4x / fullscreen 8x; WA2_RENDER_SCALE=auto for window-sized decoding"
                     .to_string()
             }
         };
@@ -1250,19 +1276,23 @@ struct Session {
     /// True when `script_dir` is the CK-GAL Chinese patch: its text needs the
     /// glyph-table reading (see `codec::sjis::decode_cn`).
     cn: bool,
-    bg_dir: std::path::PathBuf,
+    /// Scaled art trees, `(scale, dir)` ascending. Both the 4x tree and the
+    /// 8x master are kept when present: the decode scale decides which one is
+    /// read first, so entering fullscreen switches to the 8x master without
+    /// rebuilding the session.
+    bg_trees: Vec<(u32, std::path::PathBuf)>,
     /// Chinese-patch UI overrides - the 31 images shipped loose in the game's
     /// `grp/` directory, which win over the same-named files inside `grp.pak`.
-    /// Consulted before `bg_dir`; `None` in Japanese mode.
-    bg_cn: Option<std::path::PathBuf>,
+    /// Consulted before `bg_trees`; empty in Japanese mode.
+    bg_cn_trees: Vec<(u32, std::path::PathBuf)>,
     /// Original Chinese UI tree used as a per-file fallback while the
     /// optional high-resolution sibling is still being generated.
     bg_cn_original: Option<std::path::PathBuf>,
     /// Original background tree used when the selected high-resolution file
     /// is not present yet.
     bg_original: Option<std::path::PathBuf>,
-    /// Loose `*.tga` character sprites, or `None` to disable sprites.
-    sprite_dir: Option<std::path::PathBuf>,
+    /// Scaled sprite trees, ascending; empty disables sprites.
+    sprite_trees: Vec<(u32, std::path::PathBuf)>,
     /// Movies as plain `*.wmv` / `*.asf` files.
     movie_dir: std::path::PathBuf,
     voice_dir: Option<std::path::PathBuf>,
@@ -1273,24 +1303,58 @@ struct Session {
 
 impl Session {
     fn from_data(d: &data::Data, bgm: Option<String>) -> Session {
-        let bg_dir = d.bg();
+        // Keep the scaled sibling trees, not just the one Data picked: the
+        // decode scale changes at runtime (fullscreen asks for the 8x master)
+        // and the loader then just reorders these directories.
+        let mut bg_trees = vec![(d.art_scale, d.bg())];
+        let mut sprite_trees = vec![(d.art_scale, d.sprite())];
+        let mut bg_cn_trees = if d.cn {
+            vec![(d.art_scale, d.bg_cn())]
+        } else {
+            Vec::new()
+        };
+        // The default source is the 4x tree; keep the 8x master next to it so
+        // fullscreen can read it. Trees the player chose explicitly (2x proxy,
+        // original TGA) are left alone.
+        if d.art_scale == 4 {
+            let bg8 = d.root.join("bg_8x");
+            let sp8 = d.root.join("sprite_8x");
+            let cn8 = d.root.join("bg_cn_8x");
+            if bg8.is_dir() {
+                bg_trees.push((8, bg8));
+                if sp8.is_dir() {
+                    sprite_trees.push((8, sp8));
+                }
+                if d.cn && cn8.is_dir() {
+                    bg_cn_trees.push((8, cn8));
+                }
+            }
+        }
+        bg_trees.sort_by_key(|(scale, _)| *scale);
+        sprite_trees.sort_by_key(|(scale, _)| *scale);
+        bg_cn_trees.sort_by_key(|(scale, _)| *scale);
         let bg_original = d.root.join("bg");
-        let bg_cn = if d.cn { Some(d.bg_cn()) } else { None };
         let bg_cn_original = if d.cn { Some(d.root.join("bg_cn")) } else { None };
-        let mut index_dirs = Vec::new();
-        if let Some(ref p) = bg_cn { index_dirs.push(p.as_path()); }
-        if let Some(ref p) = bg_cn_original { index_dirs.push(p.as_path()); }
-        index_dirs.push(bg_dir.as_path());
+        let mut index_dirs: Vec<&std::path::Path> = Vec::new();
+        for (_, p) in &bg_cn_trees {
+            index_dirs.push(p.as_path());
+        }
+        if let Some(ref p) = bg_cn_original {
+            index_dirs.push(p.as_path());
+        }
+        for (_, p) in &bg_trees {
+            index_dirs.push(p.as_path());
+        }
         index_dirs.push(bg_original.as_path());
         let bg_index = BgIndex::build(&index_dirs);
         Session {
             script_dir: d.script(),
             cn: d.cn,
-            bg_dir,
-            bg_cn,
+            bg_trees,
+            bg_cn_trees,
             bg_cn_original,
             bg_original: Some(bg_original),
-            sprite_dir: Some(d.sprite()),
+            sprite_trees,
             movie_dir: d.movie(),
             voice_dir: Some(d.voice()),
             bgm,
@@ -1299,19 +1363,100 @@ impl Session {
     }
 
     /// Directories searched for images, in priority order.
+    ///
+    /// The scaled trees are ordered for the current decode scale: a 4x decode
+    /// reads the 4x tree first (about four times faster than shrinking the 8x
+    /// file), an 8x decode reads the 8x master. The 1280x720 originals stay as
+    /// the last fallback for files the scaled trees are missing.
     fn bg_dirs(&self) -> Vec<&std::path::Path> {
+        let want = render_art_scale();
         let mut v = Vec::new();
-        if let Some(cn) = self.bg_cn.as_deref() {
-            v.push(cn);
-        }
+        v.extend(ordered_tree_paths(&self.bg_cn_trees, want));
+        v.extend(ordered_tree_paths(&self.bg_trees, want));
         if let Some(cn) = self.bg_cn_original.as_deref() {
             v.push(cn);
         }
-        v.push(self.bg_dir.as_path());
         if let Some(original) = self.bg_original.as_deref() {
             v.push(original);
         }
         v
+    }
+
+    /// Sprite directory for the current decode scale, if any.
+    fn sprite_dir_now(&self) -> Option<&std::path::Path> {
+        ordered_tree_paths(&self.sprite_trees, render_art_scale())
+            .into_iter()
+            .next()
+    }
+}
+
+/// Order scaled trees for a decode target: exact match first, then the next
+/// larger, then the smaller ones.
+fn ordered_tree_paths<'a>(
+    trees: &'a [(u32, std::path::PathBuf)],
+    want: u32,
+) -> Vec<&'a std::path::Path> {
+    let mut order: Vec<usize> = (0..trees.len()).collect();
+    order.sort_by_key(|&i| {
+        let scale = trees[i].0;
+        if scale == want {
+            0
+        } else if scale > want {
+            1 + (scale - want)
+        } else {
+            100 + (want - scale)
+        }
+    });
+    order.into_iter().map(|i| trees[i].1.as_path()).collect()
+}
+
+#[cfg(test)]
+mod art_tree_tests {
+    use super::ordered_tree_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn ordered_trees_prefer_the_decode_scale() {
+        let trees = vec![(4u32, PathBuf::from("bg_4x")), (8, PathBuf::from("bg_8x"))];
+        let names = |want: u32| -> Vec<String> {
+            ordered_tree_paths(&trees, want)
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        };
+        // Windowed decodes at 4x and must read the 4x tree first.
+        assert_eq!(names(4), ["bg_4x", "bg_8x"]);
+        // Fullscreen decodes at 8x and must read the master first.
+        assert_eq!(names(8), ["bg_8x", "bg_4x"]);
+        // A lower target takes the next larger tree, then the smaller one.
+        assert_eq!(names(2), ["bg_4x", "bg_8x"]);
+    }
+}
+
+#[cfg(test)]
+mod sprite_bank_tests {
+    use super::SpriteBank;
+
+    /// The bank is built for the windowed tree and must move to the 8x tree
+    /// when the decode scale grows (fullscreen), dropping the old pixels.
+    #[test]
+    fn sprite_bank_retargets_between_scaled_trees() {
+        let tmp = std::env::temp_dir().join(format!("wa2-spritebank-{}", std::process::id()));
+        let four = tmp.join("sprite_4x");
+        let eight = tmp.join("sprite_8x");
+        std::fs::create_dir_all(&four).unwrap();
+        std::fs::create_dir_all(&eight).unwrap();
+        std::fs::write(four.join("a.tga"), b"x").unwrap();
+        std::fs::write(eight.join("b.webp"), b"x").unwrap();
+        let mut bank = SpriteBank::new(vec![(4, four.clone()), (8, eight.clone())]);
+        bank.retarget(4);
+        assert_eq!(bank.dir, four);
+        assert!(bank.index.contains("a.tga"));
+        bank.retarget(8);
+        assert_eq!(bank.dir, eight);
+        assert!(bank.index.contains("b.webp"));
+        assert!(bank.cache.is_empty(), "sprites from the old scale must be dropped");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
@@ -1374,10 +1519,16 @@ impl Runtime {
         } else {
             None
         };
-        let bank = s.sprite_dir.as_ref().filter(|p| p.is_dir()).map(|dir| {
-            eprintln!("sprites: {}", dir.display());
-            SpriteBank::new(dir.clone())
-        });
+        let bank = if s.sprite_trees.is_empty() {
+            None
+        } else {
+            for (scale, dir) in &s.sprite_trees {
+                if dir.is_dir() {
+                    eprintln!("sprites: {} ({}x)", dir.display(), scale);
+                }
+            }
+            Some(SpriteBank::new(s.sprite_trees.clone()))
+        };
         if bank.is_none() {
             eprintln!("note: no sprite directory - character sprites disabled");
         }
@@ -1464,6 +1615,10 @@ fn run_game_at(
     // Black until the script sets one: WA2 opens on a black screen (the IC
     // prologue's "sepia.AMP" is a color-filter LUT, not a background image).
     let mut bg = solid_bg(W, H, [0, 0, 0]);
+    // Decode scale of the pixels in `bg`; `None` while the screen is a solid
+    // colour. A fullscreen switch changes the wanted scale, which tells the
+    // loop to re-decode the picture at the new one.
+    let mut bg_scale: Option<u32> = None;
 
     let mixer = &rt.mixer;
 
@@ -1476,6 +1631,10 @@ fn run_game_at(
     let voices = &rt.voices;
     // Player settings (option screen / wa2.ini).
     let mut settings = menu::Settings::load();
+    // A debug jump (`run <scene>`) starts from the saved 画面模式 too, so the
+    // decode scale matches what the title screen would have chosen.
+    win.set_fullscreen(settings.win_disp == 1);
+    set_render_art_scale(win);
     menu::apply(&settings, mixer.as_ref());
 
     let mut bgm_track: Option<(i32, usize)> = None;
@@ -1536,24 +1695,28 @@ fn run_game_at(
         bg_id = snap.bg;
         if let Some((id, variant)) = snap.bg {
             if let Some(name) = s.bg_index.resolve(id, variant) {
-                if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                if let Some(asset) = load_background_asset(&s.bg_dirs(), &name) {
                     bg_cg = name.starts_with('v') || name.starts_with('V');
                     bg_label = name.clone();
                     eprintln!("scene {} | bg {} id={} var={}", current_id, name, id, variant);
-                    bg = img;
+                    bg_scale = Some(asset.art_scale);
+                    bg = asset.img;
                 } else {
                     eprintln!(
                         "scene {} | bg id={} var={} file {} FAILED to decode, screen stays {}",
                         current_id, id, variant, name, bg_label
                     );
                 }
-            } else if let Some(img) = load_background(&s.bg_dirs(), &event_cg_name(id, variant)) {
+            } else if let Some(asset) =
+                load_background_asset(&s.bg_dirs(), &event_cg_name(id, variant))
+            {
                 // A save made on an event CG stores the script id (10170),
                 // which is not a `b{id:04}{var:02}` background.
                 bg_cg = true;
                 bg_label = event_cg_name(id, variant);
                 eprintln!("scene {} | cg {} id={} var={}", current_id, bg_label, id, variant);
-                bg = img;
+                bg_scale = Some(asset.art_scale);
+                bg = asset.img;
             } else {
                 eprintln!(
                     "scene {} | bg MISSING id={} var={}, screen stays {}",
@@ -1660,7 +1823,7 @@ fn run_game_at(
         // first lines, so the script never waits on a 59 MP WebP.
         {
             let (bgs, sprites) = upcoming_art(&prog, &s.bg_index, bank.as_ref());
-            let queued = prefetch_paths(&s.bg_dirs(), &bgs, s.sprite_dir.as_deref(), &sprites);
+            let queued = prefetch_paths(&s.bg_dirs(), &bgs, s.sprite_dir_now(), &sprites);
             if !queued.is_empty() {
                 eprintln!("prefetch: {} pictures", queued.len());
                 artcache::prefetch(queued);
@@ -1675,11 +1838,14 @@ fn run_game_at(
         }
         'events: loop {
         win_size = win.window_size();
-        if decode_scale_for_window(win_size.0, win_size.1) != render_art_scale() {
+        if decode_scale_for_window(win) != render_art_scale() {
             set_render_art_scale(win);
-            // Re-decode the picture on screen at the new scale. Waiting for the
-            // next background change would show the current scene stretched up
-            // from the old resolution.
+        }
+        // A decode-scale change (fullscreen switch, window resize) invalidates
+        // the pixels on screen: they were decoded for the old scale. Re-decode
+        // the background and the standing sprites at the new one instead of
+        // showing the old resolution stretched.
+        if bg_scale.is_some_and(|scale| scale != render_art_scale()) {
             let dirs = s.bg_dirs();
             let reload = match bg_id {
                 Some((id, variant)) => s.bg_index.resolve(id, variant),
@@ -1689,12 +1855,21 @@ fn run_game_at(
             if let Some(name) = reload {
                 if let Some(asset) = load_background_asset(&dirs, &name) {
                     bg = asset.img;
+                    bg_scale = Some(asset.art_scale);
                     bg_label = name;
                     eprintln!(
                         "art: reloaded {} at decode scale {}x",
                         bg_label,
                         render_art_scale()
                     );
+                }
+            }
+            for slot in slots.iter_mut().flatten() {
+                if let Some(bank) = bank.as_mut() {
+                    if let Some((img, art_scale)) = bank.get(&slot.name) {
+                        slot.img = img;
+                        slot.art_scale = art_scale;
+                    }
                 }
             }
         }
@@ -1940,6 +2115,7 @@ fn run_game_at(
                         bg_id = None;
                         bg_label = "BLACK".to_string();
                         bg = solid_bg(W, H, [0, 0, 0]);
+                        bg_scale = None;
                         // id 0 is a fade-out: the shot is over, so the people
                         // from it must leave. id -2 keeps whoever is standing
                         // (the cut to black in 1010 still has them in frame).
@@ -1954,12 +2130,13 @@ fn run_game_at(
                             current_id, id, frames
                         );
                     } else if let Some(name) = s.bg_index.resolve(id, variant) {
-                        if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                        if let Some(asset) = load_background_asset(&s.bg_dirs(), &name) {
                             plates.clear();
                             bg_cg = name.starts_with('v') || name.starts_with('V');
                             bg_id = Some((id, variant));
                             bg_label = name.clone();
-                            bg = img;
+                            bg_scale = Some(asset.art_scale);
+                            bg = asset.img;
                             eprintln!(
                                 "scene {} | bg {} id={} var={} fade={}f",
                                 current_id, name, id, variant, frames
@@ -1989,13 +2166,14 @@ fn run_game_at(
                     // event (frames 0) and swaps that layer in.
                     let old = clone_surf(&cur_surf);
                     let name = event_cg_name(id, variant);
-                    if let Some(img) = load_background(&s.bg_dirs(), &name) {
+                    if let Some(asset) = load_background_asset(&s.bg_dirs(), &name) {
                         plates.clear();
                         slots = Default::default();
                         bg_cg = true;
                         bg_id = Some((id, variant));
                         bg_label = name.clone();
-                        bg = img;
+                        bg_scale = Some(asset.art_scale);
+                        bg = asset.img;
                         eprintln!(
                             "scene {} | cg {} id={} var={} fade={}f",
                             current_id, name, id, variant, frames
@@ -3856,7 +4034,11 @@ fn sprite_prefixes(cid: u32) -> &'static [&'static str] {
 /// which panicked on the archives' one non-ASCII entry name; a directory scan
 /// and a prefix rule that walks `char`s cannot panic.)
 struct SpriteBank {
+    /// Scaled sprite trees, ascending; the decode scale picks the active one.
+    trees: Vec<(u32, std::path::PathBuf)>,
     dir: std::path::PathBuf,
+    /// Scale of the pixels in `dir`; 0 before the first retarget.
+    scale: u32,
     /// lowercased file names present in the directory
     index: std::collections::HashSet<String>,
     /// file name -> (decoded pixels, scale represented by those pixels)
@@ -3867,9 +4049,42 @@ struct SpriteBank {
 }
 
 impl SpriteBank {
-    fn new(dir: std::path::PathBuf) -> SpriteBank {
-        let mut index = std::collections::HashSet::new();
-        if let Ok(rd) = std::fs::read_dir(&dir) {
+    fn new(trees: Vec<(u32, std::path::PathBuf)>) -> SpriteBank {
+        let mut bank = SpriteBank {
+            trees,
+            dir: std::path::PathBuf::new(),
+            scale: 0,
+            index: Default::default(),
+            cache: Default::default(),
+            cache_limit: 64,
+        };
+        bank.retarget(render_art_scale());
+        bank
+    }
+
+    /// Point the bank at the tree matching `want`, rebuilding the name index
+    /// and dropping sprites decoded at another scale.
+    fn retarget(&mut self, want: u32) {
+        let mut order: Vec<usize> = (0..self.trees.len()).collect();
+        order.sort_by_key(|&i| {
+            let scale = self.trees[i].0;
+            if scale == want {
+                0
+            } else if scale > want {
+                1 + (scale - want)
+            } else {
+                100 + (want - scale)
+            }
+        });
+        let Some(&i) = order.first() else { return };
+        let (scale, dir) = self.trees[i].clone();
+        if self.scale == scale && self.dir == dir {
+            return;
+        }
+        self.scale = scale;
+        self.dir = dir;
+        self.index.clear();
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
             for e in rd.flatten() {
                 let name = match e.file_name().into_string() {
                     Ok(n) => n,
@@ -3877,29 +4092,29 @@ impl SpriteBank {
                 };
                 let lower = name.to_ascii_lowercase();
                 if lower.ends_with(".tga") || lower.ends_with(".webp") {
-                    index.insert(lower);
+                    self.index.insert(lower);
                 }
             }
         }
-        SpriteBank {
-            dir,
-            index,
-            cache: Default::default(),
-            // Decoded sprites are 4x larger per art-scale step; keep the cache
-            // small enough that the working set stays in the tens of MB.
-            cache_limit: match std::env::var("WA2_RENDER_SCALE").ok().as_deref() {
-                Some("8") => 8,
-                Some("4") => 16,
-                Some("2") => 24,
-                _ => 64,
-            },
-        }
+        self.cache.clear();
+        eprintln!("sprites: retargeted to {} ({}x)", self.dir.display(), scale);
+        // Decoded sprites are 4x larger per art-scale step; keep the cache
+        // small enough that the working set stays in the tens of MB.
+        self.cache_limit = match scale {
+            8 => 8,
+            4 => 16,
+            2 => 24,
+            _ => 64,
+        };
     }
 
     /// Returns the decoded pixels and the art scale they represent. A cached
     /// image keeps the scale it was decoded with, so resizing the window never
     /// mixes pixel scales between already-loaded and newly loaded sprites.
     fn get(&mut self, name: &str) -> Option<(std::sync::Arc<codec::tga::TgaImage>, u32)> {
+        if self.scale != render_art_scale() {
+            self.retarget(render_art_scale());
+        }
         let key = name.to_ascii_lowercase();
         if !self.cache.contains_key(&key) {
             let path = self.dir.join(&key);
