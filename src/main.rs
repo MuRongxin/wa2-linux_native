@@ -2463,29 +2463,34 @@ fn run_game_at(
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::Choice { options } => {
-                    // The script's own lines already carry 「１．」「２．」. A made-up
-                    // header would push a third option out of the three-line window.
+                    // The script's own lines already carry the option numbers.
                     let opts: Vec<String> = options.iter().map(|o| clean_text(o)).collect();
-                    let body = opts.join("\n");
-                    // The choice often arrives while ACT170 has the window closed.
-                    // Drawing with that flag drops the text entirely, so the
-                    // picture freezes with nothing to pick. The options open it.
-                    let line_h = if msg_plate.is_some() {
-                        render::DIALOG_LINE
-                    } else {
-                        font.cell() as i32 + 4
-                    };
-                    let text_y = if msg_plate.is_some() {
-                        render::DIALOG_TEXT_Y
-                    } else {
-                        let box_h = (H / 4).min(160).max(120);
-                        (H - box_h - 44) as i32 + 18
-                    };
-                    let opt_top = |i: usize| text_y + i as i32 * line_h;
-                    // Plate only. The highlight is painted under the glyphs, and
-                    // the glyphs are redrawn each frame — a full scene rebuild
-                    // is far too slow to repeat while the mouse moves.
-                    let base = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), true, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                    // The original keeps the line that is on screen under the
+                    // choices and puts every option in its own one-line message
+                    // window, centred on the screen above the dialogue box. A
+                    // full scene rebuild per frame would be far too slow while
+                    // the mouse moves, so the scene (and that line) is composited
+                    // once and the rows + highlight are redrawn on a copy.
+                    let look_alpha = scene_look(&settings, bg_cg).alpha;
+                    let base = draw_scene(
+                        &bg,
+                        &last_text,
+                        last_speaker.as_deref(),
+                        font,
+                        &slots,
+                        focus,
+                        win_size.0 as u32,
+                        win_size.1 as u32,
+                        tint.as_deref(),
+                        window,
+                        msg_plate.as_ref(),
+                        msg_frame.as_ref(),
+                        &plates,
+                        scene_look(&settings, bg_cg),
+                        vfont.as_mut(),
+                    );
+                    let row_layout = choice_row_layout(opts.len(), base.height);
+                    let ui_se = ui_se_path(&s.script_dir);
                     let mut hover: Option<usize> = None;
                     let mut bar_hover: Option<cmdbar::Cmd> = None;
                     cur_surf = render::Surface {
@@ -2493,8 +2498,6 @@ fn run_game_at(
                         height: base.height,
                         pixels: base.pixels.clone(),
                     };
-                    let (fw, fh) = (cur_surf.width, cur_surf.height);
-                    draw_body(&mut cur_surf, font, vfont.as_mut(), &body, None, msg_plate.is_some(), fw, fh, usize::MAX);
                     win.present(&cur_surf);
                     eprintln!(
                         "  choice: presenting {} options (click one, or press 1-{})",
@@ -2614,20 +2617,17 @@ fn run_game_at(
                                 height: base.height,
                                 pixels: base.pixels.clone(),
                             };
-                            if let Some(i) = hover {
-                                let y = opt_top(i) - 6;
-                                let (hx, hw) = if msg_plate.is_some() {
-                                    (
-                                        render::DIALOG_TEXT_X - 16,
-                                        (render::DIALOG_TEXT_RIGHT - render::DIALOG_TEXT_X + 32) as u32,
-                                    )
-                                } else {
-                                    (40, W - 80)
-                                };
-                                frame.fill_rect(hx, y, hw, (line_h + 4) as u32, [40, 70, 120, 255]);
-                            }
-                            let (fw, fh) = (frame.width, frame.height);
-                            draw_body(&mut frame, font, vfont.as_mut(), &body, None, msg_plate.is_some(), fw, fh, usize::MAX);
+                            paint_choice_rows(
+                                &mut frame,
+                                vfont.as_mut(),
+                                font,
+                                &opts,
+                                &row_layout,
+                                hover,
+                                msg_plate.as_ref(),
+                                msg_frame.as_ref(),
+                                look_alpha,
+                            );
                             let active = cmdbar::Active {
                                 auto: cmd_auto,
                                 skip: cmd_skip,
@@ -2640,12 +2640,15 @@ fn run_game_at(
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
                                 sdl2::Input::Choice(n) if (n as usize) <= opts.len() => {
+                                    play_ui_se(mixer.as_ref(), ui_se.as_deref());
                                     break n as u32
                                 }
                                 sdl2::Input::Pointer { x, y, pressed } => {
                                     let (sx, sy) = win.surface_pos(x, y, W, H);
                                     // Command bar takes priority over the choices.
                                     if let Some(cmd) = bar.hit(sx, sy) {
+                                        // The cursor left the rows for the command bar.
+                                        hover = None;
                                         if pressed {
                                             match cmd {
                                                 cmdbar::Cmd::Auto => {
@@ -2731,13 +2734,23 @@ fn run_game_at(
                                         }
                                         win.delay(16);
                                     } else {
-                                        let hit = (0..opts.len()).find(|i| {
-                                            sy >= opt_top(*i) - 6 && sy < opt_top(*i) + line_h
+                                        let hit = row_layout.iter().position(|row| {
+                                            sy >= row.top && sy < row.top + row.height
                                         });
-                                        hover = hit;
+                                        if hit != hover {
+                                            // The original plays its system UI sound
+                                            // (SE_8905, the id the menu wrappers at
+                                            // 0x40ea10/0x40ea30 pass to 0x4064a0)
+                                            // when the cursor moves onto a choice.
+                                            if hit.is_some() {
+                                                play_ui_se(mixer.as_ref(), ui_se.as_deref());
+                                            }
+                                            hover = hit;
+                                        }
                                         bar_hover = None;
                                         if pressed {
                                             if let Some(i) = hit {
+                                                play_ui_se(mixer.as_ref(), ui_se.as_deref());
                                                 break (i + 1) as u32;
                                             }
                                         }
@@ -4877,6 +4890,189 @@ fn clean_text(s: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// branch choices
+// ---------------------------------------------------------------------------
+
+/// One choice row while a branch is presented, in output pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChoiceRow {
+    top: i32,
+    height: i32,
+}
+
+/// A choice row is one line of the message window. The numbers come from the
+/// original choice screen at 1280x720: a row is about a third of the dialogue
+/// window tall, two rows sit 138px apart and straddle y=262 (so they land on
+/// 193 and 331), and the block stays above the dialogue box.
+const CHOICE_ROW_H: i32 = 72;
+const CHOICE_PITCH: i32 = 138;
+const CHOICE_CENTER_Y: i32 = 262;
+const CHOICE_MIN_TOP: i32 = 24;
+const CHOICE_MAX_BOTTOM: i32 = 476;
+
+/// Vertical centres of every row, in logical 720p coordinates. Up to three
+/// options keep the measured pitch; a rare four-option branch is tightened so
+/// the block still fits between the top of the screen and the dialogue box.
+fn choice_row_centers(count: usize) -> Vec<i32> {
+    let n = count.max(1) as i32;
+    let (pitch, center) = if n <= 3 {
+        (CHOICE_PITCH, CHOICE_CENTER_Y)
+    } else {
+        let usable = CHOICE_MAX_BOTTOM - CHOICE_MIN_TOP - CHOICE_ROW_H;
+        (
+            (usable / (n - 1)).max(48),
+            (CHOICE_MIN_TOP + CHOICE_MAX_BOTTOM) / 2,
+        )
+    };
+    (0..n)
+        .map(|i| center + (i * 2 - (n - 1)) * pitch / 2)
+        .collect()
+}
+
+/// Same rows scaled to an output surface of surface_h height.
+fn choice_row_layout(count: usize, surface_h: u32) -> Vec<ChoiceRow> {
+    let sy = |v: i32| (v * surface_h as i32 + 360) / 720;
+    let row_h = sy(CHOICE_ROW_H).max(20);
+    // Scale the logical row centres before clamping: the block checks below
+    // compare them against scaled bounds.
+    let mut centers: Vec<i32> = choice_row_centers(count).into_iter().map(sy).collect();
+    let block_top = |c: &[i32]| c.iter().min().copied().unwrap_or(0) - row_h / 2;
+    let block_bottom = |c: &[i32]| c.iter().max().copied().unwrap_or(0) + row_h / 2;
+    // Belt and braces for odd counts: never overlap the dialogue box or run
+    // off the top of the screen.
+    if block_bottom(&centers) > sy(CHOICE_MAX_BOTTOM) {
+        let shift = sy(CHOICE_MAX_BOTTOM) - block_bottom(&centers);
+        for c in &mut centers {
+            *c += shift;
+        }
+    }
+    if block_top(&centers) < sy(CHOICE_MIN_TOP) {
+        let shift = sy(CHOICE_MIN_TOP) - block_top(&centers);
+        for c in &mut centers {
+            *c += shift;
+        }
+    }
+    centers
+        .into_iter()
+        .map(|c| ChoiceRow {
+            top: c - row_h / 2,
+            height: row_h,
+        })
+        .collect()
+}
+
+/// Paint the choice rows: one message-window plate per option, squeezed to a
+/// single line, with the option text centred inside. The hovered row gets a
+/// soft inner highlight under the glyphs.
+fn paint_choice_rows(
+    frame: &mut render::Surface,
+    vfont: Option<&mut render::text::VectorFont>,
+    font: &render::Font,
+    opts: &[String],
+    rows: &[ChoiceRow],
+    hover: Option<usize>,
+    plate: Option<&codec::tga::TgaImage>,
+    frame_img: Option<&codec::tga::TgaImage>,
+    alpha: u8,
+) {
+    let w = frame.width;
+    let x = render::WINDOW_X.max(0) as u32 * w / render::LAYOUT_W;
+    let plate_w = plate
+        .map(|p| p.width.max(1) * w / render::LAYOUT_W)
+        .unwrap_or_else(|| w.saturating_sub(2 * x).max(1));
+    for (i, row) in rows.iter().enumerate() {
+        let height = row.height.max(1) as u32;
+        if let Some(pl) = plate {
+            frame.blit_region_scaled(
+                pl, 0, 0, pl.width, pl.height, x as i32, row.top, plate_w, height, alpha,
+            );
+        } else {
+            frame.fill_rect(x as i32, row.top, plate_w, height, [16, 62, 84, 220]);
+        }
+        if let Some(fr) = frame_img {
+            frame.blit_region_scaled(
+                fr, 0, 0, fr.width, fr.height, x as i32, row.top, plate_w, height, alpha,
+            );
+        }
+        if hover == Some(i) {
+            // Brighten the row by compositing its own plate again: the oval
+            // keeps its feathered edges instead of getting a rectangle laid
+            // over it.
+            if let Some(pl) = plate {
+                frame.blit_region_scaled(
+                    pl, 0, 0, pl.width, pl.height, x as i32, row.top, plate_w, height, 96,
+                );
+            } else {
+                frame.fill_rect(x as i32, row.top, plate_w, height, [120, 190, 220, 40]);
+            }
+            if let Some(fr) = frame_img {
+                frame.blit_region_scaled(
+                    fr, 0, 0, fr.width, fr.height, x as i32, row.top, plate_w, height, 96,
+                );
+            }
+        }
+    }
+    match vfont {
+        Some(vf) => {
+            let size =
+                render::layout_px(render::text::dialog_font_size() as i32, frame.height as i32)
+                    .clamp(8, 160) as u32;
+            if vf.size() != size {
+                let _ = vf.set_size(size);
+            }
+            vf.set_edge_px(render::text::dialog_edge_px(size));
+            let body_style = render::text::dialog_body_style();
+            let hover_style = render::text::TextStyle {
+                color: [255, 246, 226],
+                ..body_style
+            };
+            for (i, (opt, row)) in opts.iter().zip(rows).enumerate() {
+                let width = vf.measure(opt);
+                let tx = ((w as i32 - width) / 2).max(x as i32 + 8);
+                let baseline = vf.baseline_in_box(row.top, row.height);
+                let style = if hover == Some(i) { &hover_style } else { &body_style };
+                vf.draw_styled(frame, opt, tx, baseline, style);
+            }
+        }
+        None => {
+            // Japanese mode keeps the bitmap atlas; its cell size is fixed, so
+            // centre by counting cells.
+            let pitch = render::DIALOG_PITCH;
+            for (opt, row) in opts.iter().zip(rows) {
+                let mut adv = 0;
+                for ch in opt.chars() {
+                    adv += if (ch as u32) < 128 { pitch / 2 } else { pitch };
+                }
+                let tx = ((w as i32 - adv) / 2).max(x as i32 + 8);
+                let ty = row.top + (row.height - font.cell() as i32) / 2;
+                font.draw_pitch(frame, opt, tx, ty, pitch);
+            }
+        }
+    }
+}
+
+/// The original's system UI sound. WA2.exe plays SE_8905 (id 0x22c9) from the
+/// two tiny wrappers at 0x40ea10 / 0x40ea30 for menu interactions; the branch
+/// choice rows use the game-wide UI sound for hover and click.
+const UI_SE_ID: u32 = 8905;
+
+fn ui_se_path(script_dir: &Path) -> Option<std::path::PathBuf> {
+    let dir = script_dir.parent()?.join("se");
+    ["WAV", "OGG", "wav", "ogg"]
+        .iter()
+        .map(|ext| dir.join(format!("SE_{:04}.{}", UI_SE_ID, ext)))
+        .find(|p| p.is_file())
+}
+
+fn play_ui_se(mixer: Option<&audio::Mixer>, path: Option<&Path>) {
+    if let (Some(mx), Some(path)) = (mixer, path) {
+        if mx.play_cat(&path.to_string_lossy(), 1.0, false, audio::mixer::CAT_SE) != usize::MAX {
+            eprintln!("  SE: choice UI id={} -> {}", UI_SE_ID, path.display());
+        }
+    }
+}
+
 /// CG stills from `bg/v*.tga`. Left and right (or the two halves of the
 /// screen) page through them; Esc or the right button returns to the title.
 fn cg_names(dirs: &[&std::path::Path]) -> Vec<String> {
@@ -6381,3 +6577,41 @@ mod bg_index_tests {
     }
 }
 
+#[cfg(test)]
+mod choice_ui_tests {
+    #[test]
+    fn dbg_layout() {
+        let rows = choice_row_layout(2, 1080);
+        eprintln!("2@1080 -> {:?}", rows);
+        let rows2 = choice_row_layout(2, 720);
+        eprintln!("2@720  -> {:?}", rows2);
+    }
+    use super::{choice_row_centers, choice_row_layout};
+
+    #[test]
+    fn choices_sit_where_the_original_screen_puts_them() {
+        assert_eq!(choice_row_centers(1), vec![262]);
+        assert_eq!(choice_row_centers(2), vec![193, 331]);
+        assert_eq!(choice_row_centers(3), vec![124, 262, 400]);
+    }
+
+    #[test]
+    fn a_branch_of_four_still_fits_above_the_dialogue_box() {
+        let rows = choice_row_layout(2, 720);
+        assert_eq!(rows[0].top, 157);
+        assert_eq!(rows[1].top, 295);
+        assert_eq!(rows[0].height, 72);
+        let rows = choice_row_layout(4, 720);
+        assert!(rows.first().unwrap().top >= 24, "{rows:?}");
+        let last = rows.last().unwrap();
+        assert!(last.top + last.height <= 476, "{rows:?}");
+    }
+
+    #[test]
+    fn rows_scale_with_the_window() {
+        let rows = choice_row_layout(2, 1080);
+        assert_eq!(rows[0].height, 108);
+        assert_eq!(rows[0].top, 236);
+        assert_eq!(rows[1].top, 443);
+    }
+}
