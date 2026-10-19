@@ -1071,8 +1071,8 @@ fn page_labs(page: usize) -> Vec<Lab> {
             v.push(row(40, 162, 250, 28, "自动模式速度", ""));
             // Scales sit on their own row under the track, aligned to its
             // ends. They used to sit on the track's bottom edge.
-            v.push(tiny(BAR_X0 - 16, SL_AUTO.y + BAR_H + 2, 44, 12, "FAST"));
-            v.push(tiny(BAR_X1 - 44, SL_AUTO.y + BAR_H + 2, 48, 12, "SLOW"));
+            v.push(tiny(BAR_X0 - 16, SL_AUTO.y + BAR_H + 4, 44, 11, "FAST"));
+            v.push(tiny(BAR_X1 - 44, SL_AUTO.y + BAR_H + 4, 48, 11, "SLOW"));
             v.push(head(36, 204, 200, "视觉设置"));
             v.push(row(48, 226, 240, 28, "画面特效", ""));
             v.push(btn(458, 222, 252, 36, "瞬间显示", "Fast"));
@@ -1085,9 +1085,9 @@ fn page_labs(page: usize) -> Vec<Lab> {
             v.push(note(48, 360, 180, "（小说场景）"));
             v.push(row(40, 386, 260, 26, "指令图标透明度", ""));
             for sl in [SL_ANOVEL, SL_ACG, SL_ABACK, SL_ACMD] {
-                let row_y = sl.y + BAR_H + 2;
-                v.push(tiny(BAR_X0 - 16, row_y, 44, 12, "0%"));
-                v.push(tiny(BAR_X1 - 44, row_y, 48, 12, "100%"));
+                let row_y = sl.y + BAR_H + 4;
+                v.push(tiny(BAR_X0 - 16, row_y, 44, 11, "0%"));
+                v.push(tiny(BAR_X1 - 44, row_y, 48, 11, "100%"));
             }
         }
         1 => {
@@ -1102,8 +1102,8 @@ fn page_labs(page: usize) -> Vec<Lab> {
             v.push(head(36, 96, 200, "声音设置"));
             for (y, name) in [(118, "全体音量"), (158, "BGM音量"), (198, "SE音量"), (238, "VOICE音量")] {
                 v.push(row(40, y + 2, 220, 28, name, ""));
-                v.push(tiny(BAR_X0 - 16, y + BAR_H + 2, 44, 12, "MIN"));
-                v.push(tiny(BAR_X1 - 44, y + BAR_H + 2, 48, 12, "MAX"));
+                v.push(tiny(BAR_X0 - 16, y + BAR_H + 4, 44, 11, "MIN"));
+                v.push(tiny(BAR_X1 - 44, y + BAR_H + 4, 48, 11, "MAX"));
             }
             v.push(head(36, 280, 200, "暂停设置"));
             v.push(row(40, 308, 270, 30, "翻页时中断语音", ""));
@@ -1287,7 +1287,7 @@ fn rebuild_caption_regions(s: &mut Surface, page: usize) {
     //    run all the way to the buttons on every page; the ON/OFF pills sit in
     //    that strip on pages 1 and 2 and are drawn as-is, so their rectangles
     //    (plus their glow) are skipped.
-    let right = 478;
+    let right = 480;
     let pills: Vec<(i32, i32, i32, i32)> = page_hots(page)
         .iter()
         .filter(|h| matches!(h.act, Act::Off(_)))
@@ -1328,7 +1328,10 @@ fn rebuild_caption_regions(s: &mut Surface, page: usize) {
             .map(|a| (a.x, a.y, a.x + a.w, a.y + a.h))
             .collect();
         let y0 = sl.y + BAR_H;
-        let y1 = (sl.y + 38).min(s.height as i32);
+        // Run right up to the next row's track. Its top edge is a horizontal
+        // run, so the structure test keeps it; every faint label/noise pixel
+        // between the tracks is wiped.
+        let y1 = (sl.y + 40).min(s.height as i32);
         for y in y0..y1 {
             for x in 500..940.min(s.width as i32) {
                 if arrows.iter().any(|&(ax0, ay0, ax1, ay1)| {
@@ -1336,9 +1339,9 @@ fn rebuild_caption_regions(s: &mut Surface, page: usize) {
                 }) {
                     continue;
                 }
-                // Nothing in this band is worth keeping: it holds the baked
-                // scale labels and the baked value bar (which fights the
-                // dynamic fill), and the band sits between two tracks.
+                // No structure lives inside the band: the track edges are
+                // above and at the band's end, so everything here is a baked
+                // label, its faint leader line or the old value bar.
                 let i = ((y as u32 * s.width + x as u32) * 4) as usize;
                 s.pixels[i] = 0;
                 s.pixels[i + 1] = 0;

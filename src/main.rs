@@ -853,9 +853,14 @@ fn load_background_asset_inner(dirs: &[&std::path::Path], name: &str) -> Option<
             artcache::load(&path).map(|img| (*img).clone())
         };
         if let Some(img) = decoded {
-            let art_scale = if is_ui { 1 } else { codec::image::art_scales(&path).1.max(1) };
+            let (art_scale, src_scale) = if is_ui {
+                (1, 1)
+            } else {
+                let (src, dec) = codec::image::art_scales(&path);
+                (dec.max(1), src.max(1))
+            };
             tlog(if cp932 { "decode (cp932 name)" } else { "decode" }, t1);
-            return Some(LoadedAsset { img, art_scale });
+            return Some(LoadedAsset { img, art_scale, src_scale });
         }
     }
     None
@@ -1626,6 +1631,9 @@ fn run_game_at(
     // colour. A fullscreen switch changes the wanted scale, which tells the
     // loop to re-decode the picture at the new one.
     let mut bg_scale: Option<u32> = None;
+    // Source tree the background was read from (4/8 for bg_4x/bg_8x, 1 for the
+    // original TGA tree). Printed with the scene line.
+    let mut bg_src_scale: Option<u32> = None;
 
     let mixer = &rt.mixer;
 
@@ -1707,6 +1715,7 @@ fn run_game_at(
                     bg_label = name.clone();
                     eprintln!("scene {} | bg {} id={} var={}", current_id, name, id, variant);
                     bg_scale = Some(asset.art_scale);
+                    bg_src_scale = Some(asset.src_scale);
                     bg = asset.img;
                 } else {
                     eprintln!(
@@ -1723,6 +1732,7 @@ fn run_game_at(
                 bg_label = event_cg_name(id, variant);
                 eprintln!("scene {} | cg {} id={} var={}", current_id, bg_label, id, variant);
                 bg_scale = Some(asset.art_scale);
+                    bg_src_scale = Some(asset.src_scale);
                 bg = asset.img;
             } else {
                 eprintln!(
@@ -1741,8 +1751,8 @@ fn run_game_at(
                 None => continue,
             };
             if let Some(bank) = bank.as_mut() {
-                if let Some((img, art_scale)) = bank.get(name) {
-                    slots[i] = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img, art_scale });
+                if let Some((img, art_scale, src_scale)) = bank.get(name) {
+                    slots[i] = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img, art_scale, src_scale });
                 }
             }
         }
@@ -1863,6 +1873,7 @@ fn run_game_at(
                 if let Some(asset) = load_background_asset(&dirs, &name) {
                     bg = asset.img;
                     bg_scale = Some(asset.art_scale);
+                    bg_src_scale = Some(asset.src_scale);
                     bg_label = name;
                     eprintln!(
                         "art: reloaded {} at decode scale {}x",
@@ -1873,9 +1884,10 @@ fn run_game_at(
             }
             for slot in slots.iter_mut().flatten() {
                 if let Some(bank) = bank.as_mut() {
-                    if let Some((img, art_scale)) = bank.get(&slot.name) {
+                    if let Some((img, art_scale, src_scale)) = bank.get(&slot.name) {
                         slot.img = img;
                         slot.art_scale = art_scale;
+                        slot.src_scale = src_scale;
                     }
                 }
             }
@@ -1927,7 +1939,7 @@ fn run_game_at(
                         .enumerate()
                         .filter_map(|(i, s)| {
                             s.as_ref().map(|a| {
-                                format!("{}:{}", i, a.name.trim_end_matches(".tga"))
+                                format!("{}:{}({}x)", i, a.name, a.src_scale)
                             })
                         })
                         .collect::<Vec<_>>()
@@ -1945,12 +1957,20 @@ fn run_game_at(
                     // not the characters on screen, so the log keeps the voice
                     // id instead of printing them.
                     let cn = s.script_dir.file_name().and_then(|n| n.to_str()) == Some("script_cn");
+                    // Mark which art tree the picture came from, so the log
+                    // says whether this frame is 4x or 8x art.
+                    let bg_tag = match bg_src_scale {
+                        Some(scale) if !bg_label.eq_ignore_ascii_case("BLACK") => {
+                            format!("{}({}x)", bg_label, scale)
+                        }
+                        _ => bg_label.clone(),
+                    };
                     if cn {
                         eprintln!(
                             "scene {} | line {} | bg {} | sprites {} | focus {} | window {} | voice {}",
                             current_id,
                             line_no,
-                            bg_label,
+                            bg_tag,
                             cast,
                             focus_id,
                             if window { "open" } else { "hidden" },
@@ -1964,7 +1984,7 @@ fn run_game_at(
                             "scene {} | line {} | bg {} | sprites {} | focus {} | window {} | voice {} | {} | {}",
                             current_id,
                             line_no,
-                            bg_label,
+                            bg_tag,
                             cast,
                             focus_id,
                             if window { "open" } else { "hidden" },
@@ -2022,6 +2042,9 @@ fn run_game_at(
                             }
                         }
                     }
+                    // Blank line after this line's log block (scene line and its
+                    // voice line) so consecutive clicks are easy to tell apart.
+                    eprintln!();
                     // Remember the current line for save (last_text) and backlog.
                     let logged = match &speaker {
                         Some(sp) => format!("{}：{}", sp, body),
@@ -2035,7 +2058,7 @@ fn run_game_at(
                     let mut changed = false;
                     if let Some(bank) = bank.as_mut() {
                         if let Some(name) = bank.resolve(char_id, series, variant) {
-                            if let Some((img, art_scale)) = bank.get(&name) {
+                            if let Some((img, art_scale, src_scale)) = bank.get(&name) {
                                 let idx = slot as usize;
                                 // One character occupies one slot. Moving them
                                 // (雪菜 from 2 to 1, and so on) has to clear
@@ -2046,8 +2069,11 @@ fn run_game_at(
                                     }
                                 }
                                 if let Some(dst) = slots.get_mut(idx) {
-                                    eprintln!("  sprite: {} (char {}, slot {}, {}f)", name, char_id, idx, frames);
-                                    *dst = Some(ActiveSprite { char_id, name, img, art_scale });
+                                    eprintln!(
+                                        "  sprite: {} ({}x source, char {}, slot {}, {}f)",
+                                        name, src_scale, char_id, idx, frames
+                                    );
+                                    *dst = Some(ActiveSprite { char_id, name, img, art_scale, src_scale });
                                     changed = true;
                                 } else {
                                     eprintln!("  sprite: slot {} out of range", idx);
@@ -2123,6 +2149,7 @@ fn run_game_at(
                         bg_label = "BLACK".to_string();
                         bg = solid_bg(W, H, [0, 0, 0]);
                         bg_scale = None;
+                        bg_src_scale = None;
                         // id 0 is a fade-out: the shot is over, so the people
                         // from it must leave. id -2 keeps whoever is standing
                         // (the cut to black in 1010 still has them in frame).
@@ -2143,6 +2170,7 @@ fn run_game_at(
                             bg_id = Some((id, variant));
                             bg_label = name.clone();
                             bg_scale = Some(asset.art_scale);
+                    bg_src_scale = Some(asset.src_scale);
                             bg = asset.img;
                             eprintln!(
                                 "scene {} | bg {} id={} var={} fade={}f",
@@ -2180,6 +2208,7 @@ fn run_game_at(
                         bg_id = Some((id, variant));
                         bg_label = name.clone();
                         bg_scale = Some(asset.art_scale);
+                    bg_src_scale = Some(asset.src_scale);
                         bg = asset.img;
                         eprintln!(
                             "scene {} | cg {} id={} var={} fade={}f",
@@ -3325,11 +3354,17 @@ fn rewind_step(
         for (i, entry) in dest.slots.iter().enumerate() {
             let Some((char_id, name)) = entry else { continue };
             if let Some(bank) = bank.as_mut() {
-                let Some((img, art_scale)) = bank.get(name) else {
+                let Some((img, art_scale, src_scale)) = bank.get(name) else {
                     continue;
                 };
                 if let Some(dst) = slots.get_mut(i) {
-                    *dst = Some(ActiveSprite { char_id: *char_id, name: name.clone(), img, art_scale });
+                    *dst = Some(ActiveSprite {
+                        char_id: *char_id,
+                        name: name.clone(),
+                        img,
+                        art_scale,
+                        src_scale,
+                    });
                 }
             }
         }
@@ -4065,8 +4100,9 @@ struct SpriteBank {
     scale: u32,
     /// lowercased file names present in the directory
     index: std::collections::HashSet<String>,
-    /// file name -> (decoded pixels, scale represented by those pixels)
-    cache: std::collections::HashMap<String, (std::sync::Arc<codec::tga::TgaImage>, u32)>,
+    /// file name -> (decoded pixels, scale of those pixels, scale of the
+    /// source tree they were read from)
+    cache: std::collections::HashMap<String, (std::sync::Arc<codec::tga::TgaImage>, u32, u32)>,
     /// High-resolution sprites are large after WebP decode. Do not retain the
     /// entire 1,600-file library in RAM as the story advances.
     cache_limit: usize,
@@ -4135,7 +4171,7 @@ impl SpriteBank {
     /// Returns the decoded pixels and the art scale they represent. A cached
     /// image keeps the scale it was decoded with, so resizing the window never
     /// mixes pixel scales between already-loaded and newly loaded sprites.
-    fn get(&mut self, name: &str) -> Option<(std::sync::Arc<codec::tga::TgaImage>, u32)> {
+    fn get(&mut self, name: &str) -> Option<(std::sync::Arc<codec::tga::TgaImage>, u32, u32)> {
         if self.scale != render_art_scale() {
             self.retarget(render_art_scale());
         }
@@ -4145,15 +4181,18 @@ impl SpriteBank {
             // Shared with the background loader, so a sprite the prefetch
             // thread already decoded costs nothing here.
             let img = (*artcache::load(&path)?).clone();
-            let art_scale = codec::image::art_scales(&path).1.max(1);
+            let (src_scale, art_scale) = codec::image::art_scales(&path);
+            let art_scale = art_scale.max(1);
             if self.cache.len() >= self.cache_limit {
                 if let Some(old) = self.cache.keys().next().cloned() {
                     self.cache.remove(&old);
                 }
             }
-            self.cache.insert(key.clone(), (std::sync::Arc::new(img), art_scale));
+            self.cache.insert(key.clone(), (std::sync::Arc::new(img), art_scale, src_scale.max(1)));
         }
-        self.cache.get(&key).map(|(img, scale)| (std::sync::Arc::clone(img), *scale))
+        self.cache
+            .get(&key)
+            .map(|(img, scale, src)| (std::sync::Arc::clone(img), *scale, *src))
     }
 
     /// Resolve `(char, series, variant)` to a real sprite file name.
@@ -4220,6 +4259,10 @@ struct LoadedAsset {
     /// Effective scale of the decoded pixels relative to 1280x720 layout
     /// coordinates. UI assets have already been normalized and use 1.
     art_scale: u32,
+    /// Scale of the source tree the file was read from (4 for `bg_4x`, 8 for
+    /// `bg_8x`, 1 for the original TGA tree). Printed next to the asset name so
+    /// the log says where the pixels came from.
+    src_scale: u32,
 }
 
 struct ActiveSprite {
@@ -4228,6 +4271,8 @@ struct ActiveSprite {
     name: String,
     img: std::sync::Arc<codec::tga::TgaImage>,
     art_scale: u32,
+    /// Scale of the sprite tree the file came from (4x or 8x), for the log.
+    src_scale: u32,
 }
 
 /// An ACT176 plate (item, effect, or a layer of a composite CG).
