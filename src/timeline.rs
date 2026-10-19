@@ -234,7 +234,7 @@ pub fn run(
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick => return None,
             sdl2::Input::Advance => return Some(chart.nodes[sel].id.clone()),
-            sdl2::Input::Back => {
+            sdl2::Input::Back | sdl2::Input::Left => {
                 sel = nav::step(&chart, sel, -1);
                 nav::focus_view(&chart, sel, &mut view);
             }

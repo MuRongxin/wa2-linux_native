@@ -145,6 +145,9 @@ pub struct TextStyle {
     pub shadow: (i32, i32, u8),
     /// Shadow colour.
     pub shadow_rgb: [u8; 3],
+    /// Rule under the line. The dialogue body only - a menu label sits on its
+    /// own plate and has nothing to separate from.
+    pub underline: bool,
 }
 
 impl TextStyle {
@@ -156,6 +159,7 @@ impl TextStyle {
             edge_alpha: DEFAULT_EDGE_ALPHA,
             shadow: (1, 1, 110),
             shadow_rgb: [0, 0, 0],
+            underline: false,
         }
     }
 
@@ -170,6 +174,7 @@ impl TextStyle {
             edge_alpha: 170,
             shadow: (0, 0, 0),
             shadow_rgb: [0, 0, 0],
+            underline: false,
         }
     }
 
@@ -180,6 +185,7 @@ impl TextStyle {
             edge_alpha: 0,
             shadow: (0, 0, 0),
             shadow_rgb: [0, 0, 0],
+            underline: false,
         }
     }
 
@@ -957,9 +963,26 @@ impl Label {
     }
 }
 
-thread_local! {
-    static UI: RefCell<Option<VectorFont>> = const { RefCell::new(None) };
+/// One cached font instance. `gen` is the generation of the role ids it was
+/// opened under: bumping an id drops the instance, and with it the glyph
+/// cache, so not one glyph of the old font can survive into the new one.
+struct RoleFont {
+    gen: u64,
+    vf: VectorFont,
 }
+
+thread_local! {
+    /// One font per role, each with its own FreeType face and its own glyph
+    /// cache. Sharing one instance was what locked the menu, the history and
+    /// the dialogue to the same file.
+    static ROLE_FONTS: RefCell<[Option<RoleFont>; 3]> = const { RefCell::new([None, None, None]) };
+}
+
+/// What the player picked for each role, and how often it changed. The ids
+/// live outside the thread-local instances so the settings screen can drop
+/// every cached font from wherever it is applied.
+static ROLE_IDS: std::sync::Mutex<[i32; 3]> = std::sync::Mutex::new([0, 0, 0]);
+static ROLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The font file and the knobs that change how heavy it reads.
 pub struct FontChoice {
@@ -991,18 +1014,604 @@ fn split_font_spec(spec: &str) -> (String, Option<i64>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// dialogue text style
+// ---------------------------------------------------------------------------
+
+/// How the dialogue body is drawn once the player has moved it off the
+/// defaults. It lives with the font roles because a change has to reach the
+/// same place: the next line drawn, not the one already on screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DialogStyle {
+    /// Body size in 720p pixels; the window scales it from there.
+    pub size: u32,
+    /// Outline radius in pixels. 0 keeps the one the size implies.
+    pub edge: u32,
+    /// Index into DIALOG_COLORS.
+    pub color: u32,
+    pub underline: bool,
+}
+
+pub const DIALOG_SIZE_MIN: u32 = 20;
+pub const DIALOG_SIZE_MAX: u32 = 40;
+pub const DIALOG_EDGE_MAX: u32 = 3;
+
+/// The body colours the player can pick: white, then warm and cool tints that
+/// still read on a CG.
+pub const DIALOG_COLORS: [[u8; 3]; 8] = [
+    [255, 255, 255],
+    [255, 246, 226],
+    [255, 231, 205],
+    [226, 255, 235],
+    [205, 233, 255],
+    [233, 214, 255],
+    [255, 214, 231],
+    [206, 206, 206],
+];
+
+pub const DIALOG_COLOR_NAMES: [&str; 8] = ["白", "暖白", "米色", "淡绿", "淡蓝", "淡紫", "淡粉", "灰"];
+
+impl DialogStyle {
+    /// What the game ships with: 26px, the edge the size implies, white, no
+    /// rule under the line.
+    pub const fn default_style() -> DialogStyle {
+        DialogStyle { size: 26, edge: 0, color: 0, underline: false }
+    }
+
+    /// Clamp a value that came out of the config file.
+    pub fn clamp(self) -> DialogStyle {
+        DialogStyle {
+            size: self.size.clamp(DIALOG_SIZE_MIN, DIALOG_SIZE_MAX),
+            edge: self.edge.min(DIALOG_EDGE_MAX),
+            color: self.color.min(DIALOG_COLORS.len() as u32 - 1),
+            underline: self.underline,
+        }
+    }
+}
+
+static DIALOG: std::sync::Mutex<DialogStyle> = std::sync::Mutex::new(DialogStyle::default_style());
+
+pub fn set_dialog_style(s: DialogStyle) -> bool {
+    let s = s.clamp();
+    let mut cur = DIALOG.lock().unwrap_or_else(|e| e.into_inner());
+    if *cur == s {
+        return false;
+    }
+    *cur = s;
+    true
+}
+
+pub fn dialog_style() -> DialogStyle {
+    *DIALOG.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Body size in 720p pixels, for the caller that scales it to the window.
+pub fn dialog_font_size() -> u32 {
+    dialog_style().size
+}
+
+/// The body style the dialogue is drawn with: the player's colour and rule on
+/// top of the shadow the artwork was tuned for.
+pub fn dialog_body_style() -> TextStyle {
+    let s = dialog_style();
+    TextStyle {
+        color: DIALOG_COLORS[(s.color as usize).min(DIALOG_COLORS.len() - 1)],
+        underline: s.underline,
+        ..TextStyle::body()
+    }
+}
+
+/// The outline radius the player asked for, or None to keep the one the size
+/// implies - which is what the game shipped with.
+pub fn dialog_edge_px(size: u32) -> Option<u32> {
+    let e = dialog_style().edge;
+    if e == 0 {
+        None
+    } else {
+        Some(e.min(size / 4).max(1))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// font roles
+// ---------------------------------------------------------------------------
+
+/// The three fonts the player sets independently.
+///
+/// Everything used to borrow one font, so the title screen, the text history
+/// and the dialogue had to share a file and a glyph cache. A role owns its own
+/// instance now: changing one role drops only that role's cache.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FontRole {
+    /// Title screen, option screens, save/load, timeline, music mode.
+    Home,
+    /// The text history / backlog screen.
+    History,
+    /// Dialogue, speaker names and narration.
+    Game,
+}
+
+/// Display order in the settings page: the text the player reads most comes
+/// first. The slot each role owns is `FontRole::index`, not this order.
+pub const FONT_ROLES: [FontRole; 3] = [FontRole::Game, FontRole::History, FontRole::Home];
+
+impl FontRole {
+    pub fn index(self) -> usize {
+        match self {
+            FontRole::Home => 0,
+            FontRole::History => 1,
+            FontRole::Game => 2,
+        }
+    }
+
+    /// Short tag for the log line.
+    pub fn tag(self) -> &'static str {
+        match self {
+            FontRole::Home => "home",
+            FontRole::History => "history",
+            FontRole::Game => "game",
+        }
+    }
+
+    /// Key it is stored under in `wa2.ini`.
+    pub fn ini_key(self) -> &'static str {
+        match self {
+            FontRole::Home => "font_home",
+            FontRole::History => "font_history",
+            FontRole::Game => "font_game",
+        }
+    }
+
+    /// Row label on the option page.
+    pub fn label(self) -> &'static str {
+        match self {
+            FontRole::Home => "UI字体",
+            FontRole::History => "已读文本字体",
+            FontRole::Game => "对话文本字体",
+        }
+    }
+
+    /// Environment variable that overrides this role alone.
+    pub fn env_var(self) -> &'static str {
+        match self {
+            FontRole::Home => "WA2_FONT_HOME",
+            FontRole::History => "WA2_FONT_HISTORY",
+            FontRole::Game => "WA2_FONT_GAME",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// font catalogue
+// ---------------------------------------------------------------------------
+
+/// One entry of the font list the settings page offers.
+#[derive(Clone, Debug)]
+pub struct FontProfile {
+    /// Stable id, and the only thing wa2.ini stores: a hash of the font file's
+    /// own name and face index, so the same value names the same font on
+    /// another machine and never depends on where it sorted here. 0 is the
+    /// default entry.
+    pub id: i32,
+    /// Name shown in the settings page: the family, plus the style when the
+    /// face carries an interesting one.
+    pub name: String,
+    /// Resolved file. None only for the default entry when this machine has
+    /// nothing that can draw the script.
+    pub path: Option<String>,
+    pub face: i64,
+    /// Family FreeType reports for the resolved face.
+    pub family: String,
+}
+
+/// Face index of the Simplified Chinese face inside a Noto CJK collection
+/// (JP=0, KR=1, SC=2, TC=3, HK=4). Noto ships one file per script region, so
+/// the index is fixed for every weight.
+const SC_FACE: i64 = 2;
+
+/// A fonts/ folder shipped with the program, then one next to the working
+/// directory. A packaged build drops its CJK font here so the default never
+/// depends on what the distro happened to install.
+fn bundled_dirs() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("fonts").to_string_lossy().into_owned());
+        }
+    }
+    v.push("fonts".to_string());
+    v
+}
+
+/// The default entry: the font shipped with the program if there is one, then
+/// the platform's own sans. It is the only entry a packaged build can count on.
+fn default_candidates() -> Vec<(String, i64)> {
+    let mut v = Vec::new();
+    for dir in bundled_dirs() {
+        v.push((format!("{}/NotoSansCJK-Medium.ttc", dir), SC_FACE));
+        v.push((format!("{}/NotoSansCJK-Regular.ttc", dir), SC_FACE));
+    }
+    for (path, face) in medium_paths() {
+        v.push(((*path).to_string(), *face));
+    }
+    v
+}
+
+/// Noto Sans CJK Medium, the weight the dialog layout was tuned on.
+fn medium_paths() -> &'static [(&'static str, i64)] {
+    if cfg!(target_os = "windows") {
+        &[("C:/Windows/Fonts/msyhbd.ttc", 0), ("C:/Windows/Fonts/msyh.ttc", 0)]
+    } else if cfg!(target_os = "macos") {
+        &[
+            ("/System/Library/Fonts/PingFang.ttc", 0),
+            ("/Library/Fonts/NotoSansCJK-Medium.ttc", SC_FACE),
+        ]
+    } else {
+        &[
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc", SC_FACE),
+            ("/usr/share/fonts/truetype/noto/NotoSansCJK-Medium.ttc", SC_FACE),
+            ("/usr/local/share/fonts/noto/NotoSansCJK-Medium.ttc", SC_FACE),
+        ]
+    }
+}
+
+/// A face that cannot draw the script is not offered: it would put tofu, or
+/// Japanese glyph shapes, in the middle of the Chinese lines.
+fn script_ok(ft: &mut ft2::Ft) -> bool {
+    ft.glyph('汉').is_some() && ft.glyph('あ').is_some() && ft.glyph('A').is_some()
+}
+/// FNV-1a over "filename#face": the id travels with the font file rather than
+/// with the position it happened to sort into on this machine.
+fn stable_id(path: &str, face: i64) -> i32 {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let mut h: u32 = 0x811c_9dc5;
+    let key = format!("{}#{}", name, face);
+    for b in key.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    match (h & 0x7fff_ffff) as i32 {
+        0 => 1,
+        n => n,
+    }
+}
+
+/// How many faces of a file to try. A ttc holds one per script region and the
+/// Chinese one is rarely face 0.
+fn faces_in(path: &str) -> i64 {
+    let low = path.to_ascii_lowercase();
+    if !low.ends_with(".ttc") && !low.ends_with(".otc") {
+        return 1;
+    }
+    match ft2::Ft::open(path, 24, 0) {
+        Some(ft) => ft.num_faces().clamp(1, 8),
+        None => 1,
+    }
+}
+
+/// Where the platform keeps its fonts.
+fn font_search_dirs() -> Vec<String> {
+    let mut v = Vec::new();
+    if cfg!(target_os = "windows") {
+        v.push("C:/Windows/Fonts".to_string());
+    } else if cfg!(target_os = "macos") {
+        v.push("/System/Library/Fonts".to_string());
+        v.push("/System/Library/Fonts/Supplemental".to_string());
+        v.push("/Library/Fonts".to_string());
+    } else {
+        v.push("/usr/share/fonts".to_string());
+        v.push("/usr/local/share/fonts".to_string());
+        if let Ok(home) = std::env::var("HOME") {
+            v.push(format!("{}/.local/share/fonts", home));
+            v.push(format!("{}/.fonts", home));
+        }
+    }
+    v
+}
+
+fn collect_font_files(out: &mut Vec<String>, dir: &str, depth: usize) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_font_files(out, &p.to_string_lossy(), depth + 1);
+        } else {
+            let low = p.to_string_lossy().to_ascii_lowercase();
+            if low.ends_with(".ttf") || low.ends_with(".otf") || low.ends_with(".ttc") || low.ends_with(".otc") {
+                out.push(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+}
+
+fn font_files() -> Vec<String> {
+    let mut files = Vec::new();
+    for d in font_search_dirs() {
+        collect_font_files(&mut files, &d, 0);
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+/// Every font on this machine that can actually draw the script, one entry per
+/// family and style. Opening a thousand-odd files is slow, so the result is
+/// kept in data/cache/fonts.tsv between runs.
+/// Every font on this machine that can actually draw the script, one entry per
+/// family and style. Opening a thousand-odd files is slow, so the result is
+/// kept in data/cache/fonts.tsv between runs.
+///
+/// A collection is where this gets interesting: NotoSansCJK-Regular.ttc holds
+/// five script regions and face 0 is Japanese, which has plenty of kanji and
+/// would happily count as covered - and then draw Japanese glyph shapes for
+/// hanzi like 骨, 直 and 着. So the Simplified Chinese face is looked for by
+/// name, and only a file with no such face falls back to the first one that
+/// has coverage.
+fn scan_system_fonts() -> Vec<FontProfile> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for path in font_files() {
+        let mut fallback: Option<FontProfile> = None;
+        for face in 0..faces_in(&path) {
+            let Some(mut ft) = ft2::Ft::open(&path, 24, face) else { break };
+            if !script_ok(&mut ft) {
+                continue;
+            }
+            let family = ft.family().unwrap_or_default();
+            let style = ft.style().unwrap_or_default();
+            let name = if style.is_empty() || style == "Regular" {
+                family.clone()
+            } else {
+                format!("{} {}", family, style)
+            };
+            let prof = FontProfile {
+                id: stable_id(&path, face),
+                name,
+                path: Some(path.clone()),
+                face,
+                family: family.clone(),
+            };
+            // The Simplified Chinese face of a collection: Noto Sans CJK SC,
+            // SourceHanSansSC, PingFang SC - the families name their region.
+            let sc = family.ends_with(" SC") || family.ends_with(" Hans");
+            if sc {
+                if seen.insert(format!("{}|{}", family, style)) {
+                    out.push(prof);
+                }
+                fallback = None;
+                break;
+            }
+            if fallback.is_none() {
+                fallback = Some(prof);
+            }
+        }
+        if let Some(p) = fallback {
+            if seen.insert(format!("{}|{}", p.family, p.name)) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+fn font_cache_path() -> Option<std::path::PathBuf> {
+    Some(crate::data::Data::resolve()?.root.join("cache").join("fonts.tsv"))
+}
+
+/// The cached scan, if the font directories still hold the same file count.
+fn load_font_cache(count: usize) -> Option<Vec<FontProfile>> {
+    let path = font_cache_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut lines = text.lines();
+    let recorded: usize = lines.next()?.trim().strip_prefix("# files=")?.parse().ok()?;
+    if recorded != count {
+        return None;
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let path = f[2].to_string();
+        if !std::path::Path::new(&path).is_file() {
+            return None;
+        }
+        out.push(FontProfile {
+            id: f[0].parse().ok()?,
+            name: f[1].to_string(),
+            path: Some(path),
+            face: f[3].parse().unwrap_or(0),
+            family: f[4].to_string(),
+        });
+    }
+    Some(out)
+}
+
+fn save_font_cache(count: usize, list: &[FontProfile]) {
+    let Some(path) = font_cache_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut out = format!("# files={}\n", count);
+    for p in list {
+        if let Some(path) = p.path.as_ref() {
+            out.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", p.id, p.name, path, p.face, p.family));
+        }
+    }
+    let tmp = path.with_extension("tsv.tmp");
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+fn resolve_catalog() -> Vec<FontProfile> {
+    let files = font_files();
+    let discovered = match load_font_cache(files.len()) {
+        Some(v) => v,
+        None => {
+            let v = scan_system_fonts();
+            save_font_cache(files.len(), &v);
+            v
+        }
+    };
+    let mut def = FontProfile {
+        id: 0,
+        name: "默认".to_string(),
+        path: None,
+        face: SC_FACE,
+        family: String::new(),
+    };
+    for (path, face) in default_candidates() {
+        if let Some(mut ft) = ft2::Ft::open(&path, 24, face) {
+            if script_ok(&mut ft) {
+                def.family = ft.family().unwrap_or_default();
+                def.face = face;
+                def.path = Some(path);
+                break;
+            }
+        }
+    }
+    match def.path.as_ref() {
+        Some(path) => eprintln!("font: default -> {} (face {}) {}", path, def.face, def.family),
+        None => eprintln!(
+            "font: ERROR - nothing here can draw Chinese; install a CJK font or drop one in {}",
+            bundled_dirs().first().cloned().unwrap_or_else(|| "fonts".to_string())
+        ),
+    }
+    let mut out = Vec::with_capacity(discovered.len() + 1);
+    out.push(def);
+    let mut seen: HashSet<i32> = HashSet::new();
+    seen.insert(0);
+    for p in discovered {
+        if seen.insert(p.id) {
+            out.push(p);
+        }
+    }
+    eprintln!("font: {} fonts here can draw Chinese", out.len() - 1);
+    out
+}
+
+static CATALOG: std::sync::OnceLock<Vec<FontProfile>> = std::sync::OnceLock::new();
+
+/// The catalogue: the default entry first, then everything the machine has
+/// that can draw the script.
+pub fn font_catalog() -> &'static [FontProfile] {
+    CATALOG.get_or_init(resolve_catalog).as_slice()
+}
+
+pub fn font_profile(id: i32) -> Option<&'static FontProfile> {
+    font_catalog().iter().find(|p| p.id == id)
+}
+
+/// Position of an id in the catalogue, for the arrow keys.
+pub fn font_profile_index(id: i32) -> usize {
+    font_catalog().iter().position(|p| p.id == id).unwrap_or(0)
+}
+
+pub fn font_profile_count() -> i32 {
+    font_catalog().len() as i32
+}
+
+/// An id that names a font this machine still has; anything else (a stale
+/// config, a hand-edited value, an uninstalled font) falls back to the
+/// default rather than to a file that is not there.
+fn clamp_profile_id(id: i32) -> i32 {
+    match font_profile(id) {
+        Some(p) if p.path.is_some() => id,
+        _ => 0,
+    }
+}
+
+/// Step through the catalogue from id, skipping entries that are not loadable.
+/// Wraps around, so the arrows always land somewhere.
+pub fn cycle_profile_id(id: i32, dir: i32) -> i32 {
+    let cat = font_catalog();
+    if cat.is_empty() {
+        return 0;
+    }
+    let n = cat.len() as i32;
+    let mut i = font_profile_index(id) as i32;
+    for _ in 0..n {
+        i = (i + dir + n) % n;
+        if cat[i as usize].path.is_some() {
+            return cat[i as usize].id;
+        }
+    }
+    0
+}
+
+/// Point the three roles at the ids the player saved. Returns true when
+/// anything changed, which is when the cached instances have to go.
+pub fn set_role_ids(ids: [i32; 3]) -> bool {
+    let next = [clamp_profile_id(ids[0]), clamp_profile_id(ids[1]), clamp_profile_id(ids[2])];
+    let mut cur = ROLE_IDS.lock().unwrap_or_else(|e| e.into_inner());
+    if *cur == next {
+        return false;
+    }
+    *cur = next;
+    ROLE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+pub fn role_ids() -> [i32; 3] {
+    *ROLE_IDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The id a role is using, already clamped to something loadable.
+pub fn role_id(role: FontRole) -> i32 {
+    role_ids()[role.index()]
+}
+
+/// True when the role asked for a font this machine cannot provide and the
+/// default is standing in for it. The settings panel says so out loud instead
+/// of letting the player believe the choice took effect.
+pub fn role_fallback(role: FontRole) -> bool {
+    if std::env::var_os(role.env_var()).is_some() || std::env::var_os("WA2_FONT").is_some() {
+        return false;
+    }
+    match font_profile(role_id(role)) {
+        Some(p) => p.path.is_none(),
+        None => true,
+    }
+}
+
 /// What the player asked for. WA2_FONT / WA2_FONT_FACE / WA2_FONT_BOLD /
 /// WA2_FONT_GAMMA (or the legacy WA2_FONT_GAIN) / WA2_FONT_EDGE /
 /// WA2_FONT_EDGE_ALPHA / WA2_FONT_HINT are the stand-in for the font settings
-/// page, which will write the same values.
-pub fn font_choice() -> FontChoice {
-    let spec = std::env::var("WA2_FONT").unwrap_or_else(|_| DEFAULT_FONT.to_string());
-    let (path, spec_face) = split_font_spec(&spec);
-    let face = std::env::var("WA2_FONT_FACE")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .or(spec_face)
-        .unwrap_or(DEFAULT_FACE);
+/// page, which writes the same values per role.
+///
+/// A role's own WA2_FONT_* wins, then the global WA2_FONT, then the profile id
+/// from `wa2.ini`, then the default profile.
+pub fn font_choice_for(role: FontRole) -> FontChoice {
+    let spec = std::env::var(role.env_var())
+        .or_else(|_| std::env::var("WA2_FONT"))
+        .unwrap_or_default();
+    let (path, face) = if spec.is_empty() {
+        match font_profile(role_id(role)).and_then(|p| p.path.clone()) {
+            Some(p) => (p, font_profile(role_id(role)).map(|p| p.face).unwrap_or(DEFAULT_FACE)),
+            None => (DEFAULT_FONT.to_string(), DEFAULT_FACE),
+        }
+    } else {
+        let (path, spec_face) = split_font_spec(&spec);
+        let face = std::env::var("WA2_FONT_FACE")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .or(spec_face)
+            .unwrap_or(DEFAULT_FACE);
+        (path, face)
+    };
+    env_choice(path, face)
+}
+
+/// The knobs that shape the ink, shared by every role: they are environment
+/// only, because the settings page does not expose them yet.
+fn env_choice(path: String, face: i64) -> FontChoice {
     let bold = std::env::var("WA2_FONT_BOLD")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1045,34 +1654,69 @@ pub fn apply_choice(vf: &VectorFont, choice: &FontChoice) {
     vf.set_hint(choice.hint);
 }
 
-/// Run f with the engine's own font at size pixels.
+/// Open a font for one role, owned by the caller.
+///
+/// The runtime's dialogue font and the history screen hold theirs outright;
+/// the shared UI path goes through [`with_role_font`].
+pub fn open_role_font(role: FontRole, size: u32) -> Option<VectorFont> {
+    let choice = font_choice_for(role);
+    let vf = VectorFont::open_face(&choice.path, size.max(8), choice.face)?;
+    apply_choice(&vf, &choice);
+    // Which file and which face of it actually opened: a .ttc defaults to its
+    // first (Japanese) face, and the file name alone never says which one the
+    // role ended up with.
+    eprintln!(
+        "font role={} profile={} path={} family={} face={}",
+        role.tag(),
+        role_id(role),
+        choice.path,
+        vf.family(),
+        choice.face
+    );
+    Some(vf)
+}
+
+/// Open one catalogue entry by id, for the panel's preview line.
+pub fn open_profile_font(id: i32, size: u32) -> Option<VectorFont> {
+    let p = font_profile(id)?;
+    let path = p.path.as_ref()?;
+    let vf = VectorFont::open_face(path, size.max(8), p.face)?;
+    apply_choice(&vf, &env_choice(path.clone(), p.face));
+    Some(vf)
+}
+
+/// Run f with one role's font at size pixels.
 ///
 /// Screens that only need a caption or two borrow the font here instead of
-/// threading one through every UI function; the font is opened on first use
-/// from WA2_FONT (or the default Noto CJK face) and is shared by every call.
+/// threading one through every UI function. The instance is opened on first
+/// use - or re-opened after the player changed that role's font - and is then
+/// shared by every call for that role.
 /// None means FreeType or the font file is unavailable, and the caller has to
 /// do without the text.
-pub fn with_ui_font<R>(size: u32, f: impl FnOnce(&VectorFont) -> R) -> Option<R> {
-    UI.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            let choice = font_choice();
-            *slot = VectorFont::open_face(&choice.path, size.max(8), choice.face);
-            // The title menu, settings, save/load and timeline labels all come
-            // from this instance, which is separate from the dialogue font the
-            // runtime opens. Without a line here there is nothing in the log to
-            // tell which face those screens drew with.
-            if let Some(vf) = slot.as_ref() {
-                eprintln!("ui font: {}", vf.describe());
-            }
+pub fn with_role_font<R>(role: FontRole, size: u32, f: impl FnOnce(&VectorFont) -> R) -> Option<R> {
+    ROLE_FONTS.with(|cell| {
+        let gen = ROLE_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        let mut slots = cell.borrow_mut();
+        let slot = &mut slots[role.index()];
+        if slot.as_ref().map(|s| s.gen) != Some(gen) {
+            *slot = open_role_font(role, size.max(8)).map(|vf| RoleFont { gen, vf });
         }
-        let vf = slot.as_ref()?;
+        let vf = &slot.as_ref()?.vf;
         if !vf.set_size(size) {
             return None;
         }
-        apply_choice(vf, &font_choice());
+        apply_choice(vf, &font_choice_for(role));
         Some(f(vf))
     })
+}
+
+/// Run f with the menu font at size pixels.
+///
+/// Every screen that is not the dialogue or the history draws from the Home
+/// role, so the player's menu choice covers the title screen, the option
+/// screens, save/load, the timeline and the music mode in one go.
+pub fn with_ui_font<R>(size: u32, f: impl FnOnce(&VectorFont) -> R) -> Option<R> {
+    with_role_font(FontRole::Home, size, f)
 }
 
 /// The bitmap font carried a one-pixel edge at its ~26px dialog size; keep that
@@ -1174,8 +1818,59 @@ fn stamp_styled(surf: &mut Surface, t: &Tile, pen: i32, baseline: i32, style: &T
 
 #[cfg(test)]
 mod tests {
-    use super::{round_266, Label, TextStyle, VectorFont, DEFAULT_FONT, DEFAULT_GAMMA};
+    use super::{
+        font_catalog, role_ids, round_266, set_role_ids, with_role_font, FontRole, Label, TextStyle,
+        VectorFont, DEFAULT_FONT, DEFAULT_GAMMA,
+    };
     use crate::render::Surface;
+
+    /// The default entry is id 0, because 0 is what every old config file and
+    /// every out-of-range value resolves to. Ids are otherwise hashes of the
+    /// font file, so they are not dense - they just have to be unique.
+    #[test]
+    fn catalogue_ids_start_at_zero_and_are_unique() {
+        let cat = font_catalog();
+        assert_eq!(cat[0].id, 0);
+        let mut ids: Vec<i32> = cat.iter().map(|p| p.id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), cat.len(), "an id must name one font, not two");
+    }
+
+    /// An id this machine does not have - a hand-edited config, an
+    /// uninstalled font - falls back to the default instead of to a file that
+    /// is not there.
+    #[test]
+    fn unknown_profile_ids_fall_back_to_the_default() {
+        let Some(real) = font_catalog().iter().find(|p| p.id != 0 && p.path.is_some()) else {
+            return
+        };
+        set_role_ids([0, 0, 0]);
+        set_role_ids([real.id, 0, 0]);
+        assert_eq!(role_ids()[0], real.id, "a real id has to stick");
+        set_role_ids([i32::MAX, -3, 0]);
+        assert_eq!(role_ids(), [0, 0, 0], "out-of-range ids must not stick");
+        set_role_ids([0, 0, 0]);
+    }
+    /// The whole point of the role layer: pointing one role at another profile
+    /// leaves the others on the font they were opened with.
+    #[test]
+    fn roles_keep_their_own_font() {
+        set_role_ids([0, 0, 0]);
+        let Some(other) = font_catalog().iter().find(|p| p.id != 0 && p.path.is_some()) else {
+            return
+        };
+        let game_before = with_role_font(FontRole::Game, 20, |f| f.describe());
+        set_role_ids([other.id, 0, 0]);
+        let home = with_role_font(FontRole::Home, 20, |f| f.describe());
+        let game_after = with_role_font(FontRole::Game, 20, |f| f.describe());
+        set_role_ids([0, 0, 0]);
+        let (Some(home), Some(before), Some(after)) = (home, game_before, game_after) else {
+            return
+        };
+        assert_eq!(before, after, "the game font must not follow the home one");
+        assert_ne!(home, after, "the home font should follow its own id");
+    }
 
     /// Tracking has to move the glyphs, not just the measured width: every gap
     /// between two glyphs gets the extra pixels. A loop that adds the tracking

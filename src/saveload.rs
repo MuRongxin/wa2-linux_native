@@ -187,7 +187,7 @@ pub fn run(
         let mut activate: Option<usize> = None;
         match win.poll_input() {
             sdl2::Input::Quit => return None,
-            sdl2::Input::Back => return None,
+            sdl2::Input::Back | sdl2::Input::Left => return None,
             sdl2::Input::RightClick => return None,
             // 1 / 2 switch between saving and loading; the shipped banner only
             // carries the Japanese word for whichever mode was opened.

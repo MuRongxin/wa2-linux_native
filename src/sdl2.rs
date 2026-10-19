@@ -101,6 +101,9 @@ pub enum Input {
     /// Right arrow. The timeline uses it to step forward along the scenario
     /// graph; every other screen treats it as Advance.
     Right,
+    /// Left arrow. Screens that do not give it a meaning of their own treat
+    /// it as `Back`; the font settings panel uses it to step backwards.
+    Left,
     /// Menu navigation (arrow up / down).
     Up,
     Down,
@@ -369,7 +372,7 @@ impl Sdl {
                     match sc {
                         SDLK_ESCAPE | SDLK_q => out = Input::Quit,
                         SDLK_F11 => out = Input::Fullscreen,
-                        SDLK_LEFT => out = Input::Back,
+                        SDLK_LEFT => out = Input::Left,
                         SDLK_UP => out = Input::Up,
                         SDLK_PAGEUP => out = Input::Rewind,
                         SDLK_SPACE | SDLK_RETURN => out = Input::Advance,

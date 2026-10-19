@@ -1000,19 +1000,22 @@ pub fn draw_dialog_vector(
     wh: i32,
     limit: usize,
 ) {
-    let size = layout_px(DIALOG_FONT_720 as i32, wh).max(8) as u32;
-    // Only a resize changes this, and set_size drops the glyph cache, so it is
-    // worth the check: the name and the body share one size for that reason.
+    // The player sets the dialogue size; a change is as rare as a resize, and
+    // both drop the glyph cache, so the check is worth keeping.
+    let size = layout_px(text::dialog_font_size() as i32, wh).max(8) as u32;
     if vf.size() != size {
         let _ = vf.set_size(size);
     }
+    vf.set_edge_px(text::dialog_edge_px(size));
     // Round to nearest rather than truncate: a truncated baseline or line
     // pitch jitters by a pixel when the window is resized or moved between
     // monitors.
     let sx = |v: i32| (v * ww.max(1) + 640) / 1280;
     let sy = |v: i32| (v * wh.max(1) + 360) / 720;
     let name_style = text::TextStyle::for_role(text::TextRole::Name);
-    let body_style = text::TextStyle::for_role(text::TextRole::Body);
+    // The body takes the player's colour and rule; everything else about it
+    // is the style the artwork was tuned for.
+    let body_style = text::dialog_body_style();
     if let Some(name) = speaker {
         if !name.is_empty() {
             // The name sits on the window's rim, so it gets its own line box
@@ -1054,6 +1057,19 @@ pub fn draw_dialog_vector(
             vf.draw_char_styled(s, ch, pen_px, baseline, &body_style);
             pen += vf.advance_266(prev, ch);
             prev = Some(ch);
+        }
+        if body_style.underline {
+            // The rule follows the ink, not the box: a short last line gets a
+            // short rule, the way a text box would draw it.
+            let end = ((pen + 32) >> 6).min(x_max);
+            let thick = (size / 16).max(1);
+            let y = baseline + (size as i32 / 10).max(2);
+            s.fill_rect(x0, y, (end - x0).max(0) as u32, thick as u32, [
+                body_style.color[0],
+                body_style.color[1],
+                body_style.color[2],
+                220,
+            ]);
         }
         line_top += line_h;
     }
