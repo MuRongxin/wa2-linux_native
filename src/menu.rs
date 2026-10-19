@@ -75,29 +75,34 @@ const DEF_Y: i32 = 664;
 /// the three font rows.
 const FONT_BLOCK_H: i32 = 108;
 /// Where page 1's artwork is cut: everything above stays put, everything below
-/// moves down by [`FONT_BLOCK_H`]. This is the boundary between the
-/// 「文本显示速度」 row (its buttons end at page y = 117) and
-/// 「文本快进模式」 (y = 118), so the font rows sit *inside* the 文本设置
-/// group, directly under the text-speed row, instead of on a separate strip
-/// above the page.
-const FONT_SPLIT: i32 = 118;
+/// moves down by [`FONT_BLOCK_H`]. The three font rows are the last entries of
+/// the 文本设置 group, so the cut is after 「自动模式速度」 (its row ends at
+/// page y = 201) and just before the 视觉设置 group header (y = 204); the band
+/// therefore opens between the two groups instead of on a strip above the page.
+const FONT_SPLIT: i32 = 204;
 
 /// The three font rows, on the grid the rest of the page uses: the label
-/// column ends at 448 and the controls run from 458 to 966.
-const FROW_H: i32 = 30;
+/// column ends at 448 and the two control columns are the artwork's own
+/// 458..710 and 714..966 button slots. The row height and the plate are the
+/// 252x36 button the page uses for its two-column options, so the new controls
+/// read as part of the same UI instead of as custom flat plates.
+const FROW_H: i32 = 34;
 const FROW_PITCH: i32 = 36;
-const FROW_Y0: i32 = 4;
+const FROW_Y0: i32 = 1;
 const FROW_LABEL_X: i32 = 48;
 const FROW_LABEL_W: i32 = 400;
 const FROW_BOX_X: i32 = 458;
-const FROW_BOX_W: i32 = 300;
-/// The style button follows the font box with a small gap: it opens the
-/// second-level panel for the row it belongs to, so it reads as part of that
-/// row instead of as a separate control far to the right.
-const FROW_STYLE_X: i32 = FROW_BOX_X + FROW_BOX_W + 8;
-const FROW_STYLE_W: i32 = 120;
+const FROW_BOX_W: i32 = 252;
+const FROW_STYLE_X: i32 = 714;
+const FROW_STYLE_W: i32 = 252;
 /// The marker that says the box opens a list rather than stepping a value.
 const FROW_DOWN_W: i32 = 22;
+
+/// Source rectangle of the caption-free 252x36 button plate in the baked clean
+/// page: the 「全文」 two-column button on the 文本快进模式 row. The font rows
+/// copy it (and its cyan hover state) so their controls have the artwork's own
+/// bevel, border and interior instead of a hand-drawn flat plate.
+const PLATE_SRC: (i32, i32, u32, u32) = (458, 118, 252, 36);
 
 /// The list that opens under a font row.
 const LST_X: i32 = 458;
@@ -2536,9 +2541,11 @@ fn build_font_rows(st: &Settings, scr: &Screen, ww: i32, wh: i32) -> Option<Font
                 y: py(y),
                 w: px(FROW_STYLE_W),
                 h: py(FROW_H),
-                size: menu_px(15, wh),
+                // Same bright button ink as the page's own option labels; the
+                // style entry is a button, not a secondary note.
+                size: menu_px(17, wh),
                 center: true,
-                rgb: ink::SUB,
+                rgb: ink::BUTTON,
                 tracking: 0,
             });
         }
@@ -2622,15 +2629,48 @@ fn pick_role_font(st: &mut Settings, row: usize, id: i32) -> bool {
     *slot = next;
     true
 }
+/// Blit one of the page's own button plates (and optionally its cyan hover
+/// state) into the font band. Both sheets are page-sized, caption-free copies
+/// of the artwork, so the source rectangle is the artwork coordinate of a
+/// 252x36 two-column button.
+fn blit_font_plate(
+    frame: &mut Surface,
+    img: &TgaImage,
+    ww: i32,
+    wh: i32,
+    dx: i32,
+    dy: i32,
+    w: i32,
+    h: i32,
+) {
+    let px = |v: i32| (v * ww) / 1280;
+    let py = |v: i32| (v * wh) / 720;
+    frame.blit_region_scaled(
+        img,
+        PLATE_SRC.0,
+        PLATE_SRC.1,
+        PLATE_SRC.2,
+        PLATE_SRC.3,
+        px(dx),
+        py(dy),
+        px(w).max(1) as u32,
+        py(h).max(1) as u32,
+        255,
+    );
+}
+
 /// Draw the three font rows into the band above the artwork's own rows.
 ///
 /// `open` is the row whose list is currently on screen (F-19 m1): it was taken
 /// out of `Screen` because the request to open a list lives for exactly one
-/// frame, while the open state lives in the [`FontList`] itself.
+/// frame, while the open state lives in the [`FontList`] itself. `assets` is
+/// used for the page's own button plates; without a clean page (no baked
+/// cache) the rows fall back to the flat plates.
 fn paint_font_rows(
     frame: &mut Surface,
     ww: i32,
     wh: i32,
+    assets: Option<&Assets>,
     scr: &Screen,
     open: Option<usize>,
     rows: Option<&FontRows>,
@@ -2643,34 +2683,61 @@ fn paint_font_rows(
     let band = oy + py(FONT_SPLIT);
     let dim = [64, 96, 108, 255];
     let lit = [96, 196, 212, 255];
+    let plate_base = assets.and_then(|a| a.clean[0].as_ref());
+    let plate_hover = assets.and_then(|a| a.hover[0].as_ref());
+    let mut plate = |frame: &mut Surface, hovered: bool, dx: i32, y: i32, w: i32| {
+        if let Some(img) = plate_base {
+            blit_font_plate(frame, img, ww, wh, PAGE_X + dx, PAGE_Y + y, w, FROW_H);
+            if hovered {
+                if let Some(state) = plate_hover {
+                    blit_font_plate(frame, state, ww, wh, PAGE_X + dx, PAGE_Y + y, w, FROW_H);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    };
     for i in 0..3 {
         let y = font_row_y(i);
         let is_open = open == Some(i);
         let on = is_open || scr.font_sel == i || scr.font_hover == Some(i);
         // The box is the trigger: the marker on its right edge is drawn as a
         // chevron by the text layer, since a triangle would need its own plate.
-        flat_plate(
+        let drawn = plate(
             frame,
-            ox + px(FROW_BOX_X),
-            band + py(y),
-            px(FROW_BOX_W),
-            py(FROW_H),
             scr.font_hover == Some(i) || is_open,
-            on,
-            if is_open { lit } else if on { [72, 150, 172, 255] } else { dim },
+            FROW_BOX_X,
+            FONT_SPLIT + y,
+            FROW_BOX_W,
         );
-        if i == 0 {
-            let sh = scr.font_hover == Some(FONT_STYLE_ROW);
+        if !drawn {
             flat_plate(
                 frame,
-                ox + px(FROW_STYLE_X),
+                ox + px(FROW_BOX_X),
                 band + py(y),
-                px(FROW_STYLE_W),
+                px(FROW_BOX_W),
                 py(FROW_H),
-                sh,
-                false,
-                if sh { lit } else { dim },
+                scr.font_hover == Some(i) || is_open,
+                on,
+                if is_open { lit } else if on { [72, 150, 172, 255] } else { dim },
             );
+        }
+        if i == 0 {
+            let sh = scr.font_hover == Some(FONT_STYLE_ROW);
+            let drawn = plate(frame, sh, FROW_STYLE_X, FONT_SPLIT + y, FROW_STYLE_W);
+            if !drawn {
+                flat_plate(
+                    frame,
+                    ox + px(FROW_STYLE_X),
+                    band + py(y),
+                    px(FROW_STYLE_W),
+                    py(FROW_H),
+                    sh,
+                    false,
+                    if sh { lit } else { dim },
+                );
+            }
         }
     }
     if let Some(r) = rows {
@@ -3932,7 +3999,7 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                 if stale {
                     font_rows = build_font_rows(st, &scr, ww, wh);
                 }
-                paint_font_rows(&mut frame, ww, wh, &scr, open_row, font_rows.as_ref());
+                paint_font_rows(&mut frame, ww, wh, Some(&assets), &scr, open_row, font_rows.as_ref());
             }
             if let Some(l) = font_list.as_ref() {
                 let pw = (LST_W * ww) / 1280;
@@ -4355,16 +4422,23 @@ mod tests {
                 assert_eq!(page_y(page, hot.y), PAGE_Y + hot.y + want);
             }
         }
-        // The cut is between the text-speed buttons (72..=117) and the
-        // fast-forward row (118), so the three font rows belong to 文本设置.
-        assert!(FONT_SPLIT >= 117, "split cuts into the text-speed row");
-        assert!(FONT_SPLIT <= 118, "split leaves the text-speed row behind");
-        assert_eq!(FONT_SPLIT + FONT_BLOCK_H, 118 + FONT_BLOCK_H);
+        // The cut is after 自动模式速度 (its track ends at y = 192 and its
+        // scale labels at 201) and at the 视觉设置 header (y = 204), so the
+        // three font rows are the last entries of the 文本设置 group.
+        assert!(FONT_SPLIT >= 192, "split cuts into the auto-speed row");
+        assert!(FONT_SPLIT <= 204, "split leaves the 视觉设置 header behind");
         assert!(FONT_BLOCK_H >= 3 * FROW_PITCH, "the font block needs room for three rows");
-        // The split lands exactly on the 文本快进模式 buttons' top edge.
-        assert!(page_hots(0)
-            .iter()
-            .any(|h| matches!(h.act, Act::Opt("msg_cut_optin", _)) && h.y == FONT_SPLIT));
+        // The rows above the split keep the artwork's position; the group
+        // header below it moves down by the band.
+        let labs = page_labs(0);
+        let auto = labs.iter().find(|l| l.text == "自动模式速度").expect("auto-speed label");
+        assert_eq!(auto.y, PAGE_Y + 162, "the auto-speed row must not move");
+        let visual = labs.iter().find(|l| l.text == "视觉设置").expect("visual-settings head");
+        assert!(
+            visual.y >= PAGE_Y + FONT_SPLIT + FONT_BLOCK_H,
+            "视觉设置 has to move below the font band, got {}",
+            visual.y
+        );
         assert_eq!(page_shift(1), 0);
         assert_eq!(page_shift(2), 0);
         // The help line follows the lower artwork.
@@ -4659,19 +4733,26 @@ mod tests {
         }
     }
 
-    /// Page 1's widgets are drawn 108 px lower; the drag hit test has to use
-    /// the same position as the drawing and the click (F-15).
+    /// Page 1's lower artwork is drawn 108 px lower; the drag hit test has to
+    /// use the same position as the drawing and the click (F-15). The auto
+    /// speed row sits above the font band, so the shifted tracks are the
+    /// opacity ones below it.
     #[test]
     fn sliders_on_page_one_hit_where_they_are_drawn() {
         let x = PAGE_X + 531 + 10;
         assert_eq!(
             track_at(0, x, page_y(0, 156) + 10).map(|s| s.key),
             Some("auto_max"),
-            "the shifted track must be found"
+            "the auto-speed track is above the split and must not move"
+        );
+        assert_eq!(
+            track_at(0, x, page_y(0, 261) + 10).map(|s| s.key),
+            Some("win_alpha_novel"),
+            "the shifted opacity track must be found"
         );
         assert!(
-            track_at(0, x, PAGE_Y + 156 + 10).is_none(),
-            "the unshifted position is above the track"
+            track_at(0, x, PAGE_Y + 261 + 10).is_none(),
+            "the unshifted position is above the shifted track"
         );
         // Pages 2 and 3 do not move.
         assert_eq!(
@@ -4793,7 +4874,7 @@ mod tests {
         assert_ne!(before, after, "a fallback has to invalidate the font band");
         if let Some(rows) = rows {
             let mut frame = Surface::new(W, H, [0, 0, 0, 255]);
-            paint_font_rows(&mut frame, 1280, 720, &scr, None, Some(&rows));
+            paint_font_rows(&mut frame, 1280, 720, None, &scr, None, Some(&rows));
         }
     }
 
@@ -4813,7 +4894,7 @@ mod tests {
         };
         let mut frame = Surface::new(W, H, [0, 0, 0, 255]);
         let rows = build_font_rows(&st, &scr, 1280, 720);
-        paint_font_rows(&mut frame, 1280, 720, &scr, Some(0), rows.as_ref());
+        paint_font_rows(&mut frame, 1280, 720, None, &scr, Some(0), rows.as_ref());
         let l = FontList::new(0, 0);
         let mut previews = PreviewCache::new();
         let text = build_list_text(&l, 1280, 720, &mut previews);
@@ -4832,7 +4913,7 @@ mod tests {
         if let Some(rows) = build_font_rows(&st, &scr, 960, 540) {
             assert_eq!(rows.w as i32, (PAGE_W * 960) / 1280);
             let mut small_frame = Surface::new(960, 540, [0, 0, 0, 255]);
-            paint_font_rows(&mut small_frame, 960, 540, &scr, None, Some(&rows));
+            paint_font_rows(&mut small_frame, 960, 540, None, &scr, None, Some(&rows));
         }
     }
 
