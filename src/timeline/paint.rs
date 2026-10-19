@@ -13,7 +13,7 @@ use super::*;
 use crate::codec::tga::TgaImage;
 use crate::render::Surface;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Everything paint needs for one frame. The run loop owns the state; paint
 /// only reads it.
@@ -103,15 +103,17 @@ fn band_edge(chapter: &Chapter) -> [u8; 4] {
 
 // ------------------------------------------------------------------- text ---
 
-/// Rasterize short text once and reuse it. The cache is keyed by (size, text);
-/// the timeline has a fixed chapter table, so it stays small for a session.
+/// Rasterize short text once and reuse it. The cache is keyed by the font
+/// generation, the pixel size and the text: the timeline has a fixed chapter
+/// table, so it stays small for a session, and a font change made in the
+/// option screen reaches the chart the next time it is opened instead of
+/// after a restart.
 fn with_label<R>(text: &str, size: u32, f: impl FnOnce(&Label) -> R) -> Option<R> {
-    static CACHE: OnceLock<Mutex<HashMap<(u32, String), Option<Label>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(u64, u32, String), Option<Label>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (crate::render::text::role_generation(), size, text.to_string());
     let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = guard
-        .entry((size, text.to_string()))
-        .or_insert_with(|| preview::label(text, size));
+    let entry = guard.entry(key).or_insert_with(|| preview::label(text, size));
     entry.as_ref().map(f)
 }
 
@@ -120,21 +122,22 @@ fn label_dims(text: &str, size: u32) -> (i32, i32) {
 }
 
 /// Chapter short names for the header bar when the zoomed-out band is too
-/// narrow for the full title. Rasterized on first use, one per band.
-fn short_headers(chart: &Chart) -> &'static [Option<Label>] {
-    static SHORT: OnceLock<Vec<Option<Label>>> = OnceLock::new();
-    let list = SHORT.get_or_init(|| {
-        chart
+/// narrow for the full title. Rasterized on first use, one per band, and
+/// rebuilt when the font roles change. The guard is returned so the caller can
+/// read the labels without cloning their buffers.
+fn short_headers(chart: &Chart) -> MutexGuard<'static, (u64, Vec<Option<Label>>)> {
+    static SHORT: Mutex<(u64, Vec<Option<Label>>)> = Mutex::new((0, Vec::new()));
+    let generation = crate::render::text::role_generation();
+    let mut guard = SHORT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.0 != generation || guard.1.len() != chart.bands.len() {
+        guard.1 = chart
             .bands
             .iter()
             .map(|band| preview::label(band.chapter.short, 15))
-            .collect()
-    });
-    if list.len() == chart.bands.len() {
-        list.as_slice()
-    } else {
-        &[]
+            .collect();
+        guard.0 = generation;
     }
+    guard
 }
 
 #[derive(Clone, Copy)]
@@ -539,7 +542,7 @@ fn draw_top(s: &mut Surface, st: &PaintState) {
             continue;
         }
         let avail = x1.min(W - 2) - x - 4;
-        let short = shorts.get(idx).and_then(|header| header.as_ref());
+        let short = shorts.1.get(idx).and_then(|header| header.as_ref());
         let chosen: Option<&Label> = if avail >= title.w as i32 + 14 {
             Some(title)
         } else {

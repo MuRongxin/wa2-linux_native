@@ -78,8 +78,12 @@ pub struct CmdBar {
     labels: Option<TgaImage>,
     /// Skip column flipped left-to-right, three rows of 40×40.
     rewind: Option<TgaImage>,
-    /// Hover caption. The label sheet has no 快退 row.
-    rewind_label: Option<(u32, u32, Vec<u8>)>,
+    /// Hover caption. The label sheet has no 快退 row, so the vector font
+    /// draws it. It is rasterized on the first hover and rebuilt when the font
+    /// roles change: the bar lives for a whole game and the player can swap
+    /// the UI font in the option screen, so a one-shot bitmap would keep the
+    /// old face until a restart. The u64 is the role generation it came from.
+    rewind_label: std::cell::RefCell<(u64, Option<(u32, u32, Vec<u8>)>)>,
 }
 
 fn load_img(dirs: &[&Path], name: &str) -> Option<TgaImage> {
@@ -105,7 +109,9 @@ impl CmdBar {
             icons,
             labels: load_img(dirs, "sys_00012.tga"),
             rewind,
-            rewind_label: crate::render::text::with_ui_font(16, |f| f.line_rgba("快退", 16)).flatten(),
+            // Rasterized on demand: a game can run for hours without the
+            // player ever hovering 快退.
+            rewind_label: std::cell::RefCell::new((0, None)),
         }
     }
 
@@ -185,7 +191,14 @@ impl CmdBar {
         }
         if let Some(cmd) = hover {
             if cmd == Cmd::Rewind {
-                if let Some((w, h, rgba)) = self.rewind_label.as_ref() {
+                let mut cache = self.rewind_label.borrow_mut();
+                let generation = crate::render::text::role_generation();
+                if cache.0 != generation {
+                    cache.1 =
+                        crate::render::text::with_ui_font(16, |f| f.line_rgba("快退", 16)).flatten();
+                    cache.0 = generation;
+                }
+                if let Some((w, h, rgba)) = cache.1.as_ref() {
                     let b = BTNS.iter().find(|b| b.cmd == Cmd::Rewind).unwrap();
                     let x = cx(b.x + CELL - *w as i32);
                     let y = cy(ROW_Y - *h as i32 + 6);
@@ -478,5 +491,37 @@ mod integration {
         // Alpha 0 leaves the flat backdrop; alpha 255 composites the dark plate.
         let i = ((600 * 1280 + 700) * 4) as usize;
         assert!(full.pixels[i] < bare.pixels[i], "the plate should darken that pixel");
+    }
+
+    /// The 快退 caption is rasterized lazily and stamped with the font
+    /// generation. The bar outlives the option screen, so without the stamp a
+    /// UI-font change would keep the old face over the button for the rest of
+    /// the game.
+    #[test]
+    fn rewind_caption_is_cached_per_font_generation() {
+        let dirs = [
+            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let bar = CmdBar::load(&dirs);
+        if bar.icons.is_none() {
+            return;
+        }
+        assert!(bar.rewind_label.borrow().1.is_none(), "nothing rasterized before the first hover");
+        let mut surf = Surface::new(1280, 720, [8, 12, 24, 255]);
+        let active = Active { auto: false, skip: false, rewind: false, hide: false };
+        bar.draw(&mut surf, Some(Cmd::Rewind), active, 100, 1280, 720);
+        let cached = bar.rewind_label.borrow();
+        let Some((w, h, rgba)) = cached.1.as_ref() else {
+            // No vector font on this machine: there is nothing to cache.
+            return;
+        };
+        // A parallel test may change the roles between the draw and this
+        // line, so only the fact that a generation was stamped is asserted.
+        assert!(
+            cached.0 > 0 && cached.0 <= crate::render::text::role_generation(),
+            "the cache has to carry the font generation it was built from"
+        );
+        assert!(*w > 0 && *h > 0 && rgba.len() == (*w * *h * 4) as usize, "caption buffer {}x{}", w, h);
     }
 }

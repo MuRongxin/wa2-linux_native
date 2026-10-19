@@ -1002,11 +1002,22 @@ pub fn draw_dialog_vector(
 ) {
     // The player sets the dialogue size; a change is as rare as a resize, and
     // both drop the glyph cache, so the check is worth keeping.
-    let size = layout_px(text::dialog_font_size() as i32, wh).max(8) as u32;
+    let ds = text::dialog_style();
+    let size = layout_px(ds.size as i32, wh).max(8) as u32;
     if vf.size() != size {
         let _ = vf.set_size(size);
     }
     vf.set_edge_px(text::dialog_edge_px(size));
+    // §11's remaining knobs: outline opacity, synthetic weight, letter tracking
+    // and extra line pitch. The environment's global bold still applies on top
+    // of the panel's weight so both overrides keep working.
+    let want_bold = ds.weight.max(text::env_bold_px());
+    if vf.bold() != want_bold {
+        vf.set_bold(want_bold);
+    }
+    if vf.edge_alpha() != ds.edge_alpha.min(255) as u8 {
+        vf.set_edge_alpha(ds.edge_alpha.min(255) as u8);
+    }
     // Round to nearest rather than truncate: a truncated baseline or line
     // pitch jitters by a pixel when the window is resized or moved between
     // monitors.
@@ -1028,10 +1039,10 @@ pub fn draw_dialog_vector(
     let shown: String = body.chars().take(limit).collect();
     let x0 = sx(DIALOG_TEXT_X);
     let x_max = sx(DIALOG_TEXT_RIGHT);
-    let line_h = sy(DIALOG_LINE).max(1);
+    let line_h = sy(DIALOG_LINE + ds.line_gap).max(1);
     // Three line boxes fit the oval; the check is on the box top, so the
     // centred baseline of the third line still counts as inside it.
-    let y_limit = sy(DIALOG_TEXT_Y + DIALOG_LINE * 3);
+    let y_limit = sy(DIALOG_TEXT_Y) + line_h * 3;
     let mut line_top = sy(DIALOG_TEXT_Y);
     for line in shown.lines() {
         if line_top >= y_limit {
@@ -1044,7 +1055,16 @@ pub fn draw_dialog_vector(
         let mut pen = (x0 as i32) << 6;
         let x_max_266 = (x_max as i32) << 6;
         let mut prev: Option<char> = None;
+        let track_266 = (ds.tracking as i32) << 6;
+        let mut first = true;
         for ch in line.chars() {
+            // Tracking goes into the gap before each glyph after the first, so
+            // the first glyph stays on the left edge (the same rule the label
+            // rasterizer uses).
+            if !first {
+                pen += track_266;
+            }
+            first = false;
             // The script pre-wraps its lines; anything whose ink would cross
             // the right edge of the oval is dropped rather than reflowed. The
             // check looks at the glyph's ink, not at the advance the next pen
@@ -1153,6 +1173,180 @@ mod tests {
     use crate::render::text;
     use crate::render::{DIALOG_FONT_720, LAYOUT_H, LAYOUT_W};
 
+    /// `DialogStyle` is process-global, so every test that reads or writes it
+    /// takes this lock and puts the previous value back. Without it the
+    /// parallel suite lets one test's tracking/underline leak into another's
+    /// pixels, and a failing test leaves the style changed for the rest.
+    static STYLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct StyleGuard {
+        saved: text::DialogStyle,
+        // Held for the whole test: this is what serializes the style tests.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl StyleGuard {
+        fn new() -> StyleGuard {
+            let lock = STYLE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            StyleGuard { saved: text::dialog_style(), _lock: lock }
+        }
+
+        /// Apply a style for the lifetime of the guard.
+        fn set(&self, style: text::DialogStyle) {
+            let _ = text::set_dialog_style(style);
+        }
+    }
+
+    impl Drop for StyleGuard {
+        fn drop(&mut self) {
+            let _ = text::set_dialog_style(self.saved);
+        }
+    }
+
+    /// The shipped style with a knob or two moved.
+    fn style_with(f: impl FnOnce(&mut text::DialogStyle)) -> text::DialogStyle {
+        let mut style = text::DialogStyle::default_style();
+        f(&mut style);
+        style
+    }
+
+    /// Every pixel above the ink threshold, for a "more/less ink" check.
+    fn ink_pixels(s: &Surface) -> u32 {
+        (0..(s.width * s.height) as usize)
+            .filter(|i| s.pixels[i * 4] > 200)
+            .count() as u32
+    }
+
+    /// The underline is drawn under the ink of every body line, and only when
+    /// the player asked for it: it has to follow the line's own width, not the
+    /// box's.
+    #[test]
+    fn dialogue_underline_follows_the_line() {
+        let style = StyleGuard::new();
+        let Some(mut vf) = text::VectorFont::open(text::DEFAULT_FONT, 26) else { return };
+        let line = "abcde";
+        let mut with = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        let mut without = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        style.set(style_with(|s| s.underline = true));
+        draw_dialog_vector(&mut with, &mut vf, line, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        style.set(style_with(|s| s.underline = false));
+        draw_dialog_vector(&mut without, &mut vf, line, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+
+        // A row counts when a run of white pixels longer than any glyph row
+        // appears in one frame and not in the other.
+        let rows = |s: &Surface| -> Vec<i32> {
+            let mut out = Vec::new();
+            for y in 0..s.height as i32 {
+                let mut run = 0u32;
+                for x in 0..s.width as i32 {
+                    let i = ((y as u32 * s.width + x as u32) * 4) as usize;
+                    if s.pixels[i] > 200 && s.pixels[i + 1] > 200 && s.pixels[i + 2] > 200 {
+                        run += 1;
+                    } else {
+                        if run > 20 {
+                            out.push(y);
+                        }
+                        run = 0;
+                    }
+                }
+            }
+            out
+        };
+        let a = rows(&with);
+        let b = rows(&without);
+        let extra: Vec<i32> = a.iter().copied().filter(|y| !b.contains(y)).collect();
+        assert_eq!(extra.len(), 1, "exactly one line is added, got {:?}", extra);
+    }
+
+    /// §11 letter tracking: the gap after each glyph gets `tracking` pixels, so
+    /// the line ends further right while it still starts at the same edge.
+    #[test]
+    fn dialogue_tracking_widens_the_line() {
+        let style = StyleGuard::new();
+        let Some(mut vf) = text::VectorFont::open(text::DEFAULT_FONT, 26) else { return };
+        let line = "abcde";
+        style.set(style_with(|s| s.tracking = 0));
+        let mut tight = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        draw_dialog_vector(&mut tight, &mut vf, line, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        style.set(style_with(|s| s.tracking = 6));
+        let mut wide = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        draw_dialog_vector(&mut wide, &mut vf, line, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        let (Some(a), Some(b)) = (ink_box(&tight), ink_box(&wide)) else { panic!("nothing was drawn") };
+        assert_eq!(a.0, b.0, "the first glyph must stay on the left edge");
+        // Four gaps at 6px each; the last glyph's ink moves by that much.
+        assert!((b.2 - b.0) >= (a.2 - a.0) + 22, "width {} -> {}", a.2 - a.0 + 1, b.2 - b.0 + 1);
+    }
+
+    /// §11 line gap: the first line keeps its place and each following line is
+    /// pushed down by the extra pitch.
+    #[test]
+    fn dialogue_line_gap_pushes_the_lines_apart() {
+        let style = StyleGuard::new();
+        let Some(mut vf) = text::VectorFont::open(text::DEFAULT_FONT, 26) else { return };
+        let body = "abc\ndef";
+        style.set(style_with(|s| s.line_gap = 0));
+        let mut tight = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        draw_dialog_vector(&mut tight, &mut vf, body, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        style.set(style_with(|s| s.line_gap = 12));
+        let mut loose = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        draw_dialog_vector(&mut loose, &mut vf, body, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        let (Some(a), Some(b)) = (ink_box(&tight), ink_box(&loose)) else { panic!("nothing was drawn") };
+        // Each line box centres the baseline, so the first line drifts down by
+        // half the extra pitch; the second line gets the whole pitch on top of
+        // that, so the block grows by about the gap.
+        let drift = b.1 - a.1;
+        assert!((0..=7).contains(&drift), "the first line drifts by half the gap, got {drift}");
+        let grow = (b.3 - b.1) - (a.3 - a.1);
+        assert!((8..=16).contains(&grow), "the block should grow by about the extra pitch, got {grow}");
+    }
+
+    /// §11 synthetic weight: a heavier body covers more pixels than the face's
+    /// own weight. The global `WA2_FONT_BOLD` still wins over the panel's
+    /// value, so the two cases start from whatever the environment asks for.
+    #[test]
+    fn dialogue_weight_thickens_the_ink() {
+        let style = StyleGuard::new();
+        let env = text::env_bold_px();
+        if env >= text::DIALOG_WEIGHT_MAX {
+            return;
+        }
+        let Some(mut vf) = text::VectorFont::open(text::DEFAULT_FONT, 26) else { return };
+        let line = "冬馬和紗";
+        style.set(style_with(|s| s.weight = env));
+        let mut light = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        draw_dialog_vector(&mut light, &mut vf, line, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        style.set(style_with(|s| s.weight = env + 2));
+        let mut heavy = Surface::new(LAYOUT_W, LAYOUT_H, [0, 0, 0, 255]);
+        draw_dialog_vector(&mut heavy, &mut vf, line, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        let (a, b) = (ink_pixels(&light), ink_pixels(&heavy));
+        assert!(a > 0, "the light body left no ink");
+        assert!(b > a + a / 10, "ink {} -> {}", a, b);
+    }
+
+    /// §11 outline opacity: the outline is black, so it only shows on a
+    /// lighter backdrop. With opacity 0 the darkest pixel is the soft shadow
+    /// (110 alpha over the backdrop); a full-strength outline goes past that.
+    #[test]
+    fn dialogue_edge_alpha_controls_the_outline() {
+        let style = StyleGuard::new();
+        let Some(mut vf) = text::VectorFont::open(text::DEFAULT_FONT, 26) else { return };
+        let line = "abcde";
+        let backdrop = [80u8, 80, 80, 255];
+        let darkest = |s: &Surface| -> u8 {
+            (0..(s.width * s.height) as usize).map(|i| s.pixels[i * 4]).min().unwrap_or(255)
+        };
+        style.set(style_with(|s| s.edge_alpha = 0));
+        let mut bare = Surface::new(LAYOUT_W, LAYOUT_H, backdrop);
+        draw_dialog_vector(&mut bare, &mut vf, line, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        style.set(style_with(|s| s.edge_alpha = 255));
+        let mut edged = Surface::new(LAYOUT_W, LAYOUT_H, backdrop);
+        draw_dialog_vector(&mut edged, &mut vf, line, None, LAYOUT_W as i32, LAYOUT_H as i32, usize::MAX);
+        // The shadow floor for 110/255 over 80 is about 45.
+        assert!(darkest(&bare) > 35, "no outline should stay above the shadow floor, got {}", darkest(&bare));
+        assert!(darkest(&edged) < 20, "the outline should darken past the shadow, got {}", darkest(&edged));
+    }
+
+
     #[test]
     fn flash_peaks_at_white_and_returns() {
         let src = [10u8, 20, 30, 255];
@@ -1229,6 +1423,8 @@ mod tests {
     /// glyphs are rasterized 1.5x bigger, not stretched from 720p.
     #[test]
     fn dialog_text_follows_the_window_size() {
+        // Reads the global style too: serialized with the tests that change it.
+        let _style = StyleGuard::new();
         let Some(mut vf) = text::VectorFont::open(text::DEFAULT_FONT, DIALOG_FONT_720) else {
             return
         };

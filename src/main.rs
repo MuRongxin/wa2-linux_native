@@ -10,11 +10,25 @@ mod render;
 mod save;
 mod saveload;
 mod sdl2;
+mod sha256;
 mod timeline;
 mod video;
 mod vm;
 
 use std::path::Path;
+
+/// Chinese mode is only usable when some bundled or installed font can draw
+/// Chinese. The design requires the game to refuse to start instead of
+/// painting a screen of empty text; the headless CLIs stay available because
+/// they are the tools used to diagnose a missing font.
+fn require_chinese_font() {
+    if !render::text::chinese_font_available() {
+        eprintln!(
+            "缺少中文字体：未找到可显示中文的字体，请把 NotoSansCJK-Medium.ttc 放入 fonts/ 或安装系统 CJK 字体"
+        );
+        std::process::exit(1);
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -109,10 +123,17 @@ fn main() {
             let out = args[2].clone();
             let w: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1280);
             let h: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(720);
+            // The font ids and the dialogue style live in wa2.ini. Loading the
+            // settings here makes the sheet match what the game would draw,
+            // instead of only the WA2_FONT* environment.
+            let _ = menu::Settings::load();
             let choice = render::text::font_choice_for(render::text::FontRole::Game);
             let mut vf = match render::text::VectorFont::open_face(&choice.path, render::DIALOG_FONT_720, choice.face) {
                 Some(f) => f,
-                None => { eprintln!("font-sample: cannot open {} (face {})", choice.path, choice.face); return; }
+                None => {
+                    eprintln!("font-sample: cannot open {} (face {})", choice.path, choice.face);
+                    std::process::exit(1);
+                }
             };
             render::text::apply_choice(&vf, &choice);
             eprintln!("font: {}", vf.describe());
@@ -282,6 +303,9 @@ fn main() {
                 eprintln!("usage: wa2-native scene-noto <scenario.txt> <bg.tga> <out.tga>");
                 return;
             }
+            // Draw with the same Home role font the game uses: the ids and the
+            // style come from wa2.ini, not only from WA2_FONT*.
+            let _ = menu::Settings::load();
             let scen = match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); return; } };
             let page = vm::parse_scenario_text(&scen);
             let bg = match std::fs::read(&args[3]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
@@ -297,6 +321,9 @@ fn main() {
                 eprintln!("usage: wa2-native play-noto <scenario.txt> <bg.tga> [bgm.ogg]");
                 return;
             }
+            // Same settings the game loads: the Home role font and the style
+            // come from wa2.ini as well as from WA2_FONT*.
+            let _ = menu::Settings::load();
             let scen = match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); return; } };
             let page = vm::parse_scenario_text(&scen);
             let bg = match std::fs::read(&args[3]).ok().and_then(|d| codec::tga::decode(&d).ok()) {
@@ -458,10 +485,14 @@ fn main() {
                     d.describe(), start_id
                 );
                 let session = Session::from_data(&d, None);
+                if session.cn {
+                    require_chinese_font();
+                }
                 let mut rt = Runtime::new(&win, &session);
                 if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
                     eprintln!("run error: {}", e);
                 }
+                render::text::log_missing_glyph_stats();
                 return;
             }
             // Legacy explicit-path mode (kept for debugging single scenes).
@@ -491,6 +522,7 @@ fn main() {
             if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
                 eprintln!("run error: {}", e);
             }
+            render::text::log_missing_glyph_stats();
         }
         "title" => {
             // wa2-native title [start_id]                                (data tree)
@@ -529,6 +561,9 @@ fn main() {
                 eprintln!("wa2-native title: data={}", d.describe());
                 (font, session, start_id, bg_dir)
             };
+            if session.cn {
+                require_chinese_font();
+            }
             let mut rt = Runtime::new(&win, &session);
             match run_title(&mut win, &font, &session.bg_dirs(), &session.script_dir, !session.bg_cn_trees.is_empty()) {
                 TitleAction::Start => {
@@ -551,6 +586,10 @@ fn main() {
                 }
                 TitleAction::Quit => eprintln!("title: quit"),
             }
+            // Aggregate of characters no font could draw, if any: one line for
+            // the whole session instead of the per-character warning. Only the
+            // GUI entries do this - a headless CLI is often a diagnostic tool.
+            render::text::log_missing_glyph_stats();
         }
         "lscr-trace" => {
             // wa2-native lscr-trace <script_dir> <start_id> [choice_seq] [max_events]
@@ -1523,6 +1562,11 @@ mod sprite_bank_tests {
 pub struct Runtime {
     /// Vector font for Chinese dialogue (None in Japanese mode).
     vfont: Option<render::text::VectorFont>,
+    /// Profile id the dialogue font was opened from. The title screen can
+    /// change the Game role while this Runtime is already alive, so the first
+    /// scene of a game started from the title has to notice the mismatch and
+    /// rebuild the instance (F-01).
+    game_font_id: i32,
     bar: cmdbar::CmdBar,
     msg_plate: Option<codec::tga::TgaImage>,
     msg_frame: Option<codec::tga::TgaImage>,
@@ -1538,6 +1582,10 @@ impl Runtime {
         // in force first - a run started straight from the command line
         // reaches this point without ever loading the settings.
         menu::Settings::load().apply_text();
+        // Which id this instance belongs to: run_game_at compares it with the
+        // id in force when a game starts, so a font picked on the title screen
+        // reaches the first line instead of the second run.
+        let game_font_id = render::text::role_id(render::text::FontRole::Game);
         let vfont = if s.cn {
             render::text::open_role_font(render::text::FontRole::Game, render::DIALOG_FONT_720)
         } else {
@@ -1589,7 +1637,7 @@ impl Runtime {
         if bank.is_none() {
             eprintln!("note: no sprite directory - character sprites disabled");
         }
-        Runtime { vfont, bar, msg_plate, msg_frame, voices, mixer, bank }
+        Runtime { vfont, game_font_id, bar, msg_plate, msg_frame, voices, mixer, bank }
     }
 }
 
@@ -1632,6 +1680,13 @@ pub fn run_game_from(
         }
     }
 }
+/// Whether the Runtime's dialogue font has to be rebuilt because the Game
+/// role now points at a different profile (F-01). Japanese mode has no vector
+/// dialogue font, so it never rebuilds.
+fn game_font_is_stale(cn: bool, open_id: i32, want_id: i32) -> bool {
+    cn && open_id != want_id
+}
+
 fn run_game_at(
     win: &mut sdl2::Sdl,
     font: &render::Font,
@@ -1648,10 +1703,10 @@ fn run_game_at(
     // The art is laid out at 1280x720 and stretched to the window; the
     // dialogue is rasterized at the window's own size so it stays sharp.
     let mut win_size = win.window_size();
-    // The vector font, the command bar, the message-window sheets, the voice
-    // index, the mixer and the sprite bank all live in the Runtime, so a
-    // quick load replaces the scene state instead of the whole engine.
-    let vfont = &mut rt.vfont;
+    // The command bar, the message-window sheets, the voice index, the mixer
+    // and the sprite bank all live in the Runtime, so a quick load replaces
+    // the scene state instead of the whole engine. The dialogue font is
+    // borrowed after the settings below are applied (it may need replacing).
     let bar = &rt.bar;
     let msg_plate = &rt.msg_plate;
     let msg_frame = &rt.msg_frame;
@@ -1696,6 +1751,24 @@ fn run_game_at(
     win.set_fullscreen(settings.win_disp == 1);
     set_render_art_scale(win);
     menu::apply(&settings, mixer.as_ref());
+    // F-01: the title screen may have changed the dialogue font while this
+    // Runtime - and the Game instance it opened at startup - was already
+    // alive. A run started from the title (new game, timeline jump or a save
+    // slot) reaches this point with the new id, so rebuild before the first
+    // line. The in-game option screen refreshes the instance directly; this
+    // comparison covers the path from the title, where nothing else can.
+    let game_font_id = render::text::role_id(render::text::FontRole::Game);
+    if game_font_is_stale(s.cn, rt.game_font_id, game_font_id) {
+        rt.game_font_id = game_font_id;
+        rt.vfont =
+            render::text::open_role_font(render::text::FontRole::Game, render::DIALOG_FONT_720);
+        if let Some(vf) = rt.vfont.as_ref() {
+            eprintln!("font: {}", vf.describe());
+        }
+    }
+    // Borrowed after the rebuild: the instance is replaced above, not while
+    // this reference is alive.
+    let vfont = &mut rt.vfont;
 
     let mut bgm_track: Option<(i32, usize)> = None;
     let mut fading_bgm: Option<usize> = None;
@@ -1736,6 +1809,9 @@ fn run_game_at(
     // no body. Each tick paints a longer prefix onto a copy of it.
     let mut line_base: Option<render::Surface> = None;
     let mut line_done = true;
+    // Set after the option screen closes: the line on screen still holds
+    // glyphs of the old font/style, so the wait loop has to repaint it.
+    let mut line_redraw = false;
     let mut reveal: usize = 0;
     let mut type_tick: u32 = 0;
     // Only these three are extra bookkeeping for save/load. The dialog box is
@@ -2472,7 +2548,7 @@ fn run_game_at(
                     // the mouse moves, so the scene (and that line) is composited
                     // once and the rows + highlight are redrawn on a copy.
                     let look_alpha = scene_look(&settings, bg_cg).alpha;
-                    let base = draw_scene(
+                    let mut base = draw_scene(
                         &bg,
                         &last_text,
                         last_speaker.as_deref(),
@@ -2705,28 +2781,55 @@ fn run_game_at(
                                                         vfont.as_mut(),
                                                     );
                                                 }
-                                                other => match handle_cmd(
-                                                    other,
-                                                    win,
-                                                    font,
-                                                    vfont.as_mut(),
-                                                    s,
-                                                    &mut settings,
-                                                    mixer.as_ref(),
-                                                    &it,
-                                                    &current_id,
-                                                    bg_id,
-                                                    &tint_name,
-                                                    &slots,
-                                                    focus,
-                                                    &last_text,
-                                                    bgm_track.map(|(id, _)| id),
-                                                    &cur_surf,
-                                                    &backlog,
-                                                ) {
-                                                    CmdOutcome::Loaded(st) => return Ok(Some(st)),
-                                                    CmdOutcome::Quit => return Ok(None),
-                                                    CmdOutcome::Stay => {}
+                                                other => {
+                                                    let is_config = other == cmdbar::Cmd::Config;
+                                                    match handle_cmd(
+                                                        other,
+                                                        win,
+                                                        font,
+                                                        vfont.as_mut(),
+                                                        s,
+                                                        &mut settings,
+                                                        mixer.as_ref(),
+                                                        &it,
+                                                        &current_id,
+                                                        bg_id,
+                                                        &tint_name,
+                                                        &slots,
+                                                        focus,
+                                                        &last_text,
+                                                        bgm_track.map(|(id, _)| id),
+                                                        &cur_surf,
+                                                        &backlog,
+                                                    ) {
+                                                        CmdOutcome::Loaded(st) => return Ok(Some(st)),
+                                                        CmdOutcome::Quit => return Ok(None),
+                                                        CmdOutcome::Stay => {
+                                                            // F-17: the line under
+                                                            // the choice rows still
+                                                            // has the old font/style.
+                                                            if is_config {
+                                                                base = draw_scene(
+                                                                    &bg,
+                                                                    &last_text,
+                                                                    last_speaker.as_deref(),
+                                                                    font,
+                                                                    &slots,
+                                                                    focus,
+                                                                    win_size.0 as u32,
+                                                                    win_size.1 as u32,
+                                                                    tint.as_deref(),
+                                                                    window,
+                                                                    msg_plate.as_ref(),
+                                                                    msg_frame.as_ref(),
+                                                                    &plates,
+                                                                    scene_look(&settings, bg_cg),
+                                                                    vfont.as_mut(),
+                                                                );
+                                                                cur_surf = clone_surf(&base);
+                                                            }
+                                                        }
+                                                    }
                                                 },
                                             }
                                         } else {
@@ -2809,6 +2912,34 @@ fn run_game_at(
                     let mut cmd_hover: Option<cmdbar::Cmd> = None;
                     let mut dwell: u32 = 0;
                     'wait: loop {
+                            // F-17: the option screen may have changed the
+                            // font or the dialogue style. Repaint the line that
+                            // is already on screen instead of leaving the old
+                            // glyphs there until the next line. `last_text` is
+                            // untouched - this redraws the same line.
+                            if line_redraw {
+                                line_redraw = false;
+                                win_size = win.window_size();
+                                line_base = None;
+                                line_done = true;
+                                cur_surf = draw_scene(
+                                    &bg,
+                                    &last_text,
+                                    last_speaker.as_deref(),
+                                    font,
+                                    &slots,
+                                    focus,
+                                    win_size.0 as u32,
+                                    win_size.1 as u32,
+                                    tint.as_deref(),
+                                    window,
+                                    msg_plate.as_ref(),
+                                    msg_frame.as_ref(),
+                                    &plates,
+                                    scene_look(&settings, bg_cg),
+                                    vfont.as_mut(),
+                                );
+                            }
                             if cmd_rewind || rewind_left > 0 {
                                 let announce = !cmd_rewind && rewind_left <= 1;
                                 let cruising = cmd_rewind || rewind_left > 1;
@@ -3020,6 +3151,9 @@ fn run_game_at(
                                             // trip back to the title screen.
                                             win.set_fullscreen(settings.win_disp == 1);
                                             set_render_art_scale(win);
+                                            // F-17: repaint the current line with
+                                            // the font/style that is now in force.
+                                            line_redraw = true;
                                         }
                                         2 => {
                                             let st = make_save(
@@ -3102,29 +3236,39 @@ fn run_game_at(
                                                     vfont.as_mut(),
                                                 );
                                             }
-                                            other => match handle_cmd(
-                                                other,
-                                                win,
-                                                font,
-                                                vfont.as_mut(),
-                                                s,
-                                                &mut settings,
-                                                mixer.as_ref(),
-                                                &it,
-                                                &current_id,
-                                                bg_id,
-                                                &tint_name,
-                                                &slots,
-                                                focus,
-                                                &last_text,
-                                                bgm_track.map(|(id, _)| id),
-                                                &cur_surf,
-                                                &backlog,
-                                            ) {
-                                                CmdOutcome::Loaded(st) => return Ok(Some(st)),
-                                                CmdOutcome::Quit => return Ok(None),
-                                                CmdOutcome::Stay => {}
-                                            },
+                                            other => {
+                                                let is_config = other == cmdbar::Cmd::Config;
+                                                match handle_cmd(
+                                                    other,
+                                                    win,
+                                                    font,
+                                                    vfont.as_mut(),
+                                                    s,
+                                                    &mut settings,
+                                                    mixer.as_ref(),
+                                                    &it,
+                                                    &current_id,
+                                                    bg_id,
+                                                    &tint_name,
+                                                    &slots,
+                                                    focus,
+                                                    &last_text,
+                                                    bgm_track.map(|(id, _)| id),
+                                                    &cur_surf,
+                                                    &backlog,
+                                                ) {
+                                                    CmdOutcome::Loaded(st) => return Ok(Some(st)),
+                                                    CmdOutcome::Quit => return Ok(None),
+                                                    CmdOutcome::Stay => {
+                                                        // F-17: the option screen
+                                                        // may have changed the
+                                                        // font or the style.
+                                                        if is_config {
+                                                            line_redraw = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         },
                                         Some(c) => cmd_hover = Some(c),
                                         None => {
@@ -5465,8 +5609,13 @@ fn run_special(
     };
     let head_text = if cn { "特别内容" } else { "スペシャル" };
     let mut label_px = 0u32;
+    // Font generation the menu/heading bitmaps were rasterized with; the page
+    // stays open across a settings visit, so a UI font change has to reach it
+    // on the next frame (F-03).
+    let mut label_gen = 0u64;
     let mut labels = Vec::new();
     let mut head_px = 0u32;
+    let mut head_gen = 0u64;
     let mut head: Option<(u32, u32, Vec<u8>)> = None;
     let mut fitted: Option<FittedMenu> = None;
 
@@ -5537,13 +5686,16 @@ fn run_special(
 
         // T0100 draws each label about 29px tall inside the 40px row.
         let ipx = layout_font_px(32, wh);
-        if ipx != label_px {
+        let generation = render::text::role_generation();
+        if ipx != label_px || generation != label_gen {
             label_px = ipx;
+            label_gen = generation;
             labels = menu_labels(&items, ipx);
         }
         let hpx = layout_font_px(16, wh);
-        if hpx != head_px {
+        if hpx != head_px || generation != head_gen {
             head_px = hpx;
+            head_gen = generation;
             head = render::text::with_ui_font(hpx, |f| f.line_rgba(head_text, hpx)).flatten();
         }
 
@@ -5963,8 +6115,13 @@ fn run_title(
     };
     let notice_text = if cn { "此功能尚未实现" } else { "ただいま準備中です" };
     let mut label_px = 0u32;
+    // Font generation the label/notice bitmaps were rasterized with. A UI font
+    // change on the option screen must reach this page at once, not after a
+    // restart or a window resize (F-03).
+    let mut label_gen = 0u64;
     let mut labels = Vec::new();
     let mut note_px = 0u32;
+    let mut note_gen = 0u64;
     let mut note_img: Option<(u32, u32, Vec<u8>)> = None;
     let mut fitted: Option<FittedMenu> = None;
 
@@ -6082,15 +6239,18 @@ fn run_title(
         // ---- compose --------------------------------------------------------
         // T0100 draws each label about 29px tall inside the 40px row.
         let ipx = layout_font_px(32, wh);
-        if ipx != label_px {
+        let generation = render::text::role_generation();
+        if ipx != label_px || generation != label_gen {
             label_px = ipx;
+            label_gen = generation;
             labels = menu_labels(&items, ipx);
         }
         if let Some(n) = notice {
             if cn {
                 let px = layout_font_px(26, wh);
-                if px != note_px {
+                if px != note_px || generation != note_gen {
                     note_px = px;
+                    note_gen = generation;
                     note_img =
                         render::text::with_ui_font(px, |f| f.line_rgba(n, px)).flatten();
                 }
@@ -6691,5 +6851,21 @@ mod choice_ui_tests {
         assert_eq!(rows[0].height, 108);
         assert_eq!(rows[0].top, 236);
         assert_eq!(rows[1].top, 443);
+    }
+}
+
+#[cfg(test)]
+mod font_sync_tests {
+    use super::game_font_is_stale;
+
+    /// A run started from the title has to rebuild the Game instance exactly
+    /// when the profile id moved; Japanese mode (no vector dialogue font)
+    /// never does.
+    #[test]
+    fn game_font_rebuild_is_keyed_on_the_profile_id() {
+        assert!(game_font_is_stale(true, 0, 1234));
+        assert!(game_font_is_stale(true, 1234, 0));
+        assert!(!game_font_is_stale(true, 1234, 1234));
+        assert!(!game_font_is_stale(false, 0, 1234));
     }
 }

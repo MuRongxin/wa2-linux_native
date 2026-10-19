@@ -47,6 +47,16 @@ const RTLD_NOW: c_int = 2;
 
 /// FT_LOAD_RENDER: load the glyph and render it into the slot's bitmap.
 const FT_LOAD_RENDER: c_int = 0x0000_0004;
+/// FT_LOAD_NO_BITMAP: ignore embedded bitmap strikes and render the outline.
+///
+/// Several CJK faces (the arphic uming/ukai families, for one) ship monochrome
+/// strikes at some sizes. FreeType would answer with a 1-bit bitmap there,
+/// which this module's coverage pipeline cannot use - `Ft::open` would report
+/// the face as unusable and `glyph` would report the character as missing, so a
+/// whole size band would drop out (or fall into the per-glyph fallback with a
+/// different face). The outline rasterizer is the one path this engine measures
+/// and draws with, so the flag is on everywhere.
+const FT_LOAD_NO_BITMAP: c_int = 0x0000_0008;
 /// FT_LOAD_TARGET_LIGHT: hint horizontally only, and lightly. The baseline
 /// for CJK dialog text: MONO would quantize the strokes, LCD sub-pixel
 /// rendering would leave coloured fringes once the frame is scaled and
@@ -200,7 +210,13 @@ impl Ft {
                 let _ = (fns.done_library)(library);
                 return None;
             }
-            let mut ft = Ft { library, face, size: 0, load_flags: FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT, fns };
+            let mut ft = Ft {
+                library,
+                face,
+                size: 0,
+                load_flags: FT_LOAD_RENDER | FT_LOAD_NO_BITMAP | FT_LOAD_TARGET_LIGHT,
+                fns,
+            };
             // A .ttc can open on a non-Unicode charmap; pick it explicitly.
             let _ = (ft.fns.select_charmap)(face, FT_ENCODING_UNICODE);
             if ft.set_size(size).is_none() || !ft.offsets_line_up() {
@@ -486,5 +502,26 @@ mod tests {
         assert!(k.abs() <= 4 * 64, "AV kerning {k}");
         let cjk = ft.kerning_266('一', '丁');
         assert_eq!(cjk, 0, "CJK pair kerned {cjk}");
+    }
+
+    /// Some CJK faces carry monochrome bitmap strikes (the arphic uming/ukai
+    /// families do, from 16px up). Loading a strike would hand back a pixel
+    /// mode this module cannot use - and an earlier build even failed to open
+    /// the face at that size - so the outline is rendered instead, at every
+    /// size a window scale can ask for.
+    #[test]
+    fn embedded_bitmap_strikes_do_not_break_a_size() {
+        const UMING: &str = "/usr/share/fonts/truetype/arphic/uming.ttc";
+        if !std::path::Path::new(UMING).is_file() {
+            return;
+        }
+        for size in [9u32, 12, 15, 16, 17, 20, 24, 26, 40] {
+            let Some(mut ft) = Ft::open(UMING, size, 0) else {
+                panic!("uming.ttc does not open at {}px", size);
+            };
+            let Some(g) = ft.glyph('A') else { panic!("no A at {}px", size) };
+            assert!(g.w > 0 && g.h > 0, "A has no coverage at {}px", size);
+            assert!(g.mask.iter().any(|&v| v > 0), "A is blank at {}px", size);
+        }
     }
 }

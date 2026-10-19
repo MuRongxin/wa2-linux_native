@@ -69,14 +69,18 @@ const DEF_H: i32 = 24;
 const DEF_X: i32 = W as i32 - 128 - DEF_W;
 const DEF_Y: i32 = 664;
 
-/// Height of the font block at the top of page 1. The page artwork is a black
-/// plate with no visible frame, so the rows the artwork laid out can simply be
-/// blitted this much lower and the gap filled with the font rows.
+/// Height of the font block inside page 1's 「文本设置」 group. The page
+/// artwork is a black plate with no visible frame, so the rows the artwork laid
+/// out below the split are blitted this much lower and the gap is filled with
+/// the three font rows.
 const FONT_BLOCK_H: i32 = 108;
-/// Where the artwork is cut: everything above stays put, everything below
-/// moves down by [`FONT_BLOCK_H`]. Zero because the strip the artwork puts at
-/// the top of the page is a divider, and the font rows own the top now.
-const FONT_SPLIT: i32 = 0;
+/// Where page 1's artwork is cut: everything above stays put, everything below
+/// moves down by [`FONT_BLOCK_H`]. This is the boundary between the
+/// 「文本显示速度」 row (its buttons end at page y = 117) and
+/// 「文本快进模式」 (y = 118), so the font rows sit *inside* the 文本设置
+/// group, directly under the text-speed row, instead of on a separate strip
+/// above the page.
+const FONT_SPLIT: i32 = 118;
 
 /// The three font rows, on the grid the rest of the page uses: the label
 /// column ends at 448 and the controls run from 458 to 966.
@@ -87,15 +91,75 @@ const FROW_LABEL_X: i32 = 48;
 const FROW_LABEL_W: i32 = 400;
 const FROW_BOX_X: i32 = 458;
 const FROW_BOX_W: i32 = 300;
-const FROW_ARROW_L: i32 = 766;
-const FROW_ARROW_R: i32 = 802;
-const FROW_ARROW_W: i32 = 30;
-const FROW_STYLE_X: i32 = 846;
+/// The style button follows the font box with a small gap: it opens the
+/// second-level panel for the row it belongs to, so it reads as part of that
+/// row instead of as a separate control far to the right.
+const FROW_STYLE_X: i32 = FROW_BOX_X + FROW_BOX_W + 8;
 const FROW_STYLE_W: i32 = 120;
+/// The marker that says the box opens a list rather than stepping a value.
+const FROW_DOWN_W: i32 = 22;
+
+/// The list that opens under a font row.
+const LST_X: i32 = 458;
+const LST_W: i32 = 470;
+/// Eleven rows keeps the panel inside the page even when it opens under the
+/// last one.
+const LST_ROW_H: i32 = 30;
+const LST_ROWS: usize = 11;
+const LST_HEAD: i32 = 26;
+/// Footer strip: the font-only「恢复默认」 lives there, so the list owns the
+/// operation that resets exactly the three fonts and nothing else.
+const LST_FOOT: i32 = 22;
+const LST_PAD: i32 = 8;
+const LST_BAR_W: i32 = 10;
+/// Name column, in list-local pixels from the left edge. The marker that says
+/// which row is current sits at [`LST_TAG_X`], so the name has to be measured
+/// and clipped to end before it.
+const LST_NAME_W: i32 = 200;
+const LST_TAG_X: i32 = 214;
+/// Where the per-font sample starts, and how much room the scrollbar leaves it:
+/// `LST_W - LST_BAR_W - LST_PAD - LST_PREVIEW_X` = 184 px, about 12 px of CJK
+/// text. The sample is previewed at the largest size that fits that column, so
+/// Chinese, kana and Latin are all on screen even for the widest face.
+const LST_PREVIEW_X: i32 = 268;
+const LST_PREVIEW_W: i32 = LST_W - LST_BAR_W - LST_PAD - LST_PREVIEW_X;
+/// Hover/hit index of the footer entry; catalogue indices are smaller than
+/// this and the scrollbar uses [`usize::MAX`].
+const LST_RESET: usize = usize::MAX - 1;
+
+/// Height of the drop list itself.
+fn lst_h() -> i32 {
+    LST_HEAD + LST_ROWS as i32 * LST_ROW_H + LST_FOOT + LST_PAD
+}
+
+/// Page y of font row i's row box. The rows are laid out in the band's own
+/// coordinates (`font_row_y`); this maps them onto the page.
+fn font_band_row_y(i: usize) -> i32 {
+    FONT_SPLIT + font_row_y(i)
+}
+
+/// Where the list sits on the page, below the row that opened it. It is modal,
+/// so when there is not enough room under the row it is clamped to the page
+/// rather than covering the tab strip above it.
+fn lst_y(row: usize) -> i32 {
+    let want = font_band_row_y(row) + FROW_H + 2;
+    want.min((PAGE_H - 4 - lst_h()).max(0)).max(0)
+}
+
+/// How much lower a page-1 row sits than the artwork does. Rows above the
+/// split keep the artwork's own position; everything below it moves down by
+/// the font block. Pages 2 and 3 never move.
+fn insert_shift(page: usize, y: i32) -> i32 {
+    if page == 0 && FONT_BLOCK_H != 0 && y >= FONT_SPLIT {
+        FONT_BLOCK_H
+    } else {
+        0
+    }
+}
 
 /// Screen y of a widget that the artwork placed at page y.
 fn page_y(page: usize, y: i32) -> i32 {
-    PAGE_Y + y + page_shift(page)
+    PAGE_Y + y + insert_shift(page, y)
 }
 
 /// The help line follows the page down, or it would sit in the middle of it.
@@ -181,6 +245,16 @@ pub struct Settings {
     pub dlg_edge: i32,
     pub dlg_color: i32,
     pub dlg_under: i32,
+    /// Outline coverage 0..=255 and synthetic stroke weight 0..=4: the rest of
+    /// design §11's knobs, which used to be environment variables only.
+    pub dlg_edge_alpha: i32,
+    pub dlg_weight: i32,
+    /// Letter tracking (-2..=6 px) and extra line pitch (0..=12 px).
+    pub dlg_track: i32,
+    pub dlg_line: i32,
+    /// Font pack version the saved ids were written against. Not shown in the
+    /// panel; recorded so a replaced pack can explain why an id moved.
+    pub font_pack_version: i32,
 }
 
 impl Default for Settings {
@@ -211,12 +285,18 @@ impl Default for Settings {
             dlg_edge: 0,
             dlg_color: 0,
             dlg_under: 0,
+            dlg_edge_alpha: crate::render::text::DEFAULT_EDGE_ALPHA as i32,
+            dlg_weight: 0,
+            dlg_track: 0,
+            dlg_line: 0,
+            font_pack_version: crate::render::text::FONT_PACK_VERSION,
         }
     }
 }
 
-/// The field a font key writes to, so `set` can range-check ids instead of
-/// treating them as slider levels.
+/// The field a font key writes to, so `set` treats an id as an id rather than
+/// as a slider level. The catalogue clamp lives in the font layer (`load`
+/// normalizes what it reads back, `set_role_ids` clamps what it applies).
 fn font_slot<'a>(st: &'a mut Settings, key: &str) -> Option<&'a mut i32> {
     match key {
         "font_home" => Some(&mut st.font_home),
@@ -233,6 +313,10 @@ fn dialog_slot<'a>(st: &'a mut Settings, key: &str) -> Option<&'a mut i32> {
         "dlg_edge" => Some(&mut st.dlg_edge),
         "dlg_color" => Some(&mut st.dlg_color),
         "dlg_under" => Some(&mut st.dlg_under),
+        "dlg_edge_alpha" => Some(&mut st.dlg_edge_alpha),
+        "dlg_weight" => Some(&mut st.dlg_weight),
+        "dlg_track" => Some(&mut st.dlg_track),
+        "dlg_line" => Some(&mut st.dlg_line),
         _ => None,
     }
 }
@@ -244,8 +328,12 @@ pub fn dialog_style(st: &Settings) -> crate::render::text::DialogStyle {
     crate::render::text::DialogStyle {
         size: st.dlg_size.max(0) as u32,
         edge: st.dlg_edge.max(0) as u32,
+        edge_alpha: st.dlg_edge_alpha.clamp(0, 255) as u32,
         color: st.dlg_color.max(0) as u32,
         underline: st.dlg_under > 0,
+        weight: st.dlg_weight.max(0) as u32,
+        tracking: st.dlg_track,
+        line_gap: st.dlg_line.max(0),
     }
     .clamp()
 }
@@ -284,6 +372,11 @@ impl Settings {
             "dlg_edge" => self.dlg_edge,
             "dlg_color" => self.dlg_color,
             "dlg_under" => self.dlg_under,
+            "dlg_edge_alpha" => self.dlg_edge_alpha,
+            "dlg_weight" => self.dlg_weight,
+            "dlg_track" => self.dlg_track,
+            "dlg_line" => self.dlg_line,
+            "font_pack_version" => self.font_pack_version,
             _ => return None,
         })
     }
@@ -297,7 +390,13 @@ impl Settings {
             return;
         }
         if let Some(slot) = dialog_slot(self, key) {
-            *slot = v.max(0);
+            // Stored as written and ranged where it is read (`dialog_style`),
+            // the same rule the rest of the hand-editable keys follow.
+            *slot = v;
+            return;
+        }
+        if key == "font_pack_version" {
+            self.font_pack_version = v.max(0);
             return;
         }
         let v = v.clamp(0, LEVELS);
@@ -356,6 +455,11 @@ impl Settings {
             "dlg_edge",
             "dlg_color",
             "dlg_under",
+            "dlg_edge_alpha",
+            "dlg_weight",
+            "dlg_track",
+            "dlg_line",
+            "font_pack_version",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -384,6 +488,10 @@ impl Settings {
             Ok(d) => d,
             Err(_) => {
                 eprintln!("settings: {} not found, using defaults", path.display());
+                // The defaults are not necessarily the font layer's initial
+                // values (the default profile and style are resolved there),
+                // so they still have to be handed over before the first draw.
+                st.apply_text();
                 return st;
             }
         };
@@ -402,6 +510,20 @@ impl Settings {
             }
         }
         eprintln!("settings: loaded {}", path.display());
+        // An id that names no font on this machine is normalized here, so the
+        // file cannot keep (and re-save) an id that will never resolve. The
+        // renderer clamps too, but the settings file is the source of truth.
+        st.font_home = crate::render::text::clamp_profile_id(st.font_home);
+        st.font_history = crate::render::text::clamp_profile_id(st.font_history);
+        st.font_game = crate::render::text::clamp_profile_id(st.font_game);
+        if st.font_pack_version != crate::render::text::FONT_PACK_VERSION {
+            eprintln!(
+                "font: font pack version {} -> {}; re-checking the saved ids against the current catalogue",
+                st.font_pack_version,
+                crate::render::text::FONT_PACK_VERSION
+            );
+            st.font_pack_version = crate::render::text::FONT_PACK_VERSION;
+        }
         // Fonts have to be in place before the first screen draws, not when
         // the option screen is opened.
         st.apply_text();
@@ -418,8 +540,16 @@ impl Settings {
         }
         // Write a sibling and rename it over the target: a process that dies
         // mid-write leaves the old file behind rather than a half-written one.
-        let tmp = path.with_extension("ini.tmp");
-        std::fs::write(&tmp, out)?;
+        // The temporary name carries the pid so two instances cannot collide,
+        // and the file is flushed before the rename so a hard power loss cannot
+        // leave an empty but renamed config.
+        let tmp = path.with_extension(format!("{}.ini.tmp", std::process::id()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(out.as_bytes())?;
+            let _ = f.sync_all();
+        }
         match std::fs::rename(&tmp, &path) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -444,11 +574,12 @@ impl Settings {
         // A saved id whose font is gone is a silent fallback otherwise: the
         // player would think the choice took effect.
         for role in crate::render::text::FONT_ROLES {
-            if crate::render::text::role_fallback(role) {
+            if let Some(reason) = crate::render::text::role_fallback_reason(role) {
                 eprintln!(
-                    "settings: {} font profile {} is unavailable here, using the default",
+                    "settings: {} font profile {} fell back: {}",
                     role.tag(),
-                    crate::render::text::role_id(role)
+                    crate::render::text::role_requested(role),
+                    reason
                 );
             }
         }
@@ -482,12 +613,8 @@ pub enum Act {
     Reset,
     /// Switch to a page.
     Tab(usize),
-    /// Page navigation.
-    Page(i32),
     /// Open the dialogue style panel, from the font row.
     FontStyle,
-    /// Step row "i"'s font by "dir" (-1 back, 1 forward).
-    FontStep(usize, i32),
     /// Leave the option screen.
     Close,
 }
@@ -815,10 +942,9 @@ pub struct Screen {
     pub help_row: Option<usize>,
     /// Hovering the navigation bar / default button.
     pub nav_hover: Option<usize>,
-    /// Part of the font block under the cursor: a row, one of its arrows, or
-    /// the style button.
+    /// Part of the font block under the cursor: a row or the style button.
     pub font_hover: Option<usize>,
-    /// The font row the arrow keys move.
+    /// The font row the keyboard moves.
     pub font_sel: usize,
 }
 
@@ -1064,12 +1190,17 @@ fn hit(scr_page: usize, hots: &[Hot], sx: i32, sy: i32) -> Option<usize> {
 }
 
 /// The slider track under a screen position, if any.
+///
+/// Page 1 carries the font block, so its artwork (and every widget on it) is
+/// drawn [`page_shift`] lower: the drag has to use the same screen position
+/// the click and the drawing use, or dragging a page 1 slider stops following
+/// the pointer (F-15).
 fn track_at(page: usize, sx: i32, sy: i32) -> Option<&'static Slider> {
     page_hots(page).into_iter().find_map(|h| {
         if !matches!(h.act, Act::Track) {
             return None;
         }
-        let (x, y) = (PAGE_X + h.x, PAGE_Y + h.y);
+        let (x, y) = (PAGE_X + h.x, page_y(page, h.y));
         if sx >= x && sx < x + h.w && sy >= y && sy < y + h.h {
             h.slider
         } else {
@@ -1183,7 +1314,7 @@ fn label_page() -> usize {
 
 /// Where the label of a page-relative y lands.
 fn label_y(y: i32) -> i32 {
-    PAGE_Y + y + page_shift(label_page())
+    PAGE_Y + y + insert_shift(label_page(), y)
 }
 
 /// Group heading: 18px, a touch of tracking, the pale teal the section rules
@@ -1436,7 +1567,7 @@ pub fn bake_clean_page(base: &TgaImage, page: usize) -> Surface {
     // rectangle out of it. Doing it any other way would shift the art.
     let mut full = Surface::new(W, H, [0, 0, 0, 255]);
     full.blit(base, PAGE_X, PAGE_Y);
-    wipe_baked_captions(&mut full, base, page);
+    wipe_baked_captions_flat(&mut full, base, page);
     let mut out = Surface::new(PAGE_W as u32, PAGE_H as u32, [0, 0, 0, 255]);
     for y in 0..PAGE_H as u32 {
         let src = ((PAGE_Y as u32 + y) * W + PAGE_X as u32) as usize * 4;
@@ -1708,19 +1839,38 @@ fn clean_page_path(out_dir: &Path, page: usize) -> std::path::PathBuf {
 }
 
 thread_local! {
-    /// How much lower the page being wiped sits than its artwork does. Only
-    /// page 1 moves, and only for the font block; the helpers below read
-    /// page-image coordinates, so they learn the offset from here.
+    /// How much lower the page being wiped sits than its artwork does, and the
+    /// artwork y where that shift starts. Only page 1 moves, and only below the
+    /// font block's split; the helpers below read page-image coordinates, so
+    /// they learn the mapping from here.
     static WIPE_SHIFT: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    static WIPE_SPLIT: std::cell::Cell<i32> = const { std::cell::Cell::new(i32::MAX) };
 }
 
 /// Screen y of row y of the page being wiped.
 fn wipe_y(y: i32) -> i32 {
-    PAGE_Y + WIPE_SHIFT.with(|c| c.get()) + y
+    let shift = WIPE_SHIFT.with(|c| c.get());
+    let split = WIPE_SPLIT.with(|c| c.get());
+    PAGE_Y + y + if shift > 0 && y >= split { shift } else { 0 }
 }
 
+/// Wipe the baked captions from the composited screen, where page 1's lower
+/// artwork sits [`FONT_BLOCK_H`] lower than its source image.
 fn wipe_baked_captions(s: &mut Surface, base: &TgaImage, page: usize) {
     WIPE_SHIFT.with(|c| c.set(page_shift(page)));
+    WIPE_SPLIT.with(|c| c.set(FONT_SPLIT));
+    wipe_baked_captions_impl(s, base, page);
+}
+
+/// Wipe the baked captions from an *unshifted* copy of the page artwork. The
+/// clean-page bake works on the source image itself, so nothing may move.
+fn wipe_baked_captions_flat(s: &mut Surface, base: &TgaImage, page: usize) {
+    WIPE_SHIFT.with(|c| c.set(0));
+    WIPE_SPLIT.with(|c| c.set(i32::MAX));
+    wipe_baked_captions_impl(s, base, page);
+}
+
+fn wipe_baked_captions_impl(s: &mut Surface, base: &TgaImage, page: usize) {
     let pw = base.width as i32;
     let ph = base.height as i32;
     if pw <= 0 || ph <= 0 {
@@ -2086,6 +2236,40 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
 /// button - travel in its own RGB channels. A single tint on the way out would
 /// flatten all of them back to one colour, which is what made the page look
 /// like it was assembled from two different screens.
+/// Stamp one small RGBA buffer into a bigger one. The list uses it to put a
+/// font's own sample on a canvas drawn with another.
+/// `max_w` clips the source to a column: the font previews are stamped into
+/// the list canvas and must never reach the scrollbar track (F-07).
+fn blit_rgba_into(
+    dst: &mut [u8],
+    dw: u32,
+    dh: u32,
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    x: i32,
+    y: i32,
+    max_w: i32,
+) {
+    for row in 0..sh as i32 {
+        for col in 0..sw as i32 {
+            if col >= max_w {
+                break;
+            }
+            let (dx, dy) = (x + col, y + row);
+            if dx < 0 || dy < 0 || dx >= dw as i32 || dy >= dh as i32 {
+                continue;
+            }
+            let si = ((row as u32 * sw + col as u32) * 4) as usize;
+            if src[si + 3] == 0 {
+                continue;
+            }
+            let di = ((dy as u32 * dw + dx as u32) * 4) as usize;
+            dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+}
+
 fn blit_ink(surf: &mut Surface, rgba: &[u8], w: u32, h: u32, x: i32, y: i32) {
     for row in 0..h as i32 {
         for col in 0..w as i32 {
@@ -2144,21 +2328,155 @@ struct FontRows {
     buf: Vec<u8>,
 }
 
-fn font_rows_sig(st: &Settings, scr: &Screen) -> String {
+/// Everything the band's captions depend on: the ids the settings file asks
+/// for, what the font layer actually opened, whether it had to fall back, and
+/// the window size (the canvas is rasterized at that size).
+fn font_rows_sig(st: &Settings, scr: &Screen, ww: i32, wh: i32) -> String {
+    let mut roles = String::new();
+    for role in crate::render::text::FONT_ROLES {
+        roles.push_str(&format!(
+            "{}:{}:{};",
+            crate::render::text::role_requested(role),
+            crate::render::text::role_id(role),
+            crate::render::text::role_fallback_reason(role).is_some(),
+        ));
+    }
     format!(
-        "{}|{}|{}|{:?}|{:?}|{}",
-        st.font_game, st.font_history, st.font_home, scr.font_hover, scr.font_sel, st.dlg_size
+        "{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{}x{}|{}",
+        st.font_game,
+        st.font_history,
+        st.font_home,
+        scr.font_hover,
+        scr.font_sel,
+        st.dlg_size,
+        crate::render::text::role_generation(),
+        ww,
+        wh,
+        roles
     )
 }
 
 /// Name of a catalogue entry, or the fallback note when the font it named is
-/// no longer installed.
+/// no longer installed. An unknown id is not the default being missing: the
+/// default is what took over, so say the requested face is gone (F-06).
 fn font_name(id: i32) -> String {
     match crate::render::text::font_profile(id) {
         Some(p) if p.path.is_some() => p.name.clone(),
         Some(p) => format!("{}（未安装）", p.name),
-        None => "默认（未安装）".to_string(),
+        None => "默认（原字体未安装）".to_string(),
     }
+}
+
+/// What a font row's box says. A role that had to fall back says so and names
+/// the id the file asked for, so the player cannot mistake the default for the
+/// choice that took effect (F-06). The box is only ~300 px wide, so the
+/// effective font's name is left out here and shown in the list header (see
+/// [`font_fallback_note`]).
+fn font_row_text(requested: i32, effective: i32, fallback: Option<&str>) -> String {
+    if fallback.is_some() {
+        format!("已使用备用字体（原 id {}）", requested)
+    } else if requested != effective {
+        // The file and the renderer can disagree when a role is overridden
+        // from the environment: show what is drawing, not what was asked.
+        format!("{}（请求 id {}）", font_name(effective), requested)
+    } else {
+        font_name(requested)
+    }
+}
+
+/// The full fallback sentence for the list header: the font that is really
+/// drawing and the id that was asked for. `None` when the role is drawing the
+/// font its id names.
+fn font_fallback_note(
+    requested: i32,
+    effective: i32,
+    fallback: Option<&str>,
+) -> Option<String> {
+    fallback.map(|_| {
+        if requested == 0 {
+            // The usual cause is an unusable WA2_FONT* override; the settings
+            // file itself says 0, so printing "original id 0" would be noise.
+            format!("已使用备用字体：{}（环境变量字体不可用）", font_name(effective))
+        } else {
+            format!("已使用备用字体：{}（原 id {}）", font_name(effective), requested)
+        }
+    })
+}
+
+/// Clip one caption to `w` pixels with an ellipsis. `labels_rgba` does not
+/// clip horizontally, so a long family name would otherwise run into the
+/// current-value marker (F-19 m3).
+fn fit_label(text: &str, w: i32, size: u32) -> String {
+    if w <= 0 {
+        return String::new();
+    }
+    crate::render::text::with_role_font(crate::render::text::FontRole::Home, size, |f| {
+        if f.measure(text) <= w {
+            return text.to_string();
+        }
+        let mut out = String::new();
+        for ch in text.chars() {
+            let mut cand = out.clone();
+            cand.push(ch);
+            cand.push('…');
+            if f.measure(&cand) > w {
+                break;
+            }
+            out.push(ch);
+        }
+        if out.is_empty() {
+            // Not even one glyph and the ellipsis fit: leave the column blank
+            // rather than paint over it.
+            String::new()
+        } else {
+            out.push('…');
+            out
+        }
+    })
+    .unwrap_or_else(|| text.to_string())
+}
+
+/// Largest `size` in `min..=want` at which `text` fits `avail` pixels.
+/// Returns `min` when even that overflows; the caller then clips the sample.
+fn fit_sample_size(
+    vf: &crate::render::text::VectorFont,
+    text: &str,
+    want: u32,
+    min: u32,
+    avail: i32,
+) -> u32 {
+    let mut size = want.max(min);
+    loop {
+        if vf.set_size(size) && vf.measure(text) <= avail {
+            return size;
+        }
+        if size <= min {
+            return min;
+        }
+        size -= 1;
+    }
+}
+
+/// Clip a sample to `avail` pixels at the font's current size: the last resort
+/// when even the smallest preview size overflows the column.
+fn fit_text_with(vf: &crate::render::text::VectorFont, text: &str, avail: i32) -> String {
+    if vf.measure(text) <= avail {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let mut cand = out.clone();
+        cand.push(ch);
+        cand.push('…');
+        if vf.measure(&cand) > avail {
+            break;
+        }
+        out.push(ch);
+    }
+    if !out.is_empty() {
+        out.push('…');
+    }
+    out
 }
 
 fn build_font_rows(st: &Settings, scr: &Screen, ww: i32, wh: i32) -> Option<FontRows> {
@@ -2182,30 +2500,35 @@ fn build_font_rows(st: &Settings, scr: &Screen, ww: i32, wh: i32) -> Option<Font
             rgb: if on { ink::HEAD } else { ink::LABEL },
             tracking: 0,
         });
+        // The box names what the role is really drawing with. A fallback says
+        // so, with the id the settings file still holds; the renderer's longer
+        // explanation goes to the log, not into a 300 px row.
+        let effective = crate::render::text::role_id(*role);
+        let fallback = crate::render::text::role_fallback_reason(*role);
+        let name = font_row_text(ids[i], effective, fallback.as_deref());
+        let name_size = if fallback.is_some() { menu_px(14, wh) } else { menu_px(17, wh) };
         labels.push(crate::render::text::Label {
-            text: font_name(ids[i]),
+            text: fit_label(&name, px(FROW_BOX_W - FROW_DOWN_W) - px(6), name_size),
             x: px(FROW_BOX_X),
             y: py(y),
-            w: px(FROW_BOX_W),
+            w: px(FROW_BOX_W - FROW_DOWN_W),
             h: py(FROW_H),
-            size: menu_px(17, wh),
+            size: name_size,
             center: true,
-            rgb: ink::BUTTON,
+            rgb: if fallback.is_some() { ink::SUB } else { ink::BUTTON },
             tracking: 0,
         });
-        for (ax, ch) in [(FROW_ARROW_L, "<"), (FROW_ARROW_R, ">")] {
-            labels.push(crate::render::text::Label {
-                text: ch.to_string(),
-                x: px(ax),
-                y: py(y),
-                w: px(FROW_ARROW_W),
-                h: py(FROW_H),
-                size: menu_px(17, wh),
-                center: true,
-                rgb: ink::SCALE,
-                tracking: 0,
-            });
-        }
+        labels.push(crate::render::text::Label {
+            text: "▼".to_string(),
+            x: px(FROW_BOX_X + FROW_BOX_W - FROW_DOWN_W),
+            y: py(y),
+            w: px(FROW_DOWN_W),
+            h: py(FROW_H),
+            size: menu_px(14, wh),
+            center: true,
+            rgb: ink::SCALE,
+            tracking: 0,
+        });
         if i == 0 {
             labels.push(crate::render::text::Label {
                 text: format!("样式 {}px", st.dlg_size),
@@ -2224,7 +2547,7 @@ fn build_font_rows(st: &Settings, scr: &Screen, ww: i32, wh: i32) -> Option<Font
     let buf = crate::render::text::with_role_font(crate::render::text::FontRole::Home, size, |f| {
         f.labels_rgba(w, h, &labels)
     })??;
-    Some(FontRows { sig: font_rows_sig(st, scr), w, h, buf })
+    Some(FontRows { sig: font_rows_sig(st, scr, ww, wh), w, h, buf })
 }
 
 /// Plate for one control: dark at rest, a cyan wash under the cursor.
@@ -2243,19 +2566,17 @@ fn flat_plate(frame: &mut Surface, x: i32, y: i32, w: i32, h: i32, hovered: bool
     frame.fill_rect(x + w - 1, y, 1, h.max(0) as u32, border);
 }
 
-/// The row itself is hover index i; its two arrows and the style button live
-/// past the three rows in the same field.
-const FROW_ARROW_HIT: usize = 3;
+/// The row itself is hover index i; the style button lives past the rows in the
+/// same field.
 const FONT_STYLE_ROW: usize = 9;
 
-/// Screen-space rects of the parts of the font block that can be clicked, in
-/// page coordinates: arrows first so they win over the row behind them.
+/// Rects of the parts of the font block that can be clicked, in page
+/// coordinates. The box and the row it labels are the same hit: both open the
+/// list.
 fn font_row_hits() -> Vec<(i32, i32, i32, i32, usize)> {
     let mut v = Vec::new();
     for i in 0..3 {
-        let y = font_row_y(i);
-        v.push((FROW_ARROW_L, y, FROW_ARROW_W, FROW_H, FROW_ARROW_HIT + i * 2));
-        v.push((FROW_ARROW_R, y, FROW_ARROW_W, FROW_H, FROW_ARROW_HIT + i * 2 + 1));
+        let y = font_band_row_y(i);
         if i == 0 {
             v.push((FROW_STYLE_X, y, FROW_STYLE_W, FROW_H, FONT_STYLE_ROW));
         }
@@ -2264,93 +2585,86 @@ fn font_row_hits() -> Vec<(i32, i32, i32, i32, usize)> {
     v
 }
 
-/// What clicking a part of the font block does. Fonts apply as they are
-/// picked, the way every other control on this page does.
+/// What a part of the font block does. A pick applies right away, the way
+/// every other control on this page does.
 enum FontHit {
-    /// Select row i without changing it.
-    Row(usize),
-    /// Step row i's font.
-    Step(usize, i32),
+    /// Open the font list for row i.
+    List(usize),
     /// Open the dialogue style panel.
     Style,
 }
 
 fn font_hit_kind(h: usize) -> Option<FontHit> {
-    Some(match h {
-        FONT_STYLE_ROW => FontHit::Style,
-        i if i >= FROW_ARROW_HIT => {
-            let a = i - FROW_ARROW_HIT;
-            FontHit::Step(a / 2, if a % 2 == 0 { -1 } else { 1 })
-        }
-        i if i < 3 => FontHit::Row(i),
-        _ => return None,
-    })
+    match h {
+        FONT_STYLE_ROW => Some(FontHit::Style),
+        i if i < 3 => Some(FontHit::List(i)),
+        _ => None,
+    }
 }
 
-/// Move one role's font on. Returns true when it changed.
-fn step_role_font(st: &mut Settings, row: usize, dir: i32) -> bool {
-    let Some(role) = crate::render::text::FONT_ROLES.get(row).copied() else {
-        return false;
-    };
-    let slot = match role {
+/// The slot a row writes to.
+fn role_slot(st: &mut Settings, row: usize) -> Option<&mut i32> {
+    let role = *crate::render::text::FONT_ROLES.get(row)?;
+    Some(match role {
         crate::render::text::FontRole::Game => &mut st.font_game,
         crate::render::text::FontRole::History => &mut st.font_history,
         crate::render::text::FontRole::Home => &mut st.font_home,
-    };
-    let next = crate::render::text::cycle_profile_id(*slot, dir);
+    })
+}
+
+/// Give one role the picked font. Returns true when it changed.
+fn pick_role_font(st: &mut Settings, row: usize, id: i32) -> bool {
+    let Some(slot) = role_slot(st, row) else { return false };
+    let next = crate::render::text::clamp_profile_id(id);
     if next == *slot {
         return false;
     }
     *slot = next;
     true
 }
-
 /// Draw the three font rows into the band above the artwork's own rows.
+///
+/// `open` is the row whose list is currently on screen (F-19 m1): it was taken
+/// out of `Screen` because the request to open a list lives for exactly one
+/// frame, while the open state lives in the [`FontList`] itself.
 fn paint_font_rows(
     frame: &mut Surface,
     ww: i32,
     wh: i32,
-    st: &Settings,
     scr: &Screen,
+    open: Option<usize>,
     rows: Option<&FontRows>,
 ) {
     let px = |v: i32| (v * ww) / 1280;
     let py = |v: i32| (v * wh) / 720;
     let ox = px(PAGE_X);
     let oy = py(PAGE_Y);
+    // The band starts at the split; the rows inside it keep their own grid.
+    let band = oy + py(FONT_SPLIT);
     let dim = [64, 96, 108, 255];
     let lit = [96, 196, 212, 255];
     for i in 0..3 {
         let y = font_row_y(i);
-        let on = scr.font_sel == i || scr.font_hover == Some(i);
+        let is_open = open == Some(i);
+        let on = is_open || scr.font_sel == i || scr.font_hover == Some(i);
+        // The box is the trigger: the marker on its right edge is drawn as a
+        // chevron by the text layer, since a triangle would need its own plate.
         flat_plate(
             frame,
             ox + px(FROW_BOX_X),
-            oy + py(y),
+            band + py(y),
             px(FROW_BOX_W),
             py(FROW_H),
-            scr.font_hover == Some(i),
+            scr.font_hover == Some(i) || is_open,
             on,
-            if on { lit } else { dim },
+            if is_open { lit } else if on { [72, 150, 172, 255] } else { dim },
         );
-        for (k, ax) in [FROW_ARROW_L, FROW_ARROW_R].iter().enumerate() {
-            flat_plate(
-                frame,
-                ox + px(*ax),
-                oy + py(y),
-                px(FROW_ARROW_W),
-                py(FROW_H),
-                scr.font_hover == Some(FROW_ARROW_HIT + i * 2 + k),
-                false,
-                dim,
-            );
-        }
         if i == 0 {
             let sh = scr.font_hover == Some(FONT_STYLE_ROW);
             flat_plate(
                 frame,
                 ox + px(FROW_STYLE_X),
-                oy + py(y),
+                band + py(y),
                 px(FROW_STYLE_W),
                 py(FROW_H),
                 sh,
@@ -2360,9 +2674,482 @@ fn paint_font_rows(
         }
     }
     if let Some(r) = rows {
-        blit_ink(frame, &r.buf, r.w, r.h, ox, oy);
+        blit_ink(frame, &r.buf, r.w, r.h, ox, band);
     }
-    let _ = st;
+}
+
+// ---------------------------------------------------------------------------
+// font list
+// ---------------------------------------------------------------------------
+
+/// The open font list: which row it belongs to, the scroll offset, and the row
+/// under the cursor. The catalogue itself lives in render::text.
+struct FontList {
+    /// Row whose list this is.
+    row: usize,
+    /// Index into the catalogue of the topmost visible row.
+    top: usize,
+    /// Cursor, as an index into the catalogue.
+    cur: usize,
+    /// The role's actually selected profile, as an index into the catalogue.
+    /// The cursor follows the pointer, but「当前」has to keep naming the font
+    /// that is really drawing, not the row the mouse happens to be over.
+    current: usize,
+    /// Row under the pointer, as an index into the catalogue.
+    hover: Option<usize>,
+    /// True while the scrollbar thumb is held.
+    drag: bool,
+    /// True while the pointer is over the font-only「恢复默认」footer.
+    reset_hover: bool,
+}
+
+impl FontList {
+    fn new(row: usize, current: i32) -> FontList {
+        let cur = crate::render::text::font_profile_index(current);
+        FontList {
+            row,
+            top: top_for(cur),
+            cur,
+            current: cur,
+            hover: Some(cur),
+            drag: false,
+            reset_hover: false,
+        }
+    }
+
+    /// Everything that changes the frame: the cursor and the pointer.
+    fn sig(&self) -> String {
+        format!(
+            "{}|{}|{}|{:?}|{}|{}",
+            self.row, self.top, self.cur, self.hover, self.drag as u8, self.reset_hover as u8
+        )
+    }
+
+    /// The part that changes the text canvas. Hover and drag only re-tint the
+    /// plates, so they must not rebuild the rasterized names and previews
+    /// (F-20).
+    fn key(&self) -> String {
+        format!("{}|{}|{}|{}", self.row, self.top, self.cur, self.current)
+    }
+
+    fn len(&self) -> usize {
+        crate::render::text::font_catalog().len()
+    }
+
+    /// Keep the cursor inside the visible window.
+    fn clamp(&mut self) {
+        if self.cur >= self.len() {
+            self.cur = 0;
+        }
+        if self.cur < self.top {
+            self.top = self.cur;
+        }
+        if self.cur >= self.top + LST_ROWS {
+            self.top = self.cur + 1 - LST_ROWS;
+        }
+        let last = self.len().saturating_sub(LST_ROWS);
+        if self.top > last {
+            self.top = last;
+        }
+    }
+
+    /// Move the cursor, scrolling the window when it leaves it.
+    fn step(&mut self, d: i32) {
+        let n = self.len() as i32;
+        if n == 0 {
+            return;
+        }
+        self.cur = ((self.cur as i32 + d + n) % n) as usize;
+        self.hover = Some(self.cur);
+        self.clamp();
+    }
+
+    /// Jump to an offset on the scrollbar track.
+    fn scroll_to(&mut self, last: usize, want: usize) {
+        self.top = want.min(last);
+        // Keep the cursor on screen, or the keyboard would be moving a row
+        // that is no longer visible.
+        if self.cur < self.top {
+            self.cur = self.top;
+        }
+        if self.cur >= self.top + LST_ROWS {
+            self.cur = self.top + LST_ROWS - 1;
+        }
+        self.clamp();
+    }
+}
+
+/// Open a list with the cursor on screen rather than at the very top.
+fn top_for(cur: usize) -> usize {
+    cur.saturating_sub(LST_ROWS / 2)
+}
+
+/// Rects of the list in page coordinates. `which` is an index into the
+/// catalogue; [`usize::MAX`] marks the scrollbar and [`LST_RESET`] the
+/// font-only reset in the footer.
+fn list_hits(l: &FontList) -> Vec<(i32, i32, i32, i32, usize)> {
+    let mut v = Vec::new();
+    let top = lst_y(l.row) + LST_HEAD;
+    for k in 0..LST_ROWS {
+        v.push((LST_X, top + k as i32 * LST_ROW_H, LST_W - LST_BAR_W, LST_ROW_H, l.top + k));
+    }
+    v.push((LST_X + LST_W - LST_BAR_W, top, LST_BAR_W, LST_ROWS as i32 * LST_ROW_H, usize::MAX));
+    v.push((
+        LST_X + LST_PAD,
+        top + LST_ROWS as i32 * LST_ROW_H,
+        LST_W - LST_BAR_W - LST_PAD * 2,
+        LST_FOOT,
+        LST_RESET,
+    ));
+    v
+}
+
+/// Hit test the list, in page coordinates.
+fn list_at(l: &FontList, x: i32, y: i32) -> Option<usize> {
+    let ly = lst_y(l.row);
+    if x < LST_X || x >= LST_X + LST_W || y < ly || y >= ly + lst_h() {
+        return None;
+    }
+    list_hits(l)
+        .iter()
+        .find(|(hx, hy, hw, hh, _)| x >= *hx && x < *hx + *hw && y >= *hy && y < *hy + *hh)
+        .map(|r| r.4)
+}
+
+/// Where a pointer y on the scrollbar track scrolls the list to. Shared by the
+/// click that grabs the thumb and the drag that follows it.
+fn scroll_from_bar(l: &mut FontList, last: usize, sy: i32) {
+    if last == 0 {
+        return;
+    }
+    let track = LST_ROWS as i32 * LST_ROW_H;
+    let rel = (sy - PAGE_Y - (lst_y(l.row) + LST_HEAD)).clamp(0, track);
+    l.scroll_to(last, (rel * last as i32 / (track - 1).max(1)) as usize);
+}
+
+/// What the list decided this frame.
+enum ListAct {
+    None,
+    /// Close without picking.
+    Close,
+    /// Pick this catalogue id and close.
+    Pick(i32),
+    /// Put the three fonts back to the default profile and close.
+    ResetFonts,
+}
+
+fn list_input(l: &mut FontList, input: sdl2::Input, win: &Sdl) -> ListAct {
+    let n = l.len();
+    let last = n.saturating_sub(LST_ROWS);
+    match input {
+        // Up/Down walk the catalogue; the page underneath never sees them
+        // while the list is open (see `run`).
+        sdl2::Input::Up => l.step(-1),
+        sdl2::Input::Down => l.step(1),
+        sdl2::Input::Wheel { y } => {
+            let step = (y.abs() as i32).max(1) * 3;
+            l.step(if y > 0 { -step } else { step });
+        }
+        // The number keys are page tabs on the option screen; the list gives
+        // them no meaning rather than mixing two kinds of jump (F-19 m10).
+        sdl2::Input::Advance => {
+            let id = crate::render::text::font_catalog().get(l.cur).map(|p| p.id).unwrap_or(0);
+            return ListAct::Pick(id);
+        }
+        sdl2::Input::Back | sdl2::Input::Left | sdl2::Input::RightClick | sdl2::Input::Quit => {
+            return ListAct::Close;
+        }
+        // The thumb follows the pointer after the click that grabbed it; the
+        // release drops it (F-19 m2).
+        sdl2::Input::Drag { x, y } => {
+            if l.drag {
+                let (_, sy) = win.surface_pos(x, y, W, H);
+                scroll_from_bar(l, last, sy);
+            }
+        }
+        sdl2::Input::Release { .. } => l.drag = false,
+        sdl2::Input::Pointer { x, y, pressed } => {
+            let (sx, sy) = win.surface_pos(x, y, W, H);
+            let px = sx - PAGE_X;
+            let py = sy - PAGE_Y;
+            match list_at(l, px, py) {
+                // The scrollbar: jump to where it was clicked, and drag.
+                Some(usize::MAX) => {
+                    if pressed {
+                        scroll_from_bar(l, last, sy);
+                    }
+                    l.drag = pressed;
+                    l.hover = None;
+                    l.reset_hover = false;
+                }
+                // Footer: the font-only reset. It closes the list, because the
+                // page behind it has to be rebuilt with the new ids.
+                Some(LST_RESET) => {
+                    l.hover = None;
+                    l.reset_hover = true;
+                    if pressed {
+                        return ListAct::ResetFonts;
+                    }
+                }
+                Some(which) if which < n => {
+                    l.hover = Some(which);
+                    l.reset_hover = false;
+                    l.cur = which;
+                    l.clamp();
+                    if pressed {
+                        let id = crate::render::text::font_catalog()
+                            .get(which)
+                            .map(|p| p.id)
+                            .unwrap_or(0);
+                        return ListAct::Pick(id);
+                    }
+                }
+                // Anywhere else on the page drops the list.
+                _ => {
+                    l.hover = None;
+                    l.reset_hover = false;
+                    if pressed {
+                        return ListAct::Close;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    ListAct::None
+}
+
+/// The sample every row is previewed with: Chinese, kana and Latin, so a font
+/// that only covers part of the script shows it at once.
+const LST_SAMPLE: &str = "春雪、かずさ、WHITE ALBUM 2";
+
+/// Preview bitmaps, keyed by `(font id, requested pixel size, column width)`.
+/// The key is known before any font is opened, so a scroll or a hover does not
+/// reopen the eleven visible FreeType faces at all - relying on the glyph cache
+/// alone would still pay the open cost every rebuild (F-20).
+type PreviewCache = std::collections::HashMap<(i32, u32, i32), (u32, u32, Vec<u8>)>;
+
+struct ListText {
+    key: String,
+    w: u32,
+    h: u32,
+    buf: Vec<u8>,
+}
+
+/// Build the list's text canvas. The names come from the UI font and each
+/// preview from its own row's font, which is the only way to show what the
+/// player is actually picking. Hover and drag are left to `paint_font_list`,
+/// so moving the mouse does not rebuild this canvas (F-20).
+fn build_list_text(
+    l: &FontList,
+    ww: i32,
+    wh: i32,
+    previews: &mut PreviewCache,
+) -> Option<ListText> {
+    let px = |v: i32| (v * ww) / 1280;
+    let py = |v: i32| (v * wh) / 720;
+    let w = px(LST_W).max(1) as u32;
+    let h = py(lst_h()).max(1) as u32;
+    let cat = crate::render::text::font_catalog();
+    // A long session that resizes the window would otherwise keep one bitmap
+    // set per column width alive; dropping them just costs a rebuild.
+    if previews.len() > 256 {
+        previews.clear();
+    }
+    let mut labels: Vec<crate::render::text::Label> = Vec::new();
+    let header_w = px(LST_W - LST_BAR_W - LST_PAD * 2);
+    // The row whose list this is may be drawing with a substitute font; the
+    // inventory says which font that substitute is and what id it replaced
+    // (F-06). It wins the header line because the count can be inferred from
+    // the scrollbar.
+    let header_note = crate::render::text::FONT_ROLES
+        .get(l.row)
+        .and_then(|r| {
+            font_fallback_note(
+                crate::render::text::role_requested(*r),
+                crate::render::text::role_id(*r),
+                crate::render::text::role_fallback_reason(*r).as_deref(),
+            )
+        })
+        .map(|note| fit_label(&note, header_w, menu_px(14, wh)));
+    let header_is_note = header_note.is_some();
+    labels.push(crate::render::text::Label {
+        text: header_note.unwrap_or_else(|| format!("字体 {} / {}", l.top + 1, cat.len())),
+        x: px(LST_PAD),
+        y: py(4),
+        w: header_w,
+        h: py(LST_HEAD - 6),
+        size: menu_px(if header_is_note { 14 } else { 15 }, wh),
+        center: false,
+        rgb: ink::SUB,
+        tracking: 0,
+    });
+    let name_size = menu_px(16, wh);
+    let name_w = px(LST_NAME_W) - px(6);
+    for k in 0..LST_ROWS {
+        let i = l.top + k;
+        let Some(p) = cat.get(i) else { continue };
+        let y = LST_HEAD + k as i32 * LST_ROW_H;
+        let current = l.current == i;
+        let missing = p.path.is_none();
+        labels.push(crate::render::text::Label {
+            text: fit_label(&p.name, name_w, name_size),
+            x: px(LST_PAD),
+            y: py(y),
+            w: px(LST_NAME_W),
+            h: py(LST_ROW_H),
+            size: name_size,
+            center: false,
+            rgb: if current { ink::HEAD } else { ink::LABEL },
+            tracking: 0,
+        });
+        // The picked row is marked, and a font that cannot be loaded is called
+        // out rather than silently offered.
+        let tag = match (current, missing) {
+            (true, _) => "当前",
+            (false, true) => "未安装",
+            _ => "",
+        };
+        if !tag.is_empty() {
+            labels.push(crate::render::text::Label {
+                text: tag.to_string(),
+                x: px(LST_TAG_X),
+                y: py(y),
+                w: px(48),
+                h: py(LST_ROW_H),
+                size: menu_px(12, wh),
+                center: false,
+                rgb: ink::SCALE,
+                tracking: 0,
+            });
+        }
+    }
+    // The footer entry: the only operation that resets exactly the three
+    // fonts and leaves every other setting alone (F-08).
+    labels.push(crate::render::text::Label {
+        text: "恢复默认（三类字体）".to_string(),
+        x: px(LST_PAD + 4),
+        y: py(LST_HEAD + LST_ROWS as i32 * LST_ROW_H),
+        w: px(LST_W - LST_BAR_W - LST_PAD * 2 - 4),
+        h: py(LST_FOOT),
+        size: menu_px(14, wh),
+        center: false,
+        rgb: ink::SUB,
+        tracking: 0,
+    });
+    let mut buf =
+        crate::render::text::with_role_font(crate::render::text::FontRole::Home, name_size, |f| {
+            f.labels_rgba(w, h, &labels)
+        })??;
+    // Previews, each in its own font: they are stamped onto the same canvas
+    // after the labels, so a font's sample cannot be overwritten by another.
+    // The size is picked per face so the whole sample fits the column, and the
+    // width is clipped before the scrollbar so it can never cover the track.
+    let want = menu_px(15, wh);
+    let min = menu_px(9, wh);
+    let avail = px(LST_PREVIEW_W) - px(4);
+    let clip = px(LST_PREVIEW_W);
+    for k in 0..LST_ROWS {
+        let i = l.top + k;
+        let Some(p) = cat.get(i) else { continue };
+        if p.path.is_none() {
+            continue;
+        }
+        let key = (p.id, want, avail);
+        if let Some((pw, ph, rgba)) = previews.get(&key) {
+            let y = LST_HEAD + k as i32 * LST_ROW_H + (LST_ROW_H - *ph as i32) / 2;
+            blit_rgba_into(&mut buf, w, h, rgba, *pw, *ph, px(LST_PREVIEW_X), py(y), clip);
+            continue;
+        }
+        let Some(vf) = crate::render::text::open_profile_font(p.id, want) else { continue };
+        let size = fit_sample_size(&vf, LST_SAMPLE, want, min, avail);
+        if !vf.set_size(size) {
+            continue;
+        }
+        let sample = fit_text_with(&vf, LST_SAMPLE, avail);
+        let Some((pw, ph, rgba)) = vf.line_rgba(&sample, size) else { continue };
+        let y = LST_HEAD + k as i32 * LST_ROW_H + (LST_ROW_H - ph as i32) / 2;
+        blit_rgba_into(&mut buf, w, h, &rgba, pw, ph, px(LST_PREVIEW_X), py(y), clip);
+        previews.insert(key, (pw, ph, rgba));
+    }
+    Some(ListText { key: l.key(), w, h, buf })
+}
+
+/// Draw the list over the page.
+fn paint_font_list(frame: &mut Surface, ww: i32, wh: i32, l: &FontList, text: Option<&ListText>) {
+    let px = |v: i32| (v * ww) / 1280;
+    let py = |v: i32| (v * wh) / 720;
+    let ox = px(PAGE_X);
+    let oy = py(PAGE_Y);
+    let (x, y, w, h) = (px(LST_X) + ox, py(lst_y(l.row)) + oy, px(LST_W), py(lst_h()));
+    // Row plates and separators are page-relative too; without this base they
+    // land `lst_y` pixels too high and the hover highlight tracks the previous
+    // row (the text canvas, blitted at `y`, was already correct).
+    let ly = y;
+    frame.fill_rect(x, y, w as u32, h as u32, [14, 18, 26, 250]);
+    let rim = [96, 196, 212, 255];
+    frame.fill_rect(x, y, w as u32, 1, rim);
+    frame.fill_rect(x, y + h - 1, w as u32, 1, rim);
+    frame.fill_rect(x, y, 1, h as u32, rim);
+    frame.fill_rect(x + w - 1, y, 1, h as u32, rim);
+    let n = crate::render::text::font_catalog().len();
+    for k in 0..LST_ROWS {
+        let i = l.top + k;
+        if i >= n {
+            break;
+        }
+        let ry = LST_HEAD + k as i32 * LST_ROW_H;
+        if l.cur == i || l.hover == Some(i) {
+            let tint = if l.cur == i { [38, 128, 150, 255] } else { [30, 74, 88, 255] };
+            frame.fill_rect(px(LST_X + 2) + ox, ly + py(ry + 1), px(LST_W - LST_BAR_W - 4).max(1) as u32, py(LST_ROW_H - 2).max(1) as u32, tint);
+        }
+        if k > 0 {
+            frame.fill_rect(
+                px(LST_X + 4) + ox,
+                ly + py(ry),
+                px(LST_W - LST_BAR_W - 8).max(1) as u32,
+                1,
+                [46, 66, 76, 255],
+            );
+        }
+    }
+    // Footer: a separate plate so it reads as an action rather than a row.
+    let fy = LST_HEAD + LST_ROWS as i32 * LST_ROW_H;
+    frame.fill_rect(
+        px(LST_X + 2) + ox,
+        ly + py(fy + 1),
+        px(LST_W - LST_BAR_W - 4).max(1) as u32,
+        py(LST_FOOT - 2).max(1) as u32,
+        if l.reset_hover { [30, 74, 88, 255] } else { [18, 24, 32, 255] },
+    );
+    frame.fill_rect(
+        px(LST_X + 4) + ox,
+        ly + py(fy),
+        px(LST_W - LST_BAR_W - 8).max(1) as u32,
+        1,
+        [46, 66, 76, 255],
+    );
+    // The scrollbar: a track with a thumb that shows where the window sits.
+    let bx = px(LST_X + LST_W - LST_BAR_W) + ox;
+    let by = py(lst_y(l.row) + LST_HEAD) + oy;
+    let bh = py(LST_ROWS as i32 * LST_ROW_H);
+    frame.fill_rect(bx, by, px(LST_BAR_W).max(1) as u32, bh.max(1) as u32, [10, 14, 20, 255]);
+    if n > LST_ROWS {
+        let last = n - LST_ROWS;
+        let track = (bh as f32) - 14.0;
+        let thumb = (track * LST_ROWS as f32 / n as f32).max(14.0);
+        let ty = by as f32 + (track - thumb) * l.top as f32 / last as f32;
+        frame.fill_rect(
+            bx,
+            ty as i32,
+            px(LST_BAR_W).max(1) as u32,
+            thumb.max(1.0) as u32,
+            if l.drag { [120, 210, 224, 255] } else { [86, 158, 178, 255] },
+        );
+    }
+    if let Some(t) = text {
+        blit_ink(frame, &t.buf, t.w, t.h, x, y);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2370,7 +3157,10 @@ fn paint_font_rows(
 // ---------------------------------------------------------------------------
 
 const SP_W: i32 = 600;
-const SP_H: i32 = 296;
+/// Eight rows: size, outline weight, outline alpha, colour, weight, tracking,
+/// line pitch, underline. 472 px leaves room for the title, the rows on their
+/// 44 px pitch and the button row inside a 720 px screen.
+const SP_H: i32 = 472;
 const SP_X: i32 = (W as i32 - SP_W) / 2;
 const SP_Y: i32 = (H as i32 - SP_H) / 2;
 const SP_ROW_Y: i32 = SP_Y + 66;
@@ -2388,12 +3178,17 @@ const SP_BTN_H: i32 = 32;
 const SP_RESET_X: i32 = SP_X + 36;
 const SP_CLOSE_X: i32 = SP_X + SP_W - 36 - 110;
 
-/// Widget indices: four rows each with a left and a right arrow, then the two
-/// buttons.
+/// The style knobs, in the panel's order. They are all of design §11's dials
+/// and all of them only touch the dialogue body.
+const SP_ROWS: usize = 8;
+const SP_NAMES: [&str; SP_ROWS] = ["字号", "描边强度", "描边透明度", "颜色", "字重", "字距", "行距", "下划线"];
+
+/// Widget indices: [`SP_ROWS`] rows each with a left and a right arrow, then
+/// the two buttons.
 const SP_PREV0: usize = 0;
-const SP_NEXT0: usize = 4;
-const SP_RESET: usize = 8;
-const SP_CLOSE: usize = 9;
+const SP_NEXT0: usize = SP_ROWS;
+const SP_RESET: usize = SP_ROWS * 2;
+const SP_CLOSE: usize = SP_ROWS * 2 + 1;
 
 /// The dialogue style being edited.
 struct StylePanel {
@@ -2411,34 +3206,96 @@ impl StylePanel {
         format!("{:?}|{:?}|{}", self.style, self.hover, self.sel)
     }
 
-    /// Step the value of row i, wrapping.
+    /// Step the value of row i, wrapping. Row 7 is a switch, so both
+    /// directions toggle it.
     fn step(&mut self, i: usize, dir: i32) {
-        use crate::render::text::{DIALOG_COLORS, DIALOG_EDGE_MAX, DIALOG_SIZE_MAX, DIALOG_SIZE_MIN};
+        use crate::render::text::{
+            DIALOG_COLORS, DIALOG_EDGE_MAX, DIALOG_LINE_GAP_MAX, DIALOG_SIZE_MAX,
+            DIALOG_SIZE_MIN, DIALOG_TRACK_MAX, DIALOG_TRACK_MIN, DIALOG_WEIGHT_MAX,
+        };
         match i {
             0 => {
-                let n = DIALOG_SIZE_MAX - DIALOG_SIZE_MIN + 1;
-                let cur = self.style.size - DIALOG_SIZE_MIN;
-                let next = (cur as i32 + dir + n as i32) % n as i32;
+                let n = (DIALOG_SIZE_MAX - DIALOG_SIZE_MIN + 1) as i32;
+                let cur = self.style.size as i32 - DIALOG_SIZE_MIN as i32;
+                let next = (cur + dir + n) % n;
                 self.style.size = DIALOG_SIZE_MIN + next as u32;
             }
             1 => {
                 let n = DIALOG_EDGE_MAX as i32 + 1;
-                let next = (self.style.edge as i32 + dir + n) % n;
-                self.style.edge = next as u32;
+                self.style.edge = ((self.style.edge as i32 + dir + n) % n) as u32;
             }
             2 => {
+                // Outline coverage in 16-px steps, clamped rather than wrapped:
+                // no outline and a fully opaque one are both useful resting
+                // points, so the arrows stop at them.
+                let v = self.style.edge_alpha as i32 + dir * 16;
+                self.style.edge_alpha = v.clamp(0, 255) as u32;
+            }
+            3 => {
                 let n = DIALOG_COLORS.len() as i32;
-                let next = (self.style.color as i32 + dir + n) % n;
-                self.style.color = next as u32;
+                self.style.color = ((self.style.color as i32 + dir + n) % n) as u32;
+            }
+            4 => {
+                let n = DIALOG_WEIGHT_MAX as i32 + 1;
+                self.style.weight = ((self.style.weight as i32 + dir + n) % n) as u32;
+            }
+            5 => {
+                let n = DIALOG_TRACK_MAX - DIALOG_TRACK_MIN + 1;
+                let cur = self.style.tracking - DIALOG_TRACK_MIN;
+                self.style.tracking = DIALOG_TRACK_MIN + (cur + dir + n) % n;
+            }
+            6 => {
+                let n = DIALOG_LINE_GAP_MAX + 1;
+                self.style.line_gap = (self.style.line_gap + dir + n) % n;
             }
             _ => self.style.underline = !self.style.underline,
         }
     }
 }
 
+/// The value column's text for row i. Kept apart from the canvas builder so the
+/// labels can be checked without a window.
+fn style_value_text(style: &crate::render::text::DialogStyle, i: usize) -> String {
+    use crate::render::text::{DIALOG_COLOR_NAMES, DIALOG_COLORS};
+    match i {
+        0 => format!("{} px", style.size),
+        1 => {
+            if style.edge == 0 {
+                "自动".to_string()
+            } else {
+                format!("{} px", style.edge)
+            }
+        }
+        2 => format!("{} / 255", style.edge_alpha),
+        3 => DIALOG_COLOR_NAMES[(style.color as usize).min(DIALOG_COLORS.len() - 1)].to_string(),
+        4 => {
+            if style.weight == 0 {
+                "字体自带".to_string()
+            } else {
+                format!("+{} px", style.weight)
+            }
+        }
+        5 => {
+            if style.tracking == 0 {
+                "0 px".to_string()
+            } else {
+                format!("{:+} px", style.tracking)
+            }
+        }
+        6 => format!("{} px", style.line_gap),
+        _ => {
+            if style.underline {
+                "开".to_string()
+            } else {
+                "关".to_string()
+            }
+        }
+    }
+}
+
 fn style_panel_hits() -> Vec<(i32, i32, i32, i32, usize)> {
     let mut v = Vec::new();
-    for i in 0..4 {
+    for i in 0..SP_ROWS {
         let y = SP_ROW_Y + i as i32 * SP_ROW_PITCH;
         v.push((SP_ARROW_L, y, SP_ARROW_W, SP_ROW_H, SP_PREV0 + i));
         v.push((SP_ARROW_R, y, SP_ARROW_W, SP_ROW_H, SP_NEXT0 + i));
@@ -2459,8 +3316,8 @@ enum StyleAct {
 
 fn style_input(p: &mut StylePanel, input: sdl2::Input, win: &Sdl) -> StyleAct {
     match input {
-        sdl2::Input::Up => p.sel = (p.sel + 3) % 4,
-        sdl2::Input::Down => p.sel = (p.sel + 1) % 4,
+        sdl2::Input::Up => p.sel = (p.sel + SP_ROWS - 1) % SP_ROWS,
+        sdl2::Input::Down => p.sel = (p.sel + 1) % SP_ROWS,
         sdl2::Input::Right => p.step(p.sel, 1),
         sdl2::Input::Left => p.step(p.sel, -1),
         sdl2::Input::Advance => return StyleAct::Apply(p.style),
@@ -2474,15 +3331,15 @@ fn style_input(p: &mut StylePanel, input: sdl2::Input, win: &Sdl) -> StyleAct {
             p.hover = w;
             if let (Some(w), true) = (w, pressed) {
                 match w {
-                    i if (SP_PREV0..SP_PREV0 + 4).contains(&i) => {
+                    i if (SP_PREV0..SP_PREV0 + SP_ROWS).contains(&i) => {
                         p.sel = i - SP_PREV0;
                         p.step(p.sel, -1);
                     }
-                    i if (SP_NEXT0..SP_NEXT0 + 4).contains(&i) => {
+                    i if (SP_NEXT0..SP_NEXT0 + SP_ROWS).contains(&i) => {
                         p.sel = i - SP_NEXT0;
                         p.step(p.sel, 1);
                     }
-                    i if i < 4 => {
+                    i if i < SP_ROWS => {
                         p.sel = i;
                         p.step(i, 1);
                     }
@@ -2508,22 +3365,10 @@ struct StyleText {
 }
 
 fn build_style_text(p: &StylePanel, ww: i32, wh: i32) -> Option<StyleText> {
-    use crate::render::text::{DIALOG_COLOR_NAMES, DIALOG_COLORS};
     let px = |v: i32| (v * ww) / 1280;
     let py = |v: i32| (v * wh) / 720;
     let w = px(SP_W).max(1) as u32;
     let h = py(SP_H).max(1) as u32;
-    let names = ["字号", "描边", "颜色", "下划线"];
-    let values = [
-        format!("{} px", p.style.size),
-        if p.style.edge == 0 {
-            "自动".to_string()
-        } else {
-            format!("{} px", p.style.edge)
-        },
-        DIALOG_COLOR_NAMES[(p.style.color as usize).min(DIALOG_COLORS.len() - 1)].to_string(),
-        if p.style.underline { "开".to_string() } else { "关".to_string() },
-    ];
     let mut labels = Vec::new();
     labels.push(crate::render::text::Label {
         text: "对话文本样式".to_string(),
@@ -2536,11 +3381,11 @@ fn build_style_text(p: &StylePanel, ww: i32, wh: i32) -> Option<StyleText> {
         rgb: ink::HEAD,
         tracking: 0,
     });
-    for i in 0..4 {
+    for i in 0..SP_ROWS {
         let y = SP_ROW_Y + i as i32 * SP_ROW_PITCH;
         let on = p.sel == i;
         labels.push(crate::render::text::Label {
-            text: names[i].to_string(),
+            text: SP_NAMES[i].to_string(),
             x: px(SP_LABEL_X - SP_X),
             y: py(y - SP_Y),
             w: px(SP_LABEL_W),
@@ -2551,7 +3396,7 @@ fn build_style_text(p: &StylePanel, ww: i32, wh: i32) -> Option<StyleText> {
             tracking: 0,
         });
         labels.push(crate::render::text::Label {
-            text: values[i].clone(),
+            text: style_value_text(&p.style, i),
             x: px(SP_BOX_X - SP_X),
             y: py(y - SP_Y),
             w: px(SP_BOX_W),
@@ -2608,7 +3453,7 @@ fn paint_style_panel(frame: &mut Surface, ww: i32, wh: i32, p: &StylePanel, text
     frame.fill_rect(x, y, 1, h as u32, rim);
     frame.fill_rect(x + w - 1, y, 1, h as u32, rim);
     let dim = [64, 96, 108, 255];
-    for i in 0..4 {
+    for i in 0..SP_ROWS {
         let ry = SP_ROW_Y + i as i32 * SP_ROW_PITCH;
         let on = p.sel == i;
         flat_plate(
@@ -2662,10 +3507,10 @@ fn paint_style_panel(frame: &mut Surface, ww: i32, wh: i32, p: &StylePanel, text
         false,
         dim,
     );
-    // A swatch of the colour next to its name, so the four rows read as one
-    // thing being edited rather than four numbers.
+    // A swatch of the colour next to its name, so the rows read as one thing
+    // being edited rather than eight numbers.
     let sw = DIALOG_COLORS[(p.style.color as usize).min(DIALOG_COLORS.len() - 1)];
-    let sy = SP_ROW_Y + 2 * SP_ROW_PITCH;
+    let sy = SP_ROW_Y + 3 * SP_ROW_PITCH;
     frame.fill_rect(
         px(SP_BOX_X) - px(20),
         py(sy) + py(8),
@@ -2678,6 +3523,31 @@ fn paint_style_panel(frame: &mut Surface, ww: i32, wh: i32, p: &StylePanel, text
     }
 }
 
+/// What the page is allowed to see this frame.
+///
+/// No modal layer is ever open while page input is handled: the page's turn
+/// comes after the list and the style panel processed the same event. Both
+/// flags describe the *start* of the frame, so the event that dismissed a
+/// modal cannot also hit the page underneath it (F-02). `opened` covers the
+/// frame a list appeared: the click that asked for it is gone by then, but a
+/// second click arriving on the opening frame must not pick from it.
+fn page_input(modal: bool, opened: bool, input: sdl2::Input) -> sdl2::Input {
+    if modal || opened {
+        sdl2::Input::None
+    } else {
+        input
+    }
+}
+
+/// Font-only「恢复默认」: the three role ids go back to the default profile.
+/// Every other setting - speed, volumes, window mode, the dialogue style - is
+/// left as the player had it, which is what design §1.2 asks for (F-08).
+fn reset_fonts(st: &mut Settings) {
+    st.font_home = 0;
+    st.font_history = 0;
+    st.font_game = 0;
+}
+
 /// Run the option screen until the player leaves it.
 ///
 /// `mx` is used for the little sample sound behind the volume rows; when no
@@ -2688,14 +3558,28 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
         eprintln!("menu: option screen artwork missing, cannot open");
         return;
     }
-    let mut scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None, font_hover: None, font_sel: 0 };
+    let mut scr = Screen {
+        page: 0,
+        hover: None,
+        help_row: None,
+        nav_hover: None,
+        font_hover: None,
+        font_sel: 0,
+    };
     let mut dirty = false;
     let cn = using_cn_art(dirs);
     let mut menu_text: Option<MenuText> = None;
     let mut shown: Option<(String, Surface)> = None;
     let mut font_rows: Option<FontRows> = None;
+    let mut font_list: Option<FontList> = None;
+    let mut list_text: Option<ListText> = None;
+    let mut previews: PreviewCache = PreviewCache::new();
     let mut style_panel: Option<StylePanel> = None;
     let mut style_text: Option<StyleText> = None;
+    // The page's one-frame request to open a font list. It is not part of
+    // `Screen`: once the list exists it owns the input, so nothing outside
+    // this loop ever needs to know about the request.
+    let mut pending_list: Option<usize> = None;
     // Verification runs: open the style panel without a mouse.
     if std::env::var_os("WA2_FONT_PANEL").is_some() {
         style_panel = Some(StylePanel::new(st));
@@ -2706,8 +3590,14 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
         // Where the click happened, for the slider tracks.
         let mut click_at: (i32, i32) = (0, 0);
         let input = win.poll_input();
-        // The style panel is modal: while it is open it owns the keyboard
-        // and the page underneath stops seeing clicks.
+        // Snapshot the modal state before any layer can close itself: on the
+        // frame a list or panel consumes an event *and* goes away, that event
+        // must not reach the page (F-02).
+        let modal = font_list.is_some() || style_panel.is_some();
+        let mut opened_list = false;
+        // The style panel is modal: while it is open it owns the keyboard and
+        // the page underneath stops seeing clicks. Esc/right-click close the
+        // panel only.
         let mut applied: Option<crate::render::text::DialogStyle> = None;
         if let Some(p) = style_panel.as_mut() {
             match style_input(p, input, win) {
@@ -2719,8 +3609,12 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
         if let Some(s) = applied {
             st.dlg_size = s.size as i32;
             st.dlg_edge = s.edge as i32;
+            st.dlg_edge_alpha = s.edge_alpha as i32;
             st.dlg_color = s.color as i32;
             st.dlg_under = if s.underline { 1 } else { 0 };
+            st.dlg_weight = s.weight as i32;
+            st.dlg_track = s.tracking;
+            st.dlg_line = s.line_gap;
             if let Err(e) = st.save() {
                 eprintln!("settings: could not write {}: {}", Settings::path().display(), e);
             }
@@ -2729,20 +3623,80 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
             menu_text = None;
             font_rows = None;
         }
-        // While the panel is open the page underneath sees nothing at all.
-        match if style_panel.is_some() { sdl2::Input::None } else { input } {
+        // A box that was clicked (or Enter on a font row) opens its list on
+        // the next frame. That frame consumes its input too: the list just
+        // appeared under the cursor and a second click must not pick from it.
+        if style_panel.is_none() {
+            if let Some(row) = pending_list.take() {
+                let current = crate::render::text::FONT_ROLES
+                    .get(row)
+                    .map(|r| crate::render::text::role_id(*r))
+                    .unwrap_or(0);
+                font_list = Some(FontList::new(row, current));
+                list_text = None;
+                opened_list = true;
+            }
+        }
+        // The font list is modal too. The cursor is opened on the role's
+        // *effective* font, so the「当前」marker names what is really drawing.
+        if let Some(l) = font_list.as_mut() {
+            if !opened_list {
+                match list_input(l, input, win) {
+                    ListAct::None => {}
+                    ListAct::Close => font_list = None,
+                    ListAct::Pick(id) => {
+                        let row = l.row;
+                        if pick_role_font(st, row, id) {
+                            dirty = true;
+                            // The page captions were rasterised with the old
+                            // menu font, so they have to be built again.
+                            menu_text = None;
+                            font_rows = None;
+                        }
+                        font_list = None;
+                    }
+                    // Font-only「恢复默认」. The explicit reset drops the font
+                    // layer's caches even when the settings already said 0
+                    // (an environment override can have been in effect).
+                    ListAct::ResetFonts => {
+                        reset_fonts(st);
+                        crate::render::text::reset_role_ids();
+                        dirty = true;
+                        menu_text = None;
+                        font_rows = None;
+                        list_text = None;
+                        font_list = None;
+                    }
+                }
+            }
+        }
+        // While the list or the panel is open (or opened this frame) the page
+        // sees nothing at all.
+        match page_input(modal, opened_list, input) {
             sdl2::Input::Quit => {
                 win.set_fullscreen(st.win_disp == 1);
                 break;
             }
             sdl2::Input::Up => {
-                scr.help_row = Some(match scr.help_row {
-                    Some(r) if r > 0 => r - 1,
-                    _ => 0,
-                });
+                // Page 1: Up/Down move the selected font row, and Enter on a
+                // row opens its list. That is the keyboard path to the history
+                // and UI rows; the help line is driven by the pointer (F-19
+                // m4). Other pages keep the old help-row stepping.
+                if scr.page == 0 {
+                    scr.font_sel = (scr.font_sel + 2) % 3;
+                } else {
+                    scr.help_row = Some(match scr.help_row {
+                        Some(r) if r > 0 => r - 1,
+                        _ => 0,
+                    });
+                }
             }
             sdl2::Input::Down => {
-                scr.help_row = Some(scr.help_row.map(|r| r + 1).unwrap_or(0));
+                if scr.page == 0 {
+                    scr.font_sel = (scr.font_sel + 1) % 3;
+                } else {
+                    scr.help_row = Some(scr.help_row.map(|r| r + 1).unwrap_or(0));
+                }
             }
             sdl2::Input::Choice(k) => {
                 if let Some(p) = (1..=3).contains(&k).then(|| k as usize - 1) {
@@ -2761,9 +3715,10 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
             }
             sdl2::Input::Back | sdl2::Input::Left => activate = Some(Act::Close),
             sdl2::Input::Advance | sdl2::Input::Right => {
-                // Left and right step the font the row cursor is on, which
-                // is what the arrows drawn on screen do.
-                activate = Some(Act::FontStep(scr.font_sel, 1));
+                // Enter on a font row opens its list, like the click does.
+                if scr.page == 0 {
+                    pending_list = Some(scr.font_sel);
+                }
             }
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
@@ -2777,8 +3732,8 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                         click_at = (sx, sy);
                     }
                 }
-                // The font block owns the strip above the artwork rows, so
-                // it is checked on its own.
+                // The font block owns the band inside page 1's 文本设置
+                // group, so it is checked on its own.
                 scr.font_hover = None;
                 if scr.page == 0 {
                     if let Some(which) = font_row_hits()
@@ -2792,11 +3747,16 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                         scr.font_hover = Some(which);
                         if pressed {
                             match font_hit_kind(which) {
-                                Some(FontHit::Row(i)) => scr.font_sel = i,
-                                Some(FontHit::Step(i, d)) =>
-                                    activate = Some(Act::FontStep(i, d)),
-                                Some(FontHit::Style) =>
-                                    activate = Some(Act::FontStyle),
+                                // Clicking the box of the list that is already
+                                // open can never happen: the list owns the
+                                // pointer while it is up, and a click outside
+                                // it closes it (the old "click again to
+                                // collapse" branch was dead code).
+                                Some(FontHit::List(i)) => {
+                                    scr.font_sel = i;
+                                    pending_list = Some(i);
+                                }
+                                Some(FontHit::Style) => activate = Some(Act::FontStyle),
                                 None => {}
                             }
                         }
@@ -2870,15 +3830,6 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                         }
                     }
                 }
-                Act::FontStep(row, d) => {
-                    if step_role_font(st, row, d) {
-                        dirty = true;
-                        // The page captions were rasterised with the old
-                        // menu font, so they have to be built again.
-                        menu_text = None;
-                        font_rows = None;
-                    }
-                }
                 Act::FontStyle => {
                     style_panel = Some(StylePanel::new(st));
                     style_text = None;
@@ -2886,6 +3837,11 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                 Act::Reset => {
                     *st = Settings::default();
                     dirty = true;
+                    // The page captions and the font band were rasterised with
+                    // the old Home font and the old ids: drop both so the
+                    // restored font shows without changing page (F-24).
+                    menu_text = None;
+                    font_rows = None;
                     win.set_fullscreen(false);
                 }
                 Act::Tab(p) => {
@@ -2893,12 +3849,6 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                         eprintln!("menu: tab -> page {}", p);
                     }
                     scr.page = p.min(2);
-                    scr.hover = None;
-                    scr.help_row = None;
-                }
-                Act::Page(d) => {
-                    let p = scr.page as i32 + d;
-                    scr.page = p.clamp(0, 2) as usize;
                     scr.hover = None;
                     scr.help_row = None;
                 }
@@ -2918,16 +3868,28 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
         let (ww, wh) = win.window_size();
         let ww = ww.max(1);
         let wh = wh.max(1);
+        // What the font band and the list should contain, computed before the
+        // frame key so a font-layer change (fallback, environment override)
+        // repaints even when no setting moved.
+        let rows_want = if scr.page == 0 {
+            font_rows_sig(st, &scr, ww, wh)
+        } else {
+            String::new()
+        };
+        let list_key = font_list.as_ref().map(|l| l.key());
+        let open_row = font_list.as_ref().map(|l| l.row);
         let sig = format!(
-            "{:?}|{:?}|{:?}|{:?}|{}|{}|{}",
+            "{:?}|{:?}|{:?}|{:?}|{}|{}|{}{}{}{:?}",
             scr.page,
             scr.hover,
             scr.help_row,
             st,
             ww,
             wh,
-            style_panel.as_ref().map(|p| p.sig()).unwrap_or_default()
-                + &font_rows.as_ref().map(|r| r.sig.clone()).unwrap_or_default()
+            style_panel.as_ref().map(|p| p.sig()).unwrap_or_default(),
+            rows_want,
+            font_list.as_ref().map(|l| l.sig()).unwrap_or_default(),
+            open_row,
         );
         let reuse = shown.as_ref().map(|(k, _)| k == &sig).unwrap_or(false);
         if !reuse {
@@ -2966,14 +3928,23 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
             // screen the page artwork does not provide, so they are drawn
             // last, over everything the artwork owns.
             if scr.page == 0 {
-                let stale = font_rows
-                    .as_ref()
-                    .map(|r| r.sig != font_rows_sig(st, &scr))
-                    .unwrap_or(true);
+                let stale = font_rows.as_ref().map(|r| r.sig != rows_want).unwrap_or(true);
                 if stale {
                     font_rows = build_font_rows(st, &scr, ww, wh);
                 }
-                paint_font_rows(&mut frame, ww, wh, st, &scr, font_rows.as_ref());
+                paint_font_rows(&mut frame, ww, wh, &scr, open_row, font_rows.as_ref());
+            }
+            if let Some(l) = font_list.as_ref() {
+                let pw = (LST_W * ww) / 1280;
+                let ph = (lst_h() * wh) / 720;
+                let stale = list_text
+                    .as_ref()
+                    .map(|t| Some(&t.key) != list_key.as_ref() || t.w as i32 != pw || t.h as i32 != ph)
+                    .unwrap_or(true);
+                if stale {
+                    list_text = build_list_text(l, ww, wh, &mut previews);
+                }
+                paint_font_list(&mut frame, ww, wh, l, list_text.as_ref());
             }
             if let Some(p) = style_panel.as_ref() {
                 let pw = (SP_W * ww) / 1280;
@@ -3060,9 +4031,8 @@ mod tests {
         }
     }
 
-    /// 字体设置 opens the panel; the entry is on the text page and its rect has
-    /// to sit inside the page art.
-    #[test]
+    /// With a baked clean page there is nothing left to wipe at run time: one
+    /// blit replaces the whole caption-scrubbing pass.
     #[test]
     fn clean_page_needs_no_wipe() {
         let dirs = [
@@ -3257,9 +4227,10 @@ mod tests {
             let i = ((y * s.width + x) * 4) as usize;
             s.pixels[i] as u32 + s.pixels[i + 1] as u32 + s.pixels[i + 2] as u32
         };
-        // Page 1 starts with the font block now, so the artwork's own rows sit
-        // FONT_BLOCK_H lower.
-        let top = (PAGE_Y + page_shift(0)) as u32;
+        // The wipe works on the artwork's own coordinates; the rows above the
+        // font block (画面设置 / 画面模式) are not shifted, so the caption to
+        // hunt for is at the top of the page image.
+        let top = PAGE_Y as u32;
         let mut found = None;
         for y in top..(top + 50) {
             for x in (PAGE_X as u32 + 40)..(PAGE_X as u32 + 280) {
@@ -3369,22 +4340,35 @@ mod tests {
         let _ = surf.save_tga("/tmp/wa2btn/menu_selected.tga");
     }
 
+    /// The font block opens *inside* the 文本设置 group: page 1 is cut right
+    /// after the 文本显示速度 row, rows above the cut keep the artwork's
+    /// position, and rows below it move down by the block.
     #[test]
-    /// Page 1 grew for the font block, so every widget the artwork placed on it
-    /// has to move with it - and nothing on pages 2 and 3 may move.
-    #[test]
-    fn only_page_one_moves_for_the_font_block() {
+    fn font_block_sits_inside_the_text_settings_group() {
         for page in 0..3 {
-            let hot = page_hots(page)[0];
-            assert_eq!(page_y(page, hot.y), PAGE_Y + hot.y + page_shift(page));
+            for hot in page_hots(page) {
+                let want = if page == 0 && hot.y >= FONT_SPLIT {
+                    FONT_BLOCK_H
+                } else {
+                    0
+                };
+                assert_eq!(page_y(page, hot.y), PAGE_Y + hot.y + want);
+            }
         }
-        assert!(page_shift(0) >= 3 * FROW_PITCH, "the font block needs room for three rows");
+        // The cut is between the text-speed buttons (72..=117) and the
+        // fast-forward row (118), so the three font rows belong to 文本设置.
+        assert!(FONT_SPLIT >= 117, "split cuts into the text-speed row");
+        assert!(FONT_SPLIT <= 118, "split leaves the text-speed row behind");
+        assert_eq!(FONT_SPLIT + FONT_BLOCK_H, 118 + FONT_BLOCK_H);
+        assert!(FONT_BLOCK_H >= 3 * FROW_PITCH, "the font block needs room for three rows");
+        // The split lands exactly on the 文本快进模式 buttons' top edge.
+        assert!(page_hots(0)
+            .iter()
+            .any(|h| matches!(h.act, Act::Opt("msg_cut_optin", _)) && h.y == FONT_SPLIT));
         assert_eq!(page_shift(1), 0);
         assert_eq!(page_shift(2), 0);
-        // The help line has to stay under the last row of its page, not end up
-        // in the middle of them.
-        let bottom = page_y(0, PAGE_Y as i32 - 4);
-        assert!(help_y(0) > PAGE_Y + 400, "page 1 grew, so the help line has to with it");
+        // The help line follows the lower artwork.
+        assert!(help_y(0) > PAGE_Y + 400, "page 1 grew, so the help line has to go with it");
         assert_eq!(help_y(1), HELP_Y);
     }
 
@@ -3396,35 +4380,72 @@ mod tests {
         for (i, role) in crate::render::text::FONT_ROLES.iter().enumerate() {
             let y = font_row_y(i);
             assert!(y >= 0 && y + FROW_H <= FONT_BLOCK_H, "row {} overflows the band", i);
+            assert!(!role.label().is_empty(), "row {} has no label", i);
         }
         assert_eq!(font_row_y(2) + FROW_H <= FONT_BLOCK_H, true);
+        // The dialogue row is first, and it is the one with the style entry.
         let hits = font_row_hits();
-        assert!(hits.iter().any(|(_, _, _, _, w)| font_hit_kind(*w).map_or(false, |k| matches!(k, FontHit::Style))));
-        // Every row offers both arrows.
+        assert!(hits
+            .iter()
+            .any(|(_, _, _, _, w)| matches!(font_hit_kind(*w), Some(FontHit::Style))));
+        // Every row opens a list.
         for i in 0..3 {
-            let has = |dir: i32| hits.iter().any(|(_, _, _, _, w)| matches!(font_hit_kind(*w), Some(FontHit::Step(r, d)) if r == i && d == dir));
-            assert!(has(-1) && has(1), "row {} is missing an arrow", i);
+            assert!(
+                hits.iter()
+                    .any(|(_, _, _, _, w)| matches!(font_hit_kind(*w), Some(FontHit::List(r)) if r == i)),
+                "row {} has no list trigger",
+                i
+            );
         }
     }
 
-    /// Stepping a font moves only that role, and wraps around the catalogue.
+    /// Picking a font moves only that role, and the list keeps the cursor on
+    /// screen while it scrolls.
     #[test]
-    fn stepping_a_font_moves_only_that_role() {
+    fn picking_a_font_moves_only_that_role() {
         let mut st = Settings::default();
         st.font_game = 0;
         st.font_history = 0;
         st.font_home = 0;
-        assert!(step_role_font(&mut st, 0, 1));
-        assert_ne!(st.font_game, 0, "the game font should have moved");
-        assert_eq!(st.font_history, 0);
-        assert_eq!(st.font_home, 0, "the UI font must not follow the game one");
-        assert!(step_role_font(&mut st, 0, -1));
-        assert_eq!(st.font_game, 0, "stepping back has to return");
-        let last = crate::render::text::font_profile_count() as i32 - 1;
-        st.font_home = last;
-        assert!(step_role_font(&mut st, 2, 1));
+        let Some(real) = crate::render::text::font_catalog()
+            .iter()
+            .find(|p| p.id != 0 && p.path.is_some())
+        else {
+            return
+        };
+        assert!(pick_role_font(&mut st, 0, real.id));
+        assert_eq!(st.font_game, real.id, "the game font should have moved");
+        assert_eq!(st.font_history, 0, "the history font must not follow");
+        assert_eq!(st.font_home, 0, "the UI font must not follow");
+        // An id this machine does not have falls back to the default rather
+        // than to a file that is not there.
+        assert!(pick_role_font(&mut st, 0, 99));
+        assert_eq!(st.font_game, 0);
+        // Out-of-range rows are ignored.
+        assert!(!pick_role_font(&mut st, 9, real.id));
     }
 
+    /// The list scrolls to show the cursor wherever it is in the catalogue.
+    #[test]
+    fn list_keeps_the_cursor_on_screen() {
+        let n = crate::render::text::font_catalog().len();
+        if n == 0 {
+            return;
+        }
+        for i in [0, 1, LST_ROWS - 1, LST_ROWS, n - 1, n] {
+            let mut l = FontList::new(0, 0);
+            l.cur = i;
+            l.clamp();
+            assert!(l.cur < l.top + LST_ROWS.max(1), "cursor {} below the window at {}", i, l.top);
+            assert!(l.cur >= l.top, "cursor {} above the window at {}", i, l.top);
+            assert!(l.top <= n.saturating_sub(LST_ROWS), "scrolled past the end");
+        }
+        // Stepping off the end wraps to the front.
+        let mut l = FontList::new(0, 0);
+        l.cur = n - 1;
+        l.step(1);
+        assert_eq!(l.cur, 0);
+    }
     /// The dialogue style has to survive a round trip through the settings file
     /// and has to be clamped, because it is pixels and an index rather than a
     /// slider level.
@@ -3437,7 +4458,14 @@ mod tests {
         st.set("dlg_under", 1);
         assert_eq!((st.dlg_size, st.dlg_edge, st.dlg_color, st.dlg_under), (30, 2, 5, 1));
         let style = dialog_style(&st);
-        assert_eq!(style, crate::render::text::DialogStyle { size: 30, edge: 2, color: 5, underline: true });
+        let want = crate::render::text::DialogStyle {
+            size: 30,
+            edge: 2,
+            color: 5,
+            underline: true,
+            ..crate::render::text::DialogStyle::default_style()
+        };
+        assert_eq!(style, want);
         // A hand-edited value is stored as it is and ranged where it is read,
         // the same way the slider keys clamp on the way out.
         st.set("dlg_size", 999);
@@ -3476,5 +4504,374 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), cat.len());
+    }
+
+    /// On the frame a modal layer consumes an event and dismisses itself, the
+    /// page underneath must not see that event: that is the F-02 input
+    /// passthrough. The page's turn always comes after the modal's, so the
+    /// decision has to be based on the state the frame started with.
+    #[test]
+    fn modal_frames_never_feed_the_page() {
+        let events = [
+            sdl2::Input::Quit,
+            sdl2::Input::Advance,
+            sdl2::Input::Up,
+            sdl2::Input::Pointer { x: 900, y: 220, pressed: true },
+        ];
+        for input in events {
+            assert_eq!(page_input(false, false, input), input, "an idle frame forwards its event");
+            assert_eq!(page_input(true, false, input), sdl2::Input::None, "modal frame must swallow it");
+            assert_eq!(page_input(false, true, input), sdl2::Input::None, "opening frame must swallow it");
+        }
+    }
+
+    /// The font-only「恢复默认」has to leave every other setting exactly as the
+    /// player had it (design §1.2): text speed, volumes, window mode and the
+    /// dialogue style all stay.
+    #[test]
+    fn font_reset_touches_only_the_three_roles() {
+        let mut st = Settings::default();
+        st.win_disp = 1;
+        st.text_speed = 0;
+        st.auto_speed = 2;
+        st.vol = [3, 4, 5, 6];
+        st.alpha_novel = 4;
+        st.dlg_size = 31;
+        st.dlg_edge = 2;
+        st.dlg_edge_alpha = 200;
+        st.dlg_color = 5;
+        st.dlg_under = 1;
+        st.dlg_weight = 2;
+        st.dlg_track = 3;
+        st.dlg_line = 4;
+        st.font_home = 7;
+        st.font_history = 8;
+        st.font_game = 9;
+        let before = st.clone();
+        reset_fonts(&mut st);
+        assert_eq!((st.font_home, st.font_history, st.font_game), (0, 0, 0));
+        let mut want = before;
+        want.font_home = 0;
+        want.font_history = 0;
+        want.font_game = 0;
+        assert_eq!(st, want, "only the three font ids may change");
+    }
+
+    /// A role that fell back says so, naming the font it really draws with and
+    /// the id the file still asks for (F-06). An id that names no font is not
+    /// the default being missing: the default is what took over.
+    #[test]
+    fn font_row_names_the_requested_and_effective_font() {
+        let default_name = font_name(0);
+        assert!(!default_name.is_empty());
+        // An id that names no catalogue entry must not claim the default font
+        // is missing; the default is what replaced it (F-06).
+        let unknown = font_name(999_999_999);
+        assert!(unknown.contains("原字体未安装"), "{unknown}");
+        assert!(unknown.contains("默认"), "{unknown}");
+        let fallback = font_row_text(4242, 0, Some("could not open the file"));
+        assert!(fallback.contains("已使用备用字体"), "{fallback}");
+        assert!(fallback.contains("4242"), "{fallback}");
+        // The box is ~300 px wide, so the full sentence (with the effective
+        // font's name) is left to the list header.
+        let note = font_fallback_note(4242, 0, Some("could not open the file")).unwrap();
+        assert!(note.contains("已使用备用字体"), "{note}");
+        assert!(note.contains("4242"), "{note}");
+        assert!(note.contains(&default_name), "{note}");
+        assert!(font_fallback_note(0, 0, None).is_none());
+        // A role overridden from the environment draws with the effective font
+        // and reports the id the file asked for.
+        let overridden = font_row_text(4242, 0, None);
+        assert!(overridden.contains("请求 id 4242"), "{overridden}");
+        // With nothing in the way the row simply names the requested font.
+        assert_eq!(font_row_text(0, 0, None), default_name);
+    }
+
+    /// Long family names are clipped to their column with an ellipsis: the
+    /// label canvas does not clip horizontally by itself (F-19 m3).
+    #[test]
+    fn long_captions_are_clipped_within_the_column() {
+        // Clipping needs a font to measure with; every other test in this
+        // module assumes the same, and the default profile is bundled.
+        if crate::render::text::with_ui_font(17, |_| ()).is_none() {
+            return;
+        }
+        let long = "Noto Sans CJK SC DemiLight Extra Long Family Name";
+        let clipped = fit_label(long, 200, 17);
+        assert!(clipped.chars().count() < long.chars().count(), "{clipped}");
+        let w = crate::render::text::with_ui_font(17, |f| f.measure(&clipped)).unwrap_or(0);
+        assert!(w <= 200, "clipped caption is {w} px wide: {clipped}");
+        // A caption that already fits is not touched.
+        assert_eq!(fit_label("Short", 200, 17), "Short");
+    }
+
+    /// Every preview has to fit the column between the names/tag and the
+    /// scrollbar, or it would be clipped mid-sample (F-07).
+    #[test]
+    fn font_previews_fit_the_preview_column() {
+        let avail = LST_PREVIEW_W - 4;
+        assert!(avail > 0);
+        assert!(
+            LST_PREVIEW_X + LST_PREVIEW_W <= LST_W - LST_BAR_W,
+            "the preview column must end before the scrollbar"
+        );
+        let want = 15u32;
+        let min = 9u32;
+        let mut checked = 0;
+        for p in crate::render::text::font_catalog() {
+            let Some(vf) = crate::render::text::open_profile_font(p.id, want) else { continue };
+            let size = fit_sample_size(&vf, LST_SAMPLE, want, min, avail);
+            assert!((min..=want).contains(&size), "{}: preview size {size}", p.name);
+            if !vf.set_size(size) {
+                continue;
+            }
+            let sample = fit_text_with(&vf, LST_SAMPLE, avail);
+            let w = vf.measure(&sample);
+            assert!(w <= avail, "{}: preview {w} px overflows {avail}", p.name);
+            checked += 1;
+        }
+        assert!(checked > 0, "no font could be opened");
+    }
+
+    /// The §11 knobs live in wa2.ini like every other setting, and a
+    /// hand-edited value is ranged where it is read (F-14).
+    #[test]
+    fn style_knobs_round_trip_and_clamp() {
+        let mut st = Settings::default();
+        for (k, v) in [("dlg_edge_alpha", 200), ("dlg_weight", 2), ("dlg_track", 3), ("dlg_line", 5)] {
+            st.set(k, v);
+            assert_eq!(st.get(k), Some(v), "{k} did not round trip");
+        }
+        let s = dialog_style(&st);
+        assert_eq!((s.edge_alpha, s.weight, s.tracking, s.line_gap), (200, 2, 3, 5));
+        st.set("dlg_edge_alpha", 900);
+        st.set("dlg_weight", 99);
+        st.set("dlg_track", -9);
+        st.set("dlg_line", 99);
+        let s = dialog_style(&st);
+        assert_eq!(
+            (s.edge_alpha, s.weight, s.tracking, s.line_gap),
+            (255, 4, -2, 12),
+            "hand-edited values must clamp on read"
+        );
+        for k in ["dlg_edge_alpha", "dlg_weight", "dlg_track", "dlg_line"] {
+            assert!(Settings::all_keys().iter().any(|s| s == k), "{} is not saved", k);
+        }
+    }
+
+    /// Page 1's widgets are drawn 108 px lower; the drag hit test has to use
+    /// the same position as the drawing and the click (F-15).
+    #[test]
+    fn sliders_on_page_one_hit_where_they_are_drawn() {
+        let x = PAGE_X + 531 + 10;
+        assert_eq!(
+            track_at(0, x, page_y(0, 156) + 10).map(|s| s.key),
+            Some("auto_max"),
+            "the shifted track must be found"
+        );
+        assert!(
+            track_at(0, x, PAGE_Y + 156 + 10).is_none(),
+            "the unshifted position is above the track"
+        );
+        // Pages 2 and 3 do not move.
+        assert_eq!(
+            track_at(1, x, page_y(1, 117) + 10).map(|s| s.key),
+            Some("all_vol"),
+            "page 2 tracks must not move"
+        );
+    }
+
+    /// The style panel has to offer all eight §11 knobs, and every row needs
+    /// its box and both arrows inside the panel.
+    #[test]
+    fn style_panel_has_all_eight_rows() {
+        assert_eq!(SP_NAMES.len(), SP_ROWS);
+        assert!(SP_NAMES.iter().all(|n| !n.is_empty()));
+        let hits = style_panel_hits();
+        for i in 0..SP_ROWS {
+            for which in [i, SP_PREV0 + i, SP_NEXT0 + i] {
+                assert!(hits.iter().any(|r| r.4 == which), "widget {which} is missing");
+            }
+        }
+        assert_eq!(SP_NEXT0, SP_ROWS);
+        assert_eq!(SP_RESET, SP_ROWS * 2);
+        assert_eq!(SP_CLOSE, SP_ROWS * 2 + 1);
+        let last_row = SP_ROW_Y + (SP_ROWS as i32 - 1) * SP_ROW_PITCH + SP_ROW_H;
+        assert!(last_row < SP_BTN_Y, "last row {last_row} overlaps the buttons at {SP_BTN_Y}");
+        assert!(SP_BTN_Y + SP_BTN_H <= SP_Y + SP_H, "buttons leave the panel");
+        // Up/Down walk the rows, so the selection has to stay inside them.
+        let mut p = StylePanel::new(&Settings::default());
+        for _ in 0..(SP_ROWS * 2 + 1) {
+            p.sel = (p.sel + 1) % SP_ROWS;
+            assert!(p.sel < SP_ROWS);
+        }
+    }
+
+    /// Stepping the new knobs must stay inside their ranges: size/edge/colour/
+    /// weight/tracking/gap wrap, outline alpha clamps at 0 and 255.
+    #[test]
+    fn style_steps_stay_in_range() {
+        use crate::render::text::{
+            DIALOG_EDGE_ALPHA_MAX, DIALOG_LINE_GAP_MAX, DIALOG_TRACK_MAX, DIALOG_TRACK_MIN,
+            DIALOG_WEIGHT_MAX,
+        };
+        let mut p = StylePanel::new(&Settings::default());
+        // Outline coverage stops at the ends instead of wrapping.
+        p.style.edge_alpha = 10;
+        p.step(2, -1);
+        assert_eq!(p.style.edge_alpha, 0);
+        p.step(2, -1);
+        assert_eq!(p.style.edge_alpha, 0);
+        p.style.edge_alpha = DIALOG_EDGE_ALPHA_MAX - 5;
+        p.step(2, 1);
+        assert_eq!(p.style.edge_alpha, DIALOG_EDGE_ALPHA_MAX);
+        p.step(2, 1);
+        assert_eq!(p.style.edge_alpha, DIALOG_EDGE_ALPHA_MAX);
+        // Tracking wraps through the negative end.
+        p.style.tracking = DIALOG_TRACK_MIN;
+        p.step(5, -1);
+        assert_eq!(p.style.tracking, DIALOG_TRACK_MAX);
+        // Weight and line gap wrap.
+        p.style.weight = DIALOG_WEIGHT_MAX;
+        p.step(4, 1);
+        assert_eq!(p.style.weight, 0);
+        p.style.line_gap = DIALOG_LINE_GAP_MAX;
+        p.step(6, 1);
+        assert_eq!(p.style.line_gap, 0);
+        // Underline is a switch: both arrows toggle it.
+        let under = p.style.underline;
+        p.step(7, 1);
+        assert_ne!(p.style.underline, under);
+        p.step(7, -1);
+        assert_eq!(p.style.underline, under);
+        // The value column names every knob without panicking.
+        for i in 0..SP_ROWS {
+            assert!(!style_value_text(&p.style, i).is_empty(), "row {i} has no value text");
+        }
+    }
+
+    /// The list footer is the font-only reset, and it has to be hittable as
+    /// part of the list rather than as a row of the catalogue (F-08).
+    #[test]
+    fn list_footer_offers_the_font_only_reset() {
+        let l = FontList::new(0, 0);
+        let foot = list_hits(&l)
+            .into_iter()
+            .find(|r| r.4 == LST_RESET)
+            .expect("the list has no reset footer");
+        assert!(foot.1 >= lst_y(0) + LST_HEAD);
+        assert!(foot.1 + foot.3 <= lst_y(0) + lst_h(), "footer overflows the list");
+        assert_eq!(list_at(&l, foot.0 + 4, foot.1 + 4), Some(LST_RESET));
+        // Footer and scrollbar are distinct hits.
+        let bar = list_hits(&l)
+            .into_iter()
+            .find(|r| r.4 == usize::MAX)
+            .expect("the list has no scrollbar");
+        assert_ne!(bar.4, foot.4);
+    }
+
+    /// A role whose font fell back has to invalidate the band and draw a row
+    /// that says so (F-06); the fallback reason is a runtime value, not part of
+    /// the settings, so the cache key has to include it.
+    #[test]
+    fn fallback_state_invalidates_and_draws_the_band() {
+        let st = Settings::default();
+        let scr = Screen {
+            page: 0,
+            hover: None,
+            help_row: None,
+            nav_hover: None,
+            font_hover: None,
+            font_sel: 0,
+        };
+        let before = font_rows_sig(&st, &scr, 1280, 720);
+        let Some(role) = crate::render::text::FONT_ROLES.first().copied() else { return };
+        crate::render::text::set_role_fallback_reason(role, Some("test: cannot open".to_string()));
+        let after = font_rows_sig(&st, &scr, 1280, 720);
+        let rows = build_font_rows(&st, &scr, 1280, 720);
+        crate::render::text::set_role_fallback_reason(role, None);
+        assert_ne!(before, after, "a fallback has to invalidate the font band");
+        if let Some(rows) = rows {
+            let mut frame = Surface::new(W, H, [0, 0, 0, 255]);
+            paint_font_rows(&mut frame, 1280, 720, &scr, None, Some(&rows));
+        }
+    }
+
+    /// The three font-area layers must build and paint without a window: both
+    /// are pure geometry over `Surface`, and a panic here would only show up
+    /// as a crash on the option screen.
+    #[test]
+    fn font_area_layers_paint_without_a_window() {
+        let st = Settings::default();
+        let scr = Screen {
+            page: 0,
+            hover: None,
+            help_row: None,
+            nav_hover: None,
+            font_hover: Some(0),
+            font_sel: 1,
+        };
+        let mut frame = Surface::new(W, H, [0, 0, 0, 255]);
+        let rows = build_font_rows(&st, &scr, 1280, 720);
+        paint_font_rows(&mut frame, 1280, 720, &scr, Some(0), rows.as_ref());
+        let l = FontList::new(0, 0);
+        let mut previews = PreviewCache::new();
+        let text = build_list_text(&l, 1280, 720, &mut previews);
+        paint_font_list(&mut frame, 1280, 720, &l, text.as_ref());
+        let panel = StylePanel::new(&st);
+        let style = build_style_text(&panel, 1280, 720);
+        paint_style_panel(&mut frame, 1280, 720, &panel, style.as_ref());
+        // A smaller window has to scale the canvases with it.
+        let small = build_list_text(&l, 960, 540, &mut previews);
+        if let Some(t) = small {
+            assert_eq!(t.w as i32, (LST_W * 960) / 1280);
+            assert_eq!(t.h as i32, (lst_h() * 540) / 720);
+            let mut small_frame = Surface::new(960, 540, [0, 0, 0, 255]);
+            paint_font_list(&mut small_frame, 960, 540, &l, Some(&t));
+        }
+        if let Some(rows) = build_font_rows(&st, &scr, 960, 540) {
+            assert_eq!(rows.w as i32, (PAGE_W * 960) / 1280);
+            let mut small_frame = Surface::new(960, 540, [0, 0, 0, 255]);
+            paint_font_rows(&mut small_frame, 960, 540, &scr, None, Some(&rows));
+        }
+    }
+
+    /// Dragging the scrollbar maps the pointer position on the track to a
+    /// scroll offset, and both ends of the track reach the ends of the list
+    /// (F-19 m2).
+    #[test]
+    fn scrollbar_drag_maps_the_pointer_to_an_offset() {
+        let n = crate::render::text::font_catalog().len();
+        if n <= LST_ROWS {
+            return;
+        }
+        let last = n - LST_ROWS;
+        let top_y = PAGE_Y + lst_y(0) + LST_HEAD;
+        let track = LST_ROWS as i32 * LST_ROW_H;
+        let mut l = FontList::new(0, 0);
+        scroll_from_bar(&mut l, last, top_y);
+        assert_eq!(l.top, 0, "the top of the track is the top of the list");
+        scroll_from_bar(&mut l, last, top_y + track);
+        assert_eq!(l.top, last, "the bottom of the track is the end of the list");
+        scroll_from_bar(&mut l, last, top_y + track / 2);
+        assert!(l.top > 0 && l.top < last, "the middle of the track is in between");
+    }
+
+    /// The preview bitmaps are cached by (id, size, column width), so a scroll
+    /// or a rebuild does not reopen another eleven FreeType faces.
+    #[test]
+    fn preview_cache_keeps_bitmaps_across_rebuilds() {
+        let mut previews: PreviewCache = PreviewCache::new();
+        let l = FontList::new(0, 0);
+        // The font catalogue is never empty (id 0 exists even with no font),
+        // but the UI font itself can be unavailable and then there is nothing
+        // to cache.
+        if build_list_text(&l, 1280, 720, &mut previews).is_none() {
+            return;
+        }
+        let first = previews.len();
+        assert!(first > 0, "no preview was cached");
+        let _ = build_list_text(&l, 1280, 720, &mut previews);
+        assert_eq!(previews.len(), first, "rebuilding reopened and recached previews");
     }
 }
