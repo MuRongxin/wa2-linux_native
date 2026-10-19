@@ -747,7 +747,7 @@ fn decode_scale_for_window(win: &sdl2::Sdl) -> u32 {
         ScaleMode::Forced(n) => n,
         ScaleMode::Window => render_scale_for(w, h),
         ScaleMode::Default => {
-            if win.is_fullscreen() {
+            if win.is_fullscreen() || win.is_maximized() {
                 8
             } else {
                 render_scale_for(w, h).max(4)
@@ -778,7 +778,7 @@ fn set_render_art_scale(win: &sdl2::Sdl) {
             ScaleMode::Forced(n) => format!("forced {}x by WA2_RENDER_SCALE", n),
             ScaleMode::Window => "auto: window-sized decoding".to_string(),
             ScaleMode::Default => {
-                "default: windowed 4x / fullscreen 8x; WA2_RENDER_SCALE=auto for window-sized decoding"
+                "default: windowed 4x / fullscreen or maximized 8x; WA2_RENDER_SCALE=auto for window-sized decoding"
                     .to_string()
             }
         };
@@ -2893,6 +2893,23 @@ fn run_game_at(
                             win.present(&frame);
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
+                                // F11: toggle 画面模式 without opening the option
+                                // screen. The decode scale follows on the next
+                                // loop iteration.
+                                sdl2::Input::Fullscreen => {
+                                    let on = settings.win_disp != 1;
+                                    settings.win_disp = if on { 1 } else { 0 };
+                                    win.set_fullscreen(on);
+                                    set_render_art_scale(win);
+                                    if let Err(e) = settings.save() {
+                                        eprintln!("settings: save failed: {e}");
+                                    }
+                                    eprintln!(
+                                        "display: {} (decode {}x)",
+                                        if on { "fullscreen" } else { "windowed" },
+                                        render_art_scale()
+                                    );
+                                }
                                 sdl2::Input::RightClick => {
                                     match settings.r_click {
                                         1 => {

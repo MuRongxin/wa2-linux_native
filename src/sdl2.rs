@@ -51,7 +51,9 @@ const SDLK_DOWN: i32 = 81;
 const SDLK_LEFT: i32 = 80;
 const SDLK_UP: i32 = 82;
 const SDLK_PAGEUP: i32 = 75;
-const SDLK_F11: i32 = 95;
+// SDL scancode (USB HID usage): F1 = 58 ... F11 = 68. 95 was the X11
+// keycode, which is what `xmodmap` shows, not what SDL puts in the event.
+const SDLK_F11: i32 = 68;
 const SDLK_1: i32 = 30;
 const SDLK_2: i32 = 31;
 const SDLK_3: i32 = 32;
@@ -468,6 +470,20 @@ pub fn set_fullscreen(&self, on: bool) {
 /// True between `set_fullscreen(true)` and the next windowed request.
 pub fn is_fullscreen(&self) -> bool {
     IS_FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// True while the window manager has the window maximized. The title-bar
+/// maximize button is the quick way to a screen-filling window, and the art
+/// decoder treats it like fullscreen (8x master) so that path gets the same
+/// picture quality.
+pub fn is_maximized(&self) -> bool {
+    /// SDL_WINDOW_MAXIMIZED
+    const SDL_WINDOW_MAXIMIZED: u32 = 0x0000_0080;
+    let Some(f) = self.fn_ptr::<unsafe extern "C" fn(*mut c_void) -> u32>("SDL_GetWindowFlags")
+    else {
+        return false;
+    };
+    unsafe { f(self.window) & SDL_WINDOW_MAXIMIZED != 0 }
 }
 
 fn remember_windowed(&self) {
