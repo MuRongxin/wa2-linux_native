@@ -76,25 +76,53 @@ impl Data {
                 return None;
             }
         };
-        let requested_scale = std::env::var("WA2_ART_SCALE")
+        // Which source tree to read.
+        //
+        // An explicit WA2_ART_SCALE wins. Otherwise match the tree to the
+        // decode scale: the renderer decodes at 4x by default, so reading the
+        // prepared 4x WebP tree produces the same 5120x2880 pixels in ~0.4 s
+        // where decoding the 8x tree down to 4x costs ~1.6 s. Only a forced
+        // WA2_RENDER_SCALE=8 (5K+ canvas) asks for the 8x source.
+        let explicit_scale = std::env::var("WA2_ART_SCALE")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&v| matches!(v, 1 | 2 | 4 | 8))
-            // The 8x WebP trees are the default source. A checkout that only
-            // has the original TGA tree falls back to 1x below, so running from
-            // the bare binary behaves the same as ./run.sh.
-            .unwrap_or(8);
-        let art_scale = if requested_scale > 1 {
-            let suffix = format!("{}x", requested_scale);
-            let ready = root.join(format!("bg_{}", suffix)).is_dir()
+            .filter(|&v| matches!(v, 1 | 2 | 4 | 8));
+        let requested_scale = explicit_scale.unwrap_or_else(|| {
+            let wants_8x = std::env::var("WA2_RENDER_SCALE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .map(|v| v >= 8)
+                .unwrap_or(false);
+            if wants_8x { 8 } else { 4 }
+        });
+        let tree_ready = |scale: u32| {
+            let suffix = format!("{}x", scale);
+            root.join(format!("bg_{}", suffix)).is_dir()
                 && root.join(format!("sprite_{}", suffix)).is_dir()
-                && (!cn || root.join(format!("bg_cn_{}", suffix)).is_dir());
-            if ready { requested_scale } else {
-                eprintln!("art: WA2_ART_SCALE={} requested but sibling tree is incomplete; using original art", requested_scale);
-                1
-            }
-        } else {
+                && (!cn || root.join(format!("bg_cn_{}", suffix)).is_dir())
+        };
+        let art_scale = if requested_scale == 1 {
             1
+        } else {
+            // Prefer the requested tree, then the next larger (better pixels
+            // than nothing), then smaller. An incomplete tree must not drop the
+            // run all the way back to 1x when another scaled tree is complete.
+            let mut order = vec![requested_scale];
+            for s in [8u32, 4, 2] {
+                if !order.contains(&s) {
+                    order.push(s);
+                }
+            }
+            match order.into_iter().find(|&s| tree_ready(s)) {
+                Some(s) => s,
+                None => {
+                    eprintln!(
+                        "art: no complete scaled sibling tree for {}x; using the original art",
+                        requested_scale
+                    );
+                    1
+                }
+            }
         };
         if art_scale > 1 {
             // Publish the effective source scale so diagnostics (the startup

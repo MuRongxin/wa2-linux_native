@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Pre-render logical-size UI sheets from the 8x WebP trees.
+"""Pre-render logical-size UI sheets from the scaled WebP trees.
 
 UI code (title, settings, save/load, command bar, music mode) draws in the
-1280x720 logical coordinate space, so a 8x sheet such as `sys_00000`
-(9984x1664) is decoded at ~4 s only to be reduced to 1248x208 immediately.
+1280x720 logical coordinate space, so a high-resolution sheet such as
+`sys_00000` (9984x1664) is decoded and then immediately reduced to 1248x208.
 This tool renders that logical image once into `data/cache/ui/<tree>/<stem>.tga`;
 `codec::image::decode_ui_file` prefers the cached TGA and falls back to
 decoding the WebP when the file is missing.
+
+Both the 8x master tree and the 4x tree are covered: the engine reads the 4x
+tree by default, so it needs a cache under `cache/ui/bg_4x` / `bg_cn_4x`.
 
 Usage:
     python3 tools/build_ui_cache.py            # build missing sheets
@@ -26,6 +29,8 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent / "data"
 TREES = ("bg", "bg_cn")
+# Scale trees to pre-render, highest first. Missing trees are skipped.
+SCALES = (8, 4)
 
 
 def is_ui_asset(stem: str) -> bool:
@@ -89,23 +94,26 @@ def render(task: tuple[Path, Path, str, int]) -> tuple[str, str]:
 
 def task_tree(path: Path) -> str:
     name = path.parent.name.lower()
-    return name[:-3] if name.endswith("_8x") else name
+    for suffix in ("_8x", "_4x", "_2x"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
 def collect(force: bool) -> list[tuple[Path, Path, str, int]]:
     tasks: list[tuple[Path, Path, str, int]] = []
     for tree in TREES:
-        hires = ROOT / f"{tree}_8x"
-        if not hires.is_dir():
-            continue
-        tree_scale = 8
-        for path in sorted(hires.glob("*.webp")):
-            if not is_ui_asset(path.stem):
+        for tree_scale in SCALES:
+            hires = ROOT / f"{tree}_{tree_scale}x"
+            if not hires.is_dir():
                 continue
-            dst = ROOT / "cache" / "ui" / f"{tree}_8x" / f"{path.stem}.tga"
-            if force:
-                dst.unlink(missing_ok=True)
-            tasks.append((path, dst, path.stem, tree_scale))
+            for path in sorted(hires.glob("*.webp")):
+                if not is_ui_asset(path.stem):
+                    continue
+                dst = ROOT / "cache" / "ui" / f"{tree}_{tree_scale}x" / f"{path.stem}.tga"
+                if force:
+                    dst.unlink(missing_ok=True)
+                tasks.append((path, dst, path.stem, tree_scale))
     return tasks
 
 

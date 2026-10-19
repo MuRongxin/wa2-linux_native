@@ -6,11 +6,10 @@
 #
 # 无参数:进入标题画面;带场景号:直接跳转该场景(调试用,如 ./run.sh 2003)
 cd "$(dirname "$0")" || exit 1
-# 高清素材链路：8x WebP 是唯一资源来源（data/bg_8x、data/sprite_8x）。
-# 窗口大小决定实际解码倍率（WA2_RENDER_SCALE）；UI 贴图加载时归一化到 1280x720
-# 逻辑尺寸。data/cache/ 下的 UI/时间线缓存由 tools/ 脚本生成，可加速加载。
-# 加载最快：WA2_ART_SCALE=2 ./run.sh（用 2x TGA 代理树）；原图：WA2_ART_SCALE=1。
-export WA2_ART_SCALE="${WA2_ART_SCALE:-8}"
+# 高清素材链路：引擎默认读 4x WebP 树（data/bg_4x、data/sprite_4x），解码也是 4x，
+# 图源倍率与解码倍率对齐，首次解码约 0.4s。8x 树是母版，只在
+# WA2_RENDER_SCALE=8（5K+ 画布）或显式 WA2_ART_SCALE=8 时读取。
+# 想用母版 8x 源：WA2_ART_SCALE=8 ./run.sh；2x TGA 代理：WA2_ART_SCALE=2；原图：1。
 BIN=./target/release/wa2-native
 [ -x "$BIN" ] || BIN=./target/debug/wa2-native
 if [ $# -eq 0 ]; then
