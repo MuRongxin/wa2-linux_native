@@ -5448,6 +5448,16 @@ fn run_special(
 
     let bar = load_background(bg_dirs, "T0101.tga");
     let logo = load_background(bg_dirs, "T0011.tga");
+    // The original special page draws the title street plate (T0000) behind
+    // the menu with its source scroll pinned to the bottom clamp (136 of the
+    // 856px tall plate), plus the same falling snow as the title. WA2.exe sets
+    // [0xa72f00] to the 136.0 constant and draws image 1 full-screen before
+    // the menu rows (see the special-page draw function at 0x427df0).
+    let street = load_background(bg_dirs, "T0000.tga");
+    let weather = load_background(bg_dirs, "weather.tga");
+    let mut snow = TitleSnow::new();
+    let mut street_scaled: Option<(i32, i32, render::Surface)> = None;
+    let mut snow_tick = std::time::Instant::now();
     let items: [&str; 6] = if cn {
         ["电子小说", "CG模式", "时间线", "音乐模式", "声优访谈", "返回"]
     } else {
@@ -5518,6 +5528,12 @@ fn run_special(
         let wh = wh.max(1);
         let target = (Y0 + sel as i32 * PITCH) as f32;
         slide_bar(&mut bar_y, target, wh);
+        let now = std::time::Instant::now();
+        let dt = now.saturating_duration_since(snow_tick).as_secs_f32().min(0.05);
+        snow_tick = now;
+        if weather.is_some() {
+            snow.step(dt);
+        }
 
         // T0100 draws each label about 29px tall inside the 40px row.
         let ipx = layout_font_px(32, wh);
@@ -5537,7 +5553,11 @@ fn run_special(
             wh,
             0,
             || {
-                let mut s = render::Surface::new(W, H, BACKDROP);
+                // The street plate is composited under this surface; with no
+                // street the plate itself is the navy field the logo was
+                // authored on.
+                let plate_bg = if street.is_some() { [0, 0, 0, 0] } else { BACKDROP };
+                let mut s = render::Surface::new(W, H, plate_bg);
                 if let Some(ref lg) = logo {
                     s.blit(lg, (W as i32 - lg.width as i32) / 2, 24);
                 }
@@ -5548,7 +5568,26 @@ fn run_special(
             ITEM_H as u32,
         );
         let fitted = fitted.as_ref().unwrap();
-        let mut frame = clone_surf(&fitted.plate);
+        let mut frame = if let Some(ref img) = street {
+            let rebuild = match street_scaled.as_ref() {
+                Some((sw, sh, _)) => *sw != ww || *sh != wh,
+                None => true,
+            };
+            if rebuild {
+                let dh = ((img.height as i64 * wh as i64) / H as i64).max(wh as i64) as u32;
+                street_scaled = Some((ww, wh, surface_from_tga(img).scaled_to(ww as u32, dh)));
+            }
+            let scaled = &street_scaled.as_ref().unwrap().2;
+            let max_y = (scaled.height as i32 - wh).max(0);
+            // 136 layout pixels is the clamped bottom of T0000 (856 - 720).
+            let sy = ((136 * wh) / 720).clamp(0, max_y);
+            let mut frame = render::Surface::new(ww as u32, wh as u32, BACKDROP);
+            frame.copy_rows_from(scaled, sy);
+            frame.blit_surface(&fitted.plate, 0, 0);
+            frame
+        } else {
+            clone_surf(&fitted.plate)
+        };
         paint_bar(&mut frame, fitted, 0, bar_y, X0);
         if let Some((w, h, rgba)) = head.as_ref() {
             let shadow = ((2 * wh) / 720).max(1);
@@ -5564,6 +5603,10 @@ fn run_special(
             );
         }
         draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
+        if let Some(ref sheet) = weather {
+            snow.ensure(ww, wh, sheet);
+            snow.paint(&mut frame, wh);
+        }
         win.present(&frame);
         win.delay(16);
     }
@@ -6579,13 +6622,6 @@ mod bg_index_tests {
 
 #[cfg(test)]
 mod choice_ui_tests {
-    #[test]
-    fn dbg_layout() {
-        let rows = choice_row_layout(2, 1080);
-        eprintln!("2@1080 -> {:?}", rows);
-        let rows2 = choice_row_layout(2, 720);
-        eprintln!("2@720  -> {:?}", rows2);
-    }
     use super::{choice_row_centers, choice_row_layout};
 
     #[test]
