@@ -109,7 +109,7 @@ fn main() {
             let out = args[2].clone();
             let w: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1280);
             let h: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(720);
-            let choice = render::text::font_choice();
+            let choice = render::text::font_choice_for(render::text::FontRole::Game);
             let mut vf = match render::text::VectorFont::open_face(&choice.path, render::DIALOG_FONT_720, choice.face) {
                 Some(f) => f,
                 None => { eprintln!("font-sample: cannot open {} (face {})", choice.path, choice.face); return; }
@@ -313,7 +313,7 @@ fn main() {
                 loop {
                     match win.poll_input() {
                         sdl2::Input::Advance | sdl2::Input::Right => { if idx < n - 1 { idx += 1; } break; }
-                        sdl2::Input::Back => { if idx > 0 { idx -= 1; } break; }
+                        sdl2::Input::Back | sdl2::Input::Left => { if idx > 0 { idx -= 1; } break; }
                         sdl2::Input::Up => { if idx > 0 { idx -= 1; } break; }
                         sdl2::Input::Down => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Quit => return,
@@ -422,7 +422,7 @@ fn main() {
                 loop {
                     match win.poll_input() {
                         sdl2::Input::Advance | sdl2::Input::Right => { if idx < n - 1 { idx += 1; } break; }
-                        sdl2::Input::Back => { if idx > 0 { idx -= 1; } break; }
+                        sdl2::Input::Back | sdl2::Input::Left => { if idx > 0 { idx -= 1; } break; }
                         sdl2::Input::Up => { if idx > 0 { idx -= 1; } break; }
                         sdl2::Input::Down => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Quit => return,
@@ -1088,20 +1088,38 @@ const SPRITE_DRAW_ORDER: [usize; SPRITE_SLOTS] = [7, 8, 9, 10, 3, 4, 5, 6, 0, 1,
 
 /// Background file index for the ACT146/147 ids.
 ///
-/// Files are named `b{id:04}{variant:02}.tga` (id 1004 variant 0 -> b100400.tga,
-/// id 1014 variant 10 -> b101410.tga). A few ids only ship one variant
-/// (b104402.tga with no b104400.tga), so each id keeps a fallback entry, with
-/// the `00` variant preferred.
+/// Files are named `b{id:04}{variant:02}.{tga,webp}` (id 1004 variant 0 ->
+/// b100400, id 1014 variant 10 -> b101410). Not every variant was shipped:
+/// for id 2067 only b206702 / b206712 exist, while the scripts ask for
+/// variant 0 or 1. The fallback must be another *background* variant of the
+/// same id.
+///
+/// A `v{id:04}{variant:02}` file is an event CG whose six digits happen to
+/// equal a background id (v206700 is an event CG, b206702 is the concert
+/// hall). It may stand in for a background only when no `b*` was shipped for
+/// that id at all. The previous index let the readdir order decide between
+/// the two, so some backgrounds showed an unrelated event CG.
 struct BgIndex {
     by_name: std::collections::HashMap<String, String>,
-    by_id: std::collections::HashMap<u32, String>,
+    /// Background id -> its `b*` files, sorted lowest variant first.
+    bgs: std::collections::HashMap<u32, Vec<(u32, String)>>,
+    /// Background id -> `v*` event-CG stand-ins, used only when `bgs` has no
+    /// entry for the id.
+    cgs: std::collections::HashMap<u32, Vec<(u32, String)>>,
 }
 
 impl BgIndex {
     fn build(dirs: &[&std::path::Path]) -> BgIndex {
-        use std::collections::hash_map::Entry;
-        let mut by_name = std::collections::HashMap::new();
-        let mut by_id = std::collections::HashMap::new();
+        let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut bgs: std::collections::HashMap<u32, Vec<(u32, String)>> = std::collections::HashMap::new();
+        let mut cgs: std::collections::HashMap<u32, Vec<(u32, String)>> = std::collections::HashMap::new();
+        // The first directory that has a file wins, like the search order the
+        // loaders use. Within one variant, keep the first file seen; the
+        // per-id list is sorted afterwards so the fallback never depends on
+        // the order of readdir (that used to make the chart differ between
+        // filesystems).
+        let mut seen_b: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let mut seen_v: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         for dir in dirs {
             let rd = match std::fs::read_dir(dir) {
                 Ok(r) => r,
@@ -1119,54 +1137,67 @@ impl BgIndex {
                     continue;
                 }
                 let ext_len = if lower.ends_with(".webp") { 5 } else { 4 };
-                let digits = lower[1..lower.len() - ext_len].to_string();
+                let digits = &lower[1..lower.len() - ext_len];
                 if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_digit()) {
                     continue;
                 }
-                let id: u32 = digits[..4].parse().unwrap_or(0);
-                let incoming_b = lower.starts_with('b');
+                let Ok(id) = digits[..4].parse::<u32>() else { continue };
+                let Ok(variant) = digits[4..].parse::<u32>() else { continue };
+                let is_background = lower.starts_with('b');
                 by_name.entry(lower).or_insert_with(|| name.clone());
-                match by_id.entry(id) {
-                    Entry::Vacant(v) => {
-                        v.insert(name.clone());
+                if is_background {
+                    if seen_b.insert((id, variant)) {
+                        bgs.entry(id).or_default().push((variant, name));
                     }
-                    Entry::Occupied(mut o) => {
-                        let held_b = o
-                            .get()
-                            .as_bytes()
-                            .first()
-                            .is_some_and(|c| *c == b'b' || *c == b'B');
-                        // `b*` is the background. A `v*` CG fills the id only
-                        // when no background file was shipped for it.
-                        if incoming_b && (digits.ends_with("00") || !held_b) {
-                            o.insert(name.clone());
-                        } else if !incoming_b && !held_b && digits.ends_with("00") {
-                            o.insert(name.clone());
-                        }
-                    }
+                } else if seen_v.insert((id, variant)) {
+                    cgs.entry(id).or_default().push((variant, name));
                 }
             }
         }
-        BgIndex { by_name, by_id }
+        for list in bgs.values_mut().chain(cgs.values_mut()) {
+            list.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        BgIndex { by_name, bgs, cgs }
     }
 
-    /// `b{id:04}{variant:02}.tga`, then the same number as a CG (`v*`),
-    /// else any file of that id.
+    /// Resolve one ACT146/147 background request.
+    ///
+    /// 1. exact `b{id}{variant}`;
+    /// 2. another `b` variant of the same id (lowest variant, deterministic);
+    /// 3. exact `v{id}{variant}` - an event CG standing in for a background
+    ///    that was never shipped as `b*`;
+    /// 4. another `v` variant of the id.
     ///
     /// Event CGs (ACT148) do not use this. Their file is `v{id*10+variant:06}`.
     fn resolve(&self, id: i64, variant: u32) -> Option<String> {
         if id <= 0 {
             return None;
         }
-        for prefix in ["b", "v"] {
+        let id = id as u32;
+        let exact_b = |v: u32| -> Option<String> {
             for ext in [".webp", ".tga"] {
-                let exact = format!("{}{:04}{:02}{}", prefix, id, variant, ext);
-                if let Some(n) = self.by_name.get(&exact) {
+                let name = format!("b{id:04}{v:02}{ext}");
+                if let Some(n) = self.by_name.get(&name) {
                     return Some(n.clone());
                 }
             }
+            None
+        };
+        if let Some(name) = exact_b(variant) {
+            return Some(name);
         }
-        self.by_id.get(&(id as u32)).cloned()
+        if let Some(list) = self.bgs.get(&id) {
+            // A variant that was not shipped keeps its background family: the
+            // lowest variant stands in, so b206702 wins over the v206700 CG.
+            return list.first().map(|(_, n)| n.clone());
+        }
+        for ext in [".webp", ".tga"] {
+            let name = format!("v{id:04}{variant:02}{ext}");
+            if let Some(n) = self.by_name.get(&name) {
+                return Some(n.clone());
+            }
+        }
+        self.cgs.get(&id).and_then(|l| l.first()).map(|(_, n)| n.clone())
     }
 }
 
@@ -1502,14 +1533,17 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(win: &sdl2::Sdl, s: &Session) -> Runtime {
-        let choice = render::text::font_choice();
-        let mut vfont = if s.cn {
-            render::text::VectorFont::open_face(&choice.path, render::DIALOG_FONT_720, choice.face)
+        // The dialogue font is the Game role: the settings page can move it
+        // without touching the menu or the history. The saved ids have to be
+        // in force first - a run started straight from the command line
+        // reaches this point without ever loading the settings.
+        menu::Settings::load().apply_text();
+        let vfont = if s.cn {
+            render::text::open_role_font(render::text::FontRole::Game, render::DIALOG_FONT_720)
         } else {
             None
         };
         if let Some(vf) = vfont.as_ref() {
-            render::text::apply_choice(vf, &choice);
             // Which face of the .ttc actually opened, and with what knobs: the
             // file name alone does not say, and a .ttc defaults to its first
             // (Japanese) face.
@@ -2965,6 +2999,10 @@ fn run_game_at(
                                             menu::run(win, &dirs, &mut st, mixer.as_ref());
                                             settings = menu::Settings::load();
                                             menu::apply(&settings, mixer.as_ref());
+                                            // The font may have changed too, and
+                                            // it must not wait for a trip back
+                                            // to the title screen.
+                                            refresh_dialog_font(s.cn, vfont.as_mut());
                                             // 「画面模式」 must take effect without a
                                             // trip back to the title screen.
                                             win.set_fullscreen(settings.win_disp == 1);
@@ -3596,7 +3634,7 @@ fn show_toast(
             sdl2::Input::Pointer { pressed: true, .. }
             | sdl2::Input::Advance
             | sdl2::Input::Right
-            | sdl2::Input::Back => return true,
+            | sdl2::Input::Back | sdl2::Input::Left => return true,
             _ => win.delay(16),
         }
     }
@@ -3633,7 +3671,7 @@ fn ask_yes_no(
         win.present(&surf);
         match win.poll_input() {
             sdl2::Input::Quit => return None,
-            sdl2::Input::Back | sdl2::Input::RightClick => return Some(false),
+            sdl2::Input::Back | sdl2::Input::Left | sdl2::Input::RightClick => return Some(false),
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, 1280, 720);
                 mx = sx;
@@ -3660,8 +3698,9 @@ fn handle_cmd(
     win: &mut sdl2::Sdl,
     font: &render::Font,
     // The history screen is the last modal that still drew from the atlas;
-    // the vector font rides along so it matches the dialog it replays.
-    vfont: Option<&mut render::text::VectorFont>,
+    // the vector font rides along so it matches the dialog it replays. It is
+    // the Game role - the History role is opened by the backlog itself.
+    mut vfont: Option<&mut render::text::VectorFont>,
     s: &Session,
     settings: &mut menu::Settings,
     mixer: Option<&audio::Mixer>,
@@ -3752,16 +3791,40 @@ fn handle_cmd(
             menu::run(win, &s.bg_dirs(), &mut st, mixer);
             *settings = menu::Settings::load();
             menu::apply(settings, mixer);
+            refresh_dialog_font(s.cn, vfont.as_deref_mut());
             win.set_fullscreen(settings.win_disp == 1);
             set_render_art_scale(win);
             CmdOutcome::Stay
         }
         cmdbar::Cmd::Backlog => {
-            show_backlog(win, font, vfont, backlog, frame, &s.bg_dirs());
+            // The history draws with its own role, opened here so a change
+            // made in the settings screen is in force the next time it is
+            // opened and no glyph of the old font can be left in it.
+            let hf = if s.cn {
+                render::text::open_role_font(render::text::FontRole::History, render::DIALOG_FONT_720)
+            } else {
+                None
+            };
+            show_backlog(win, font, hf, backlog, frame, &s.bg_dirs());
             CmdOutcome::Stay
         }
         // toggles are handled by the caller
         _ => CmdOutcome::Stay,
+    }
+}
+
+/// Replace the dialogue font with the Game role's current choice.
+///
+/// Called after the option screen closes. A new instance starts with an empty
+/// glyph cache, which is the point: the next line is drawn entirely in the new
+/// face instead of mixing cached glyphs of the old one into it.
+fn refresh_dialog_font(cn: bool, vfont: Option<&mut render::text::VectorFont>) {
+    if !cn {
+        return;
+    }
+    let Some(dst) = vfont else { return };
+    if let Some(nf) = render::text::open_role_font(render::text::FontRole::Game, render::DIALOG_FONT_720) {
+        *dst = nf;
     }
 }
 
@@ -3916,7 +3979,8 @@ fn paint_backlog(
 fn show_backlog(
     win: &mut sdl2::Sdl,
     font: &render::Font,
-    mut vf: Option<&mut render::text::VectorFont>,
+    // Owned by the screen: the History role's font for this visit.
+    mut vf: Option<render::text::VectorFont>,
     lines: &[String],
     scene: &render::Surface,
     dirs: &[&std::path::Path],
@@ -3930,7 +3994,7 @@ fn show_backlog(
     const BAR_Y: i32 = 40;
     const BAR_H: i32 = 640;
     const COL_W: i32 = 32;
-    let rows = backlog_rows(lines, vf.as_deref());
+    let rows = backlog_rows(lines, vf.as_ref());
     let per_page = ((TEXT_BOTTOM - TEXT_Y) / LINE_H) as usize;
     let total = rows.len();
     let max_top = total.saturating_sub(per_page);
@@ -3946,7 +4010,7 @@ fn show_backlog(
         let surf = paint_backlog(
             scene,
             font,
-            vf.as_deref_mut(),
+            vf.as_mut(),
             &rows,
             top,
             per_page,
@@ -3957,7 +4021,7 @@ fn show_backlog(
         );
         win.present(&surf);
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::Back | sdl2::Input::RightClick | sdl2::Input::Advance | sdl2::Input::Right => {
+            sdl2::Input::Quit | sdl2::Input::Back | sdl2::Input::Left | sdl2::Input::RightClick | sdl2::Input::Advance | sdl2::Input::Right => {
                 return;
             }
             sdl2::Input::Up => top = top.saturating_sub(1),
@@ -4856,7 +4920,7 @@ fn browse_cg(win: &mut sdl2::Sdl, font: &render::Font, dirs: &[&std::path::Path]
         }
         win.present(&surf);
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => return,
             sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Down => i = (i + 1) % names.len(),
             sdl2::Input::Up => i = (i + names.len() - 1) % names.len(),
             sdl2::Input::Pointer { x, y, pressed: true } => {
@@ -5224,7 +5288,7 @@ fn run_special(
             return pick(sel);
         }
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => {
                 return SpecialPick::Back;
             }
             sdl2::Input::Up => {
@@ -5360,7 +5424,7 @@ fn run_music(
 
     loop {
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => break,
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => break,
             sdl2::Input::Up => {
                 if !tracks.is_empty() {
                     selected = (selected + tracks.len() - 1) % tracks.len();
@@ -6264,3 +6328,56 @@ mod backlog_paint {
         let _ = surf.save_tga("/tmp/wa2btn/confirm.tga");
     }
 }
+
+#[cfg(test)]
+mod bg_index_tests {
+    use super::BgIndex;
+    use std::path::PathBuf;
+
+    struct TempTree(PathBuf);
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tree(tag: &str, files: &[&str]) -> TempTree {
+        let dir = std::env::temp_dir().join(format!("wa2-bgidx-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        TempTree(dir)
+    }
+
+    #[test]
+    fn a_missing_variant_falls_back_to_the_background_family() {
+        // 3005 asks for id 2067 variant 0; only b206702/b206712 were shipped,
+        // and v206700 is an unrelated event CG.
+        let d = tree("family", &["b206702.tga", "b206712.tga", "v206700.tga", "tv206700.tga"]);
+        let index = BgIndex::build(&[d.0.as_path()]);
+        assert_eq!(index.resolve(2067, 0).as_deref(), Some("b206702.tga"));
+        assert_eq!(index.resolve(2067, 1).as_deref(), Some("b206702.tga"));
+    }
+
+    #[test]
+    fn an_event_cg_stands_in_only_when_no_background_was_shipped() {
+        let d = tree("cgonly", &["v100100.tga", "v100101.tga"]);
+        let index = BgIndex::build(&[d.0.as_path()]);
+        assert_eq!(index.resolve(1001, 0).as_deref(), Some("v100100.tga"));
+        assert_eq!(index.resolve(1001, 1).as_deref(), Some("v100101.tga"));
+        let d2 = tree("cgonly2", &["v100100.tga"]);
+        let index2 = BgIndex::build(&[d2.0.as_path()]);
+        assert_eq!(index2.resolve(1001, 5).as_deref(), Some("v100100.tga"));
+    }
+
+    #[test]
+    fn the_exact_background_variant_wins() {
+        let d = tree("exact", &["b101701.tga", "b101700.tga", "v101700.tga"]);
+        let index = BgIndex::build(&[d.0.as_path()]);
+        assert_eq!(index.resolve(1017, 1).as_deref(), Some("b101701.tga"));
+        assert_eq!(index.resolve(1017, 0).as_deref(), Some("b101700.tga"));
+    }
+}
+

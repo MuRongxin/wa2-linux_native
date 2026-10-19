@@ -31,7 +31,7 @@
 
 use super::*;
 use crate::codec::tga::TgaImage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -625,6 +625,29 @@ fn picture_index(dirs: &[&Path]) -> PictureIndex {
             files.insert(name, ent.path());
         }
     }
+    // Background ids that have at least one shipped `b*` file, any variant.
+    // A `v{id:04}{variant:02}` file is an event CG that happens to share the
+    // six digits; it must not stand in for the background when the id did
+    // ship backgrounds under another variant (only b206702/b206712 exist for
+    // id 2067, and v206700 is an unrelated CG).
+    let mut bg_families: HashSet<i64> = HashSet::new();
+    for name in files.keys() {
+        let stem = if let Some(stem) = name.strip_suffix(".tga") {
+            stem
+        } else if let Some(stem) = name.strip_suffix(".webp") {
+            stem
+        } else if let Some(stem) = name.strip_suffix(".bmp") {
+            stem
+        } else {
+            continue;
+        };
+        let Some(rest) = stem.strip_prefix('b') else { continue };
+        if rest.len() == 6 && rest.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(number) = rest.parse::<i64>() {
+                bg_families.insert(number / 100);
+            }
+        }
+    }
     let mut index = PictureIndex { bg: HashMap::new(), cg: HashMap::new() };
     for (name, path) in &files {
         let stem = if let Some(stem) = name.strip_suffix(".tga") {
@@ -649,9 +672,6 @@ fn picture_index(dirs: &[&Path]) -> PictureIndex {
             continue;
         }
         let Ok(number) = rest.parse::<i64>() else { continue };
-        let has_background = ["b{rest}.tga", "b{rest}.webp", "b{rest}.bmp"]
-            .iter()
-            .any(|pattern| files.contains_key(&pattern.replace("{rest}", rest)));
         if stem.starts_with("b") {
             index.bg.entry(number / 100).or_default().push(Pic {
                 variant: (number % 100) as i32,
@@ -668,7 +688,7 @@ fn picture_index(dirs: &[&Path]) -> PictureIndex {
             background: false,
             path: path.clone(),
         });
-        if !has_background {
+        if !bg_families.contains(&(number / 100)) {
             index.bg.entry(number / 100).or_default().push(Pic {
                 variant: (number % 100) as i32,
                 thumb,
@@ -1183,5 +1203,31 @@ mod tests {
         std::fs::write(&source, b"source-edited").unwrap();
         assert!(!provider.fresh(entry, &cache), "a changed source must invalidate the cache");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_event_cg_number_does_not_replace_the_shipped_background() {
+        // Scene 3005 opens on id 2067; only b206702/b206712 were shipped, and
+        // v206700 is an unrelated event CG. The timeline must show b206702.
+        let dir = std::env::temp_dir().join(format!("wa2-shots-bgfamily-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b206702.tga", "b206712.tga", "v206700.tga"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let index = picture_index(&[dir.as_path()]);
+        let shot = Shot { cg: false, id: 2067, variant: 0, op_index: 0, source: String::new() };
+        let picked = resolve_thumb(&index, &shot).expect("a background should resolve");
+        assert_eq!(picked.file_name().unwrap().to_string_lossy(), "b206702.tga");
+        // An event CG that really is the only file still works.
+        let only_dir = std::env::temp_dir().join(format!("wa2-shots-cgonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&only_dir);
+        std::fs::create_dir_all(&only_dir).unwrap();
+        std::fs::write(only_dir.join("v206700.tga"), b"").unwrap();
+        let only = picture_index(&[only_dir.as_path()]);
+        let picked = resolve_thumb(&only, &shot).expect("the CG stand-in should resolve");
+        assert_eq!(picked.file_name().unwrap().to_string_lossy(), "v206700.tga");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&only_dir).ok();
     }
 }
