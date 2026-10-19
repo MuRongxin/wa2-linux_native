@@ -54,6 +54,15 @@ fn main() {
             };
             if let Err(e) = res { eprintln!("error: {}", e); std::process::exit(1); }
         }
+        "timeline-check" => {
+            // Offline chart consistency report: node/branch/ending counts,
+            // roots, dangling jump targets. Costs half a second, no window.
+            let dir = args.get(2).map(String::as_str).unwrap_or("data/script");
+            let lines = timeline::check(Path::new(dir));
+            for line in lines {
+                println!("{}", line);
+            }
+        }
         "tga" => {
             if args.len() < 3 { eprintln!("usage: wa2-native tga <file.tga>"); return; }
             let data = match std::fs::read(&args[2]) { Ok(d) => d, Err(e) => { eprintln!("error: {}", e); std::process::exit(1); } };
@@ -317,6 +326,7 @@ fn main() {
                         sdl2::Input::Wheel { y } if y < 0 => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Wheel { .. } => win.delay(16),
                         sdl2::Input::Rewind => win.delay(16),
+                        sdl2::Input::Nav(_) => win.delay(16),
                     }
                 }
             }
@@ -426,6 +436,7 @@ fn main() {
                         sdl2::Input::Wheel { y } if y < 0 => { if idx < n - 1 { idx += 1; } break; }
                         sdl2::Input::Wheel { .. } => win.delay(16),
                         sdl2::Input::Rewind => win.delay(16),
+                        sdl2::Input::Nav(_) => win.delay(16),
                     }
                 }
             }
@@ -5197,7 +5208,21 @@ fn run_special(
     };
     let mut sel = 0usize;
     let mut bar_y = Y0 as f32;
+    // WA2_SPECIAL_AUTO=<n> pre-selects item n and confirms it (verification
+    // runs: no input synthesis needed to reach the timeline headlessly).
+    let mut auto_pick: Option<usize> = std::env::var_os("WA2_SPECIAL_AUTO")
+        .and_then(|v| v.to_string_lossy().parse::<usize>().ok())
+        .map(|p| p.min(N - 1));
+    if let Some(p) = auto_pick {
+        sel = p;
+        bar_y = (Y0 + p as i32 * PITCH) as f32;
+    }
     loop {
+        if auto_pick.is_some() {
+            auto_pick = None;
+            win.delay(400);
+            return pick(sel);
+        }
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
                 return SpecialPick::Back;
@@ -5850,7 +5875,7 @@ fn run_title(
                     cursor.as_deref(),
                 ) {
                     SpecialPick::Replay => {
-                        if let Some(id) = timeline::run(win, font, bg_dirs, script_dir) {
+                        if let Some(id) = timeline::run(win, font, bg_dirs, script_dir, cn) {
                             return TitleAction::Jump(id);
                         }
                         notice = None;

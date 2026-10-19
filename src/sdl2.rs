@@ -63,6 +63,11 @@ const SDLK_6: i32 = 35;
 const SDLK_7: i32 = 36;
 const SDLK_8: i32 = 37;
 const SDLK_9: i32 = 38;
+const SDLK_HOME: i32 = 74;
+const SDLK_END: i32 = 77;
+const SDLK_TAB: i32 = 43;
+const SDLK_r: i32 = 21;
+const SDLK_f: i32 = 9;
 
 pub struct Sdl {
     _lib: *mut c_void,
@@ -114,6 +119,24 @@ pub enum Input {
     Wheel { y: i32 },
     /// Page Up: cruise backward through lines already shown.
     Rewind,
+    /// Home / End / Tab / R / F. One variant so screens that do not use them
+    /// keep their existing catch-all arms.
+    Nav(NavKey),
+}
+
+/// Extra navigation keys understood by the timeline chart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavKey {
+    /// Back to the story start.
+    Home,
+    /// Forward to the end of the current route.
+    End,
+    /// Next chapter band.
+    Tab,
+    /// Reset zoom and scroll.
+    Reset,
+    /// Back to the newest save's scene.
+    Focus,
 }
 
 unsafe fn sym(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
@@ -357,6 +380,11 @@ impl Sdl {
                         SDLK_7 => out = Input::Choice(7),
                         SDLK_8 => out = Input::Choice(8),
                         SDLK_9 => out = Input::Choice(9),
+                        SDLK_HOME => out = Input::Nav(NavKey::Home),
+                        SDLK_END => out = Input::Nav(NavKey::End),
+                        SDLK_TAB => out = Input::Nav(NavKey::Tab),
+                        SDLK_r => out = Input::Nav(NavKey::Reset),
+                        SDLK_f => out = Input::Nav(NavKey::Focus),
                         _ => {}
                     }
                 } else if etype == SDL_MOUSEMOTION {
