@@ -450,13 +450,34 @@ impl VectorFont {
         (top, bottom, round_266(width))
     }
 
+    /// How far this text's ink reaches above and below the baseline, in
+    /// pixels. Layout uses it to place a caption inside the box the artwork
+    /// gave it, and to check afterwards that nothing crossed a rule.
+    pub fn ink_bounds(&self, text: &str) -> (i32, i32) {
+        let (top, bottom, _) = self.ink_extents(text);
+        (top, bottom)
+    }
+
     /// Width of text at the current size, kerning included.
     pub fn measure(&self, text: &str) -> i32 {
-        let mut x = 0;
+        self.measure_tracked(text, 0)
+    }
+
+    /// Width of text with `tracking` pixels added between glyphs. Tracking is
+    /// a layout property, so it counts towards the width used for centring -
+    /// that is the whole point of doing it here instead of typing spaces into
+    /// the string.
+    pub fn measure_tracked(&self, text: &str, tracking: i32) -> i32 {
+        let mut x = 0i32;
         let mut prev: Option<char> = None;
+        let mut n = 0usize;
         for ch in text.chars() {
             x += self.advance_after(prev, ch);
+            if n > 0 {
+                x += tracking;
+            }
             prev = Some(ch);
+            n += 1;
         }
         x
     }
@@ -598,7 +619,7 @@ impl VectorFont {
         let w = (width + pad * 2).max(1) as u32;
         let h = (top + bottom + pad * 2).max(1) as u32;
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        self.stamp_buf(&mut buf, w, h, text, pad, pad + top, &TextStyle::for_role(TextRole::Ui));
+        self.stamp_buf(&mut buf, w, h, text, pad, pad + top, &TextStyle::for_role(TextRole::Ui), 0);
         Some((w, h, buf))
     }
 
@@ -624,7 +645,7 @@ impl VectorFont {
             }
             let (top, bottom, _) = self.ink_extents(line);
             let base = y + (line_h - (top + bottom)) / 2 + top;
-            self.stamp_buf(&mut buf, w, h, line, pad, base, &TextStyle::for_role(TextRole::Ui));
+            self.stamp_buf(&mut buf, w, h, line, pad, base, &TextStyle::for_role(TextRole::Ui), 0);
         }
         Some((w, h, buf))
     }
@@ -641,16 +662,27 @@ impl VectorFont {
                 continue;
             }
             let x = if l.center {
-                l.x + (l.w - self.measure(&l.text)) / 2
+                l.x + (l.w - self.measure_tracked(&l.text, l.tracking)) / 2
             } else {
                 l.x
             };
-            let (top, bottom, _) = self.ink_extents(&l.text);
-            let y = l.y + (l.h - (top + bottom)) / 2;
+            let (ink_top, ink_bottom, _) = self.ink_extents(&l.text);
+            let m = self.metrics.get();
+            let line = m.ascender - m.descender;
+            // Explicit baseline rather than centring the ink: the box is what
+            // the artwork laid out, so the font's own line sits centred in it
+            // and every caption on the page shares one rhythm. A box shorter
+            // than the line would push the baseline past its own bottom, so
+            // that case falls back to centring the ink.
+            let baseline = if line <= l.h {
+                l.y + (l.h - line) / 2 + m.ascender
+            } else {
+                l.y + (l.h - (ink_top + ink_bottom)) / 2 + ink_top
+            };
             // UI labels carry their own colour and sit on an opaque plate, so
             // they take the flat style: no edge, no shadow.
             let style = TextStyle { color: l.rgb, ..TextStyle::for_role(TextRole::Ui) };
-            self.stamp_buf(&mut buf, w, h, &l.text, x, y + top, &style);
+            self.stamp_buf(&mut buf, w, h, &l.text, x, baseline, &style, l.tracking);
         }
         Some(buf)
     }
@@ -667,13 +699,25 @@ impl VectorFont {
         x: i32,
         baseline: i32,
         style: &TextStyle,
+        tracking: i32,
     ) {
         let mut pen = (x as i32) << 6;
+        let track_266 = (tracking as i32) << 6;
         let mut prev: Option<char> = None;
+        let mut first = true;
         for ch in text.chars() {
+            // The tracking goes into the gap before each glyph after the
+            // first one. Adding it after the advance instead leaves the first
+            // gap out, while `measure_tracked` still counts it - so the line
+            // renders narrower than it measures and every later gap is one
+            // step too far right.
+            if !first {
+                pen += track_266;
+            }
             let t = self.tile(ch);
             stamp_raw(buf, bw, bh, &t, round_266(pen), baseline, style);
             pen += self.advance_266(prev, ch);
+            first = false;
             prev = Some(ch);
         }
     }
@@ -889,6 +933,28 @@ pub struct Label {
     /// Centre the text in the box instead of left-aligning it.
     pub center: bool,
     pub rgb: [u8; 3],
+    /// Extra pixels between glyphs, in this canvas's own pixels (the caller
+    /// scales it from the layout). This is letter tracking done properly:
+    /// putting real spaces into the string would change its width, its
+    /// centring and its wrap.
+    pub tracking: i32,
+}
+
+impl Label {
+    /// A label with no tracking, for callers that do not letter-space.
+    pub fn plain(text: impl Into<String>, x: i32, y: i32, w: i32, h: i32, size: u32, rgb: [u8; 3]) -> Label {
+        Label {
+            text: text.into(),
+            x,
+            y,
+            w,
+            h,
+            size,
+            center: true,
+            rgb,
+            tracking: 0,
+        }
+    }
 }
 
 thread_local! {
@@ -1108,8 +1174,48 @@ fn stamp_styled(surf: &mut Surface, t: &Tile, pen: i32, baseline: i32, style: &T
 
 #[cfg(test)]
 mod tests {
-    use super::{round_266, TextStyle, VectorFont, DEFAULT_FONT, DEFAULT_GAMMA};
+    use super::{round_266, Label, TextStyle, VectorFont, DEFAULT_FONT, DEFAULT_GAMMA};
     use crate::render::Surface;
+
+    /// Tracking has to move the glyphs, not just the measured width: every gap
+    /// between two glyphs gets the extra pixels. A loop that adds the tracking
+    /// after the second glyph makes the first gap disappear while the measured
+    /// width still counts it, so the line comes out left-shifted and the last
+    /// glyphs crowd one gap.
+    #[test]
+    fn tracking_moves_glyphs_apart() {
+        let Some(f) = VectorFont::open(DEFAULT_FONT, 24) else { return };
+        let ink_span = |tracking: i32| {
+            let label = Label {
+                text: "画面设置".to_string(),
+                x: 0,
+                y: 0,
+                w: 320,
+                h: 40,
+                size: 24,
+                center: false,
+                rgb: [255, 255, 255],
+                tracking,
+            };
+            let buf = f.labels_rgba(320, 40, &[label]).expect("label buffer");
+            let mut min = 320i32;
+            let mut max = -1i32;
+            for y in 0..40u32 {
+                for x in 0..320u32 {
+                    let i = ((y * 320 + x) * 4) as usize;
+                    if buf[i + 3] > 0 {
+                        min = min.min(x as i32);
+                        max = max.max(x as i32);
+                    }
+                }
+            }
+            (min, max)
+        };
+        let (a0, a1) = ink_span(0);
+        let (b0, b1) = ink_span(6);
+        assert_eq!(b0, a0, "tracking must not move the first glyph");
+        assert_eq!(b1 - a1, 6 * 3, "three gaps each get six pixels");
+    }
 
     /// Draw one line on a `bg` plate and report where the ink and the outline
     /// ended up. A white plate makes the outline countable, a black one the ink.

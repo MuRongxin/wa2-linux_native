@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import struct
+import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -117,6 +118,27 @@ def collect(force: bool) -> list[tuple[Path, Path, str, int]]:
     return tasks
 
 
+def bake_menu_clean() -> None:
+    """Bake the caption-free settings-screen pages.
+
+    The bake reuses the engine's own page layout and classifier, so it lives in
+    the binary (`menu-clean`) instead of being duplicated here. A checkout
+    without a build simply skips it; the screen then falls back to the runtime
+    wipe, which is slower but correct.
+    """
+    root = ROOT.parent
+    exe = root / "target/release/wa2-native"
+    if not exe.exists():
+        exe = root / "target/debug/wa2-native"
+    if not exe.exists():
+        print("menu page cache skipped: build the engine first (cargo build --release)")
+        return
+    print("baking caption-free settings pages ...")
+    result = subprocess.run([str(exe), "menu-clean"], cwd=str(root))
+    if result.returncode != 0:
+        print(f"  menu-clean failed (exit {result.returncode})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workers", type=int, default=8)
@@ -145,6 +167,7 @@ def main() -> int:
             if index % 40 == 0 or index == len(tasks):
                 print(f"  [{index}/{len(tasks)}] {time.time() - started:.0f}s built={built} skipped={skipped} failed={failed}")
     print(f"finished in {time.time() - started:.1f}s: {built} built, {skipped} skipped, {failed} failed")
+    bake_menu_clean()
     if failures:
         for line in failures[:20]:
             print(" ", line)

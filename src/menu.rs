@@ -515,6 +515,14 @@ static DUMP_SIG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new())
 
 pub struct Assets {
     base: [Option<TgaImage>; 3],
+    /// Caption-free page art baked by `menu-clean`. When a page has one, the
+    /// runtime blits it and skips the per-frame wipe entirely.
+    clean: [Option<TgaImage>; 3],
+    /// Caption-free copy of the hover/selected sheet (`sys_0321X`). It only
+    /// contributes the state rim now: its plate was rebuilt from the clean
+    /// page, so the baked captions of the original sheet cannot show through
+    /// the vector text.
+    hover: [Option<TgaImage>; 3],
     gold: [Option<TgaImage>; 3],
     cyan: [Option<TgaImage>; 3],
     header: Option<TgaImage>,
@@ -522,6 +530,22 @@ pub struct Assets {
     nav: Option<TgaImage>,
     defbtn: Option<TgaImage>,
     help: [Option<TgaImage>; 3],
+}
+
+/// `Some("4x")` for a sibling art tree like `bg_4x`, `None` for an original.
+fn tree_scale_suffix(dir: &Path) -> Option<&'static str> {
+    let name = dir.file_name()?.to_str()?;
+    for s in ["1x", "2x", "4x", "8x"] {
+        if name.ends_with(&format!("_{}", s)) {
+            return Some(match s {
+                "1x" => "1x",
+                "2x" => "2x",
+                "4x" => "4x",
+                _ => "8x",
+            });
+        }
+    }
+    None
 }
 
 fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
@@ -553,12 +577,43 @@ fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
 
 impl Assets {
     pub fn load(dirs: &[&Path]) -> Assets {
+        // The menu sheets are drawn at their logical 1280x720 size, and the
+        // patch's Chinese artwork lives in the 1x trees. The 4x tree is a
+        // runtime art tree produced by the upscaler: on the sound page its
+        // AI-upgraded sheets lost the 音量ON/OFF glyphs, so the originals come
+        // first here and 4x is only a last resort.
+        let mut ordered: Vec<&Path> = Vec::new();
+        ordered.extend(dirs.iter().copied().filter(|d| tree_scale_suffix(d).is_none()));
+        ordered.extend(
+            dirs.iter()
+                .copied()
+                .filter(|d| tree_scale_suffix(d).is_some_and(|s| s != "4x")),
+        );
+        ordered.extend(
+            dirs.iter()
+                .copied()
+                .filter(|d| tree_scale_suffix(d) == Some("4x")),
+        );
+        let dirs: &[&Path] = &ordered;
+        let cache = clean_dir();
+        let clean = [
+            read_clean(&cache, 0),
+            read_clean(&cache, 1),
+            read_clean(&cache, 2),
+        ];
+        let hover = [
+            read_hover(&cache, 0),
+            read_hover(&cache, 1),
+            read_hover(&cache, 2),
+        ];
         Assets {
             base: [
                 load(dirs, "sys_03100.tga"),
                 load(dirs, "sys_03101.tga"),
                 load(dirs, "sys_03102.tga"),
             ],
+            clean,
+            hover,
             gold: [
                 load(dirs, "sys_03200.tga"),
                 load(dirs, "sys_03210.tga"),
@@ -612,9 +667,16 @@ fn draw_page(
     st: &Settings,
     styles: &[Style],
 ) {
-    if let Some(b) = a.base[page].as_ref() {
+    // A baked clean page replaces the art and the wipe with one blit.
+    if let Some(b) = a.clean[page].as_ref() {
+        s.blit(b, PAGE_X, PAGE_Y);
+    } else if let Some(b) = a.base[page].as_ref() {
         s.blit(b, PAGE_X, PAGE_Y);
     }
+    // The baked state sheet carries the original captions inside every plate.
+    // The cached copy has the plates rebuilt from the clean page, so only its
+    // rims are new.
+    let state = a.hover[page].as_ref().or_else(|| a.cyan[page].as_ref());
     // Slider values: the gold layer is a "lit" copy of the whole bar, so the
     // current level is the part of it that gets blitted back over the dark bar.
     let mut done: Vec<&str> = Vec::new();
@@ -627,7 +689,7 @@ fn draw_page(
             continue;
         }
         done.push(sl.key);
-        if let (Some(src), Some(w)) = (a.cyan[page].as_ref(), fill_width(st, sl)) {
+        if let (Some(src), Some(w)) = (state, fill_width(st, sl)) {
             s.blit_region(src, sl.x0, sl.y, w as u32, BAR_H as u32, PAGE_X + sl.x0, PAGE_Y + sl.y);
         }
     }
@@ -640,7 +702,7 @@ fn draw_page(
             // The value sheet is gold. Its rim and the body wash both read as
             // yellow, which fights the cyan page. Selected and hovered options
             // use the cyan sheet; the body wash tells them apart.
-            Style::Gold | Style::Cyan => a.cyan[page].as_ref(),
+            Style::Gold | Style::Cyan => state,
             Style::Base => None,
         };
         if let Some(src) = src {
@@ -663,10 +725,14 @@ fn draw_page(
             if matches!(h.act, Act::Opt(_, _)) {
                 // Selected is the stronger cyan. Hover is the same hue, lighter,
                 // so the current value stays obvious under the cursor too.
+                // Three distinct states: idle is the untouched plate,
+                // selected is a mid cyan, hover is the same hue a little
+                // lighter. The old 175 washed the button out under a white
+                // caption and a bright rim.
                 let (tint, alpha) = if style == Style::Gold {
-                    ([48u8, 196, 208], 175u8)
+                    ([48u8, 196, 208], 132u8)
                 } else {
-                    ([36, 176, 196], 90)
+                    ([36, 176, 196], 80)
                 };
                 fill_option_body(s, PAGE_X + h.x, PAGE_Y + h.y, h.w, h.h, tint, alpha);
             }
@@ -686,10 +752,9 @@ fn fill_option_body(s: &mut Surface, x: i32, y: i32, w: i32, h: i32, tint: [u8; 
                 continue;
             }
             let i = ((yy as u32) * s.width + xx as u32) as usize * 4;
-            let lum = s.pixels[i] as u32 + s.pixels[i + 1] as u32 + s.pixels[i + 2] as u32;
-            if lum >= 230 {
-                continue;
-            }
+            // No brightness test here on purpose. The label is drawn after this
+            // wash and the baked caption underneath is wiped, so guessing
+            // "is this pixel text" only left the caption's own halo behind.
             for c in 0..3 {
                 s.pixels[i + c] = ((tint[c] as u32 * a + s.pixels[i + c] as u32 * ia) / 255) as u8;
             }
@@ -870,6 +935,24 @@ fn nav_act(idx: usize) -> Option<Act> {
 }
 
 /// One caption drawn with the system font, in 1280×720 coordinates.
+/// Menu ink, kept apart from the dialogue's: these captions sit on rules,
+/// buttons and dark plates, so they are lighter and flatter than text that has
+/// to survive on top of a CG.
+mod ink {
+    /// Group heading.
+    pub const HEAD: [u8; 3] = [186, 230, 240];
+    /// Left-hand row label.
+    pub const LABEL: [u8; 3] = [222, 236, 242];
+    /// Button main text.
+    pub const BUTTON: [u8; 3] = [255, 255, 255];
+    /// Button second line, and the parenthetical notes.
+    pub const SUB: [u8; 3] = [134, 178, 190];
+    /// Slider scale (0%, 100%, MIN, MAX, FAST, SLOW).
+    pub const SCALE: [u8; 3] = [152, 198, 210];
+    /// Bottom navigation and the tab strip.
+    pub const NAV: [u8; 3] = [236, 246, 250];
+}
+
 struct Lab {
     x: i32,
     y: i32,
@@ -878,6 +961,15 @@ struct Lab {
     text: &'static str,
     sub: &'static str,
     size: u32,
+    /// Size of the second line, when the sub text is itself Chinese.
+    sub_size: u32,
+    color: [u8; 3],
+    sub_color: [u8; 3],
+    /// Extra pixels between glyphs, in 1280x720 layout units. The original
+    /// captions were letter-spaced; this is that spacing, done as tracking
+    /// rather than as real spaces in the string (which would also change the
+    /// measured width, the centring and the wrap).
+    tracking: i32,
     center: bool,
     /// Pixels eaten off each edge before the baked glyphs are covered, so a
     /// button frame is not painted over.
@@ -899,38 +991,60 @@ fn lab(
     inset: i32,
     fill: bool,
 ) -> Lab {
-    Lab { x, y, w, h, text, sub, size, center, inset, fill }
+    Lab {
+        x,
+        y,
+        w,
+        h,
+        text,
+        sub,
+        size,
+        sub_size: (size * 2 / 3).max(11),
+        color: ink::BUTTON,
+        sub_color: ink::SUB,
+        tracking: 0,
+        center,
+        inset,
+        fill,
+    }
 }
 
+/// Group heading: 18px, a touch of tracking, the pale teal the section rules
+/// are drawn in.
 fn head(x: i32, y: i32, w: i32, text: &'static str) -> Lab {
-    lab(PAGE_X + x, PAGE_Y + y, w, 18, text, "", 18, false, 0, false)
+    let mut l = lab(PAGE_X + x, PAGE_Y + y, w, 20, text, "", 18, false, 0, false);
+    l.color = ink::HEAD;
+    l.tracking = 1;
+    l
 }
 
+/// Left-hand label of a row. 20px, no tracking: at 22 with a space between
+/// every glyph it read looser than the button text it labels.
 fn row(x: i32, y: i32, w: i32, h: i32, text: &'static str, sub: &'static str) -> Lab {
-    lab(PAGE_X + x, PAGE_Y + y, w, h, text, sub, 22, false, 0, false)
+    let mut l = lab(PAGE_X + x, PAGE_Y + y, w, h, text, sub, 20, false, 0, false);
+    l.color = ink::LABEL;
+    l
 }
 
+/// Parenthetical note under a label.
 fn note(x: i32, y: i32, w: i32, text: &'static str) -> Lab {
-    lab(PAGE_X + x, PAGE_Y + y, w, 16, text, "", 14, false, 0, false)
+    let mut l = lab(PAGE_X + x, PAGE_Y + y, w, 16, text, "", 13, false, 0, false);
+    l.color = ink::SUB;
+    l
 }
 
 fn btn(x: i32, y: i32, w: i32, h: i32, text: &'static str, sub: &'static str) -> Lab {
-    lab(PAGE_X + x, PAGE_Y + y, w, h, text, sub, 18, true, 7, false)
+    let mut l = lab(PAGE_X + x, PAGE_Y + y, w, h, text, sub, 17, true, 7, false);
+    l.color = ink::BUTTON;
+    l.sub_size = 11;
+    l
 }
 
+/// Slider scale.
 fn tiny(x: i32, y: i32, w: i32, h: i32, text: &'static str) -> Lab {
-    lab(PAGE_X + x, PAGE_Y + y, w, h, text, "", 13, true, 3, false)
-}
-
-/// The original captions were letter-spaced. A regular gap keeps short Chinese
-/// labels from reading as one dense block.
-fn spread_cjk(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let cjk = |c: char| ('\u{3400}'..='\u{9fff}').contains(&c);
-    if chars.len() < 2 || chars.len() > 6 || !chars.iter().copied().all(cjk) {
-        return text.to_string();
-    }
-    chars.into_iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
+    let mut l = lab(PAGE_X + x, PAGE_Y + y, w, h, text, "", 10, true, 3, false);
+    l.color = ink::SCALE;
+    l
 }
 
 fn menu_px(layout_px: u32, window_h: i32) -> u32 {
@@ -955,24 +1069,25 @@ fn page_labs(page: usize) -> Vec<Lab> {
             v.push(btn(458, 118, 252, 36, "全文", "All"));
             v.push(btn(714, 118, 252, 36, "仅限已读", "Already Read"));
             v.push(row(40, 162, 250, 28, "自动模式速度", ""));
-            v.push(tiny(532, 180, 48, 16, "FAST"));
-            v.push(tiny(848, 180, 52, 16, "SLOW"));
+            // Scales sit on their own row under the track, aligned to its
+            // ends. They used to sit on the track's bottom edge.
+            v.push(tiny(BAR_X0 - 16, SL_AUTO.y + BAR_H + 2, 44, 12, "FAST"));
+            v.push(tiny(BAR_X1 - 44, SL_AUTO.y + BAR_H + 2, 48, 12, "SLOW"));
             v.push(head(36, 204, 200, "视觉设置"));
             v.push(row(48, 226, 240, 28, "画面特效", ""));
             v.push(btn(458, 222, 252, 36, "瞬间显示", "Fast"));
             v.push(btn(714, 222, 252, 36, "普通显示", "Normal"));
             v.push(row(40, 254, 220, 22, "窗口透明度", ""));
             v.push(note(48, 278, 180, "（普通场景）"));
-            v.push(tiny(388, 268, 80, 26, "窗口ON"));
             v.push(row(40, 296, 220, 22, "窗口透明度", ""));
             v.push(note(56, 320, 160, "（CG场景）"));
-            v.push(tiny(388, 308, 80, 26, "窗口OFF"));
             v.push(row(40, 336, 220, 22, "背景透明度", ""));
             v.push(note(48, 360, 180, "（小说场景）"));
             v.push(row(40, 386, 260, 26, "指令图标透明度", ""));
-            for y in [280, 320, 360, 400] {
-                v.push(tiny(536, y, 40, 16, "0%"));
-                v.push(tiny(848, y, 48, 16, "100%"));
+            for sl in [SL_ANOVEL, SL_ACG, SL_ABACK, SL_ACMD] {
+                let row_y = sl.y + BAR_H + 2;
+                v.push(tiny(BAR_X0 - 16, row_y, 44, 12, "0%"));
+                v.push(tiny(BAR_X1 - 44, row_y, 48, 12, "100%"));
             }
         }
         1 => {
@@ -987,9 +1102,8 @@ fn page_labs(page: usize) -> Vec<Lab> {
             v.push(head(36, 96, 200, "声音设置"));
             for (y, name) in [(118, "全体音量"), (158, "BGM音量"), (198, "SE音量"), (238, "VOICE音量")] {
                 v.push(row(40, y + 2, 220, 28, name, ""));
-                v.push(lab(PAGE_X + 390, PAGE_Y + y, 80, 28, "音量ON", "音量OFF", 12, true, 3, false));
-                v.push(tiny(534, y + 26, 36, 14, "MIN"));
-                v.push(tiny(860, y + 26, 40, 14, "MAX"));
+                v.push(tiny(BAR_X0 - 16, y + BAR_H + 2, 44, 12, "MIN"));
+                v.push(tiny(BAR_X1 - 44, y + BAR_H + 2, 48, 12, "MAX"));
             }
             v.push(head(36, 280, 200, "暂停设置"));
             v.push(row(40, 308, 270, 30, "翻页时中断语音", ""));
@@ -1026,29 +1140,12 @@ fn page_labs(page: usize) -> Vec<Lab> {
 
 fn chrome_labs() -> Vec<Lab> {
     let mut v = Vec::new();
-    for i in 0..3 {
-        v.push(lab(
-            TABS_X + i * TAB_W,
-            TABS_Y,
-            TAB_W,
-            TAB_H,
-            match i {
-                0 => "OPTION 1",
-                1 => "OPTION 2",
-                _ => "OPTION 3",
-            },
-            "",
-            16,
-            true,
-            6,
-            true,
-        ));
-    }
     v.push(lab(NAV_BAR_X, NAV_Y + 14, 100, 36, "上一页", "", 16, true, 0, false));
-    v.push(lab(NAV_BAR_X + 100, NAV_Y + 4, BAR_W - 200, 26, "更改游戏的环境设置", "", 15, true, 0, false));
+    // The gap between 上一页 and 下一页 is BAR_W - 200 = 88px. The old caption
+    // needed 135 and simply overlapped both arrows; four characters fit.
+    v.push(lab(NAV_BAR_X + 100, NAV_Y + 4, BAR_W - 200, 26, "环境设置", "", 15, true, 0, false));
     v.push(lab(NAV_BAR_X + 100, NAV_Y + 36, BAR_W - 200, 22, "OPTION", "", 13, true, 0, false));
     v.push(lab(NAV_BAR_X + BAR_W - 100, NAV_Y + 14, 100, 36, "下一页", "", 16, true, 0, false));
-    v.push(lab(DEF_X, DEF_Y, DEF_W, DEF_H, "恢复默认设置", "", 16, true, 4, false));
     v
 }
 
@@ -1120,6 +1217,320 @@ fn dim_caption(p: [u8; 3]) -> bool {
 /// and put the colour underneath back. Rules, dotted leaders, snowflakes and
 /// widget frames stay. The mask comes from the base art, so a selected
 /// button's wash cannot hide the letters or get punched out.
+/// Bake the caption-free page art once, instead of repairing the composed
+/// frame on every state change.
+///
+/// `wipe_baked_captions` classifies pixels of the page art, grows the mask and
+/// repaints each masked pixel from a neighbour. That is the right algorithm
+/// but the wrong place for it: on every hover it walked the whole 1024x464
+/// page and could still leave a halo where the classifier disagreed with the
+/// artwork. Running it here, once, writes a clean page that the runtime only
+/// blits; the wipe stays as the fallback for a data tree with no cache.
+///
+/// Returns the pages it wrote, so a caller can report what happened.
+/// Where the baked caption-free pages live.
+fn clean_dir() -> std::path::PathBuf {
+    let root = std::env::var("WA2_DATA").unwrap_or_else(|_| "data".to_string());
+    std::path::Path::new(&root).join("cache/ui/menu")
+}
+
+fn read_clean(dir: &Path, page: usize) -> Option<TgaImage> {
+    let p = clean_page_path(dir, page);
+    match crate::codec::image::decode_ui_file(&p) {
+        Ok(img) => Some(img),
+        Err(_) => None,
+    }
+}
+
+fn read_hover(dir: &Path, page: usize) -> Option<TgaImage> {
+    let p = hover_page_path(dir, page);
+    match crate::codec::image::decode_ui_file(&p) {
+        Ok(img) => Some(img),
+        Err(_) => None,
+    }
+}
+
+fn hover_page_path(out_dir: &Path, page: usize) -> std::path::PathBuf {
+    out_dir.join(format!("page{}_hover.tga", page + 1))
+}
+
+/// The clean page for `page`: the art with its captions wiped, cropped to
+/// the page rectangle. Split out from the file writing so a test can compare
+/// it against the runtime path pixel for pixel.
+pub fn bake_clean_page(base: &TgaImage, page: usize) -> Surface {
+    // The wipe is written against the full screen with the page at
+    // (PAGE_X, PAGE_Y), so bake on a full-size surface and crop the page
+    // rectangle out of it. Doing it any other way would shift the art.
+    let mut full = Surface::new(W, H, [0, 0, 0, 255]);
+    full.blit(base, PAGE_X, PAGE_Y);
+    wipe_baked_captions(&mut full, base, page);
+    let mut out = Surface::new(PAGE_W as u32, PAGE_H as u32, [0, 0, 0, 255]);
+    for y in 0..PAGE_H as u32 {
+        let src = ((PAGE_Y as u32 + y) * W + PAGE_X as u32) as usize * 4;
+        let dst = (y * PAGE_W as u32) as usize * 4;
+        let n = PAGE_W as usize * 4;
+        out.pixels[dst..dst + n].copy_from_slice(&full.pixels[src..src + n]);
+    }
+    // The wipe is a classifier; it is bound to miss pixels where the artwork
+    // disagrees. The caption regions have a known background (black plates for
+    // the label column and the scale rows, a smooth gradient inside a button),
+    // so rebuild those from the model instead of guessing (plan §1).
+    rebuild_caption_regions(&mut out, page);
+    out
+}
+
+/// Replace the baked captions of one page with the page's own background
+/// model. Runs once, in the bake; the runtime only blits the result.
+fn rebuild_caption_regions(s: &mut Surface, page: usize) {
+    // 1) Caption column: the art behind the labels and their dotted leaders is
+    //    black. Keep the dim teal heading bars and section rules. The leaders
+    //    run all the way to the buttons on every page; the ON/OFF pills sit in
+    //    that strip on pages 1 and 2 and are drawn as-is, so their rectangles
+    //    (plus their glow) are skipped.
+    let right = 478;
+    let pills: Vec<(i32, i32, i32, i32)> = page_hots(page)
+        .iter()
+        .filter(|h| matches!(h.act, Act::Off(_)))
+        .map(|h| (h.x - 5, h.y - 5, h.x + h.w + 5, h.y + h.h + 5))
+        .collect();
+    for y in 0..s.height as i32 {
+        for x in 8..right.min(s.width as i32) {
+            if pills.iter().any(|&(x0, y0, x1, y1)| x >= x0 && x < x1 && y >= y0 && y < y1) {
+                continue;
+            }
+            if structural_run(s, x, y) {
+                continue;
+            }
+            let i = ((y as u32 * s.width + x as u32) * 4) as usize;
+            s.pixels[i] = 0;
+            s.pixels[i + 1] = 0;
+            s.pixels[i + 2] = 0;
+            s.pixels[i + 3] = 255;
+        }
+    }
+    // 2) Scale labels under each slider track (FAST/SLOW/0%/100%/MIN/MAX).
+    //    The band runs from the track's bottom edge to just above the next
+    //    row's track; the arrow buttons own the band's ends (their rims are
+    //    white too), so their rectangles are skipped.
+    let hots = page_hots(page);
+    let mut seen: Vec<&'static str> = Vec::new();
+    for h in &hots {
+        let Some(sl) = h.slider else { continue };
+        if seen.contains(&sl.key) {
+            continue;
+        }
+        seen.push(sl.key);
+        let arrows: Vec<(i32, i32, i32, i32)> = hots
+            .iter()
+            .filter(|a| {
+                a.slider.map(|s| s.key) == Some(sl.key) && matches!(a.act, Act::Step(_, _))
+            })
+            .map(|a| (a.x, a.y, a.x + a.w, a.y + a.h))
+            .collect();
+        let y0 = sl.y + BAR_H;
+        let y1 = (sl.y + 38).min(s.height as i32);
+        for y in y0..y1 {
+            for x in 500..940.min(s.width as i32) {
+                if arrows.iter().any(|&(ax0, ay0, ax1, ay1)| {
+                    x >= ax0 - 6 && x < ax1 + 6 && y >= ay0 - 6 && y < ay1 + 6
+                }) {
+                    continue;
+                }
+                // Nothing in this band is worth keeping: it holds the baked
+                // scale labels and the baked value bar (which fights the
+                // dynamic fill), and the band sits between two tracks.
+                let i = ((y as u32 * s.width + x as u32) * 4) as usize;
+                s.pixels[i] = 0;
+                s.pixels[i + 1] = 0;
+                s.pixels[i + 2] = 0;
+                s.pixels[i + 3] = 255;
+            }
+        }
+    }
+    // 3) Button plates: their captions sit on a smooth gradient, so the
+    //    per-column median is the plate colour and glyphs stand out from it.
+    for h in page_hots(page) {
+        // Only option buttons. The ON/OFF pills are `Act::Off` and their baked
+        // captions are already Chinese and always visible; scrubbing them left
+        // empty plates.
+        if !matches!(h.act, Act::Opt(_, _)) {
+            continue;
+        }
+        scrub_button_caption(s, &h);
+    }
+}
+
+/// Dim teal that is structure, not ink. The heading bars and rules are darker
+/// than both the white captions and their brighter teal anti-aliasing.
+fn dim_teal_structure(p: [u8; 3]) -> bool {
+    let r = p[0] as i32;
+    let g = p[1] as i32;
+    let b = p[2] as i32;
+    r < 90 && g > r + 25 && b > r + 25 && g < 135 && b < 135
+}
+
+fn clear_to_black(s: &mut Surface, x: i32, y: i32) {
+    if x < 0 || y < 0 || x >= s.width as i32 || y >= s.height as i32 {
+        return;
+    }
+    let i = ((y as u32 * s.width + x as u32) * 4) as usize;
+    let p = [s.pixels[i], s.pixels[i + 1], s.pixels[i + 2]];
+    if dim_teal_structure(p) {
+        return;
+    }
+    s.pixels[i] = 0;
+    s.pixels[i + 1] = 0;
+    s.pixels[i + 2] = 0;
+    s.pixels[i + 3] = 255;
+}
+
+/// A dim teal pixel only counts as structure when it belongs to a bar or a
+/// rule. The dotted leaders are dim teal too, but they are 2-3 px clusters, so
+/// a short run test tells them apart from the 20 px heading bars and the long
+/// section rules.
+fn structural_run(s: &Surface, x: i32, y: i32) -> bool {
+    let w = s.width as i32;
+    let h = s.height as i32;
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return false;
+    }
+    let teal = |xx: i32, yy: i32| -> bool {
+        if xx < 0 || yy < 0 || xx >= w || yy >= h {
+            return false;
+        }
+        let i = ((yy as u32 * s.width + xx as u32) * 4) as usize;
+        dim_teal_structure([s.pixels[i], s.pixels[i + 1], s.pixels[i + 2]])
+    };
+    if !teal(x, y) {
+        return false;
+    }
+    let mut run = 1;
+    for d in 1..=8 {
+        if teal(x + d, y) || teal(x - d, y) {
+            run += 1;
+        } else {
+            break;
+        }
+    }
+    if run >= 8 {
+        return true;
+    }
+    let mut run = 1;
+    for d in 1..=8 {
+        if teal(x, y + d) || teal(x, y - d) {
+            run += 1;
+        } else {
+            break;
+        }
+    }
+    run >= 8
+}
+
+/// Erase one baked caption from a button plate.
+fn scrub_button_caption(s: &mut Surface, h: &Hot) {
+    let inset = 5;
+    let x0 = (h.x + inset).max(0);
+    let x1 = (h.x + h.w - inset).min(s.width as i32);
+    let y0 = (h.y + inset).max(0);
+    let y1 = (h.y + h.h - inset).min(s.height as i32);
+    if x1 - x0 < 16 || y1 - y0 < 10 {
+        return;
+    }
+    // The snow decorations sit in the outer eighth of the plate; only the
+    // centre carries the caption.
+    let cut = ((x1 - x0) / 8).max(4);
+    for x in (x0 + cut)..(x1 - cut) {
+        let n = (y1 - y0) as usize;
+        // Median of the column: the plate gradient is vertical, a glyph only
+        // covers a few rows of it.
+        let mut col = [0u8; 3];
+        for c in 0..3 {
+            let mut vals: Vec<u8> = (y0..y1)
+                .map(|y| s.pixels[((y as u32 * s.width + x as u32) * 4) as usize + c])
+                .collect();
+            vals.sort_unstable();
+            col[c] = vals[n / 2];
+        }
+        for y in y0..y1 {
+            let i = ((y as u32 * s.width + x as u32) * 4) as usize;
+            let p = [s.pixels[i], s.pixels[i + 1], s.pixels[i + 2]];
+            let d = (0..3)
+                .map(|c| (p[c] as i32 - col[c] as i32).abs())
+                .max()
+                .unwrap_or(0);
+            if d > 16 {
+                s.pixels[i] = col[0];
+                s.pixels[i + 1] = col[1];
+                s.pixels[i + 2] = col[2];
+                s.pixels[i + 3] = 255;
+            }
+        }
+    }
+}
+
+/// Clean copy of the hover/selected sheet: keep its rims, take the plates from
+/// the clean page so no baked caption survives.
+fn bake_clean_state(state: &TgaImage, clean: &Surface, page: usize) -> Surface {
+    let mut s = Surface::new(state.width, state.height, [0, 0, 0, 255]);
+    s.pixels.copy_from_slice(&state.rgba);
+    for h in page_hots(page) {
+        // Only option buttons: the ON/OFF pills keep this sheet's baked
+        // caption (already Chinese).
+        if !matches!(h.act, Act::Opt(_, _)) {
+            continue;
+        }
+        let inset = 3;
+        let x0 = (h.x + inset).max(0);
+        let x1 = (h.x + h.w - inset).min(s.width as i32);
+        let y0 = (h.y + inset).max(0);
+        let y1 = (h.y + h.h - inset).min(s.height as i32);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let si = ((y as u32 * clean.width + x as u32) * 4) as usize;
+                let di = ((y as u32 * s.width + x as u32) * 4) as usize;
+                s.pixels[di..di + 4].copy_from_slice(&clean.pixels[si..si + 4]);
+            }
+        }
+    }
+    s
+}
+
+pub fn bake_clean_pages(dirs: &[&Path], out_dir: &Path) -> Vec<usize> {
+    let assets = Assets::load(dirs);
+    let mut written = Vec::new();
+    if std::fs::create_dir_all(out_dir).is_err() {
+        eprintln!("menu: cannot create {}", out_dir.display());
+        return written;
+    }
+    for page in 0..3 {
+        let Some(base) = assets.base[page].as_ref() else { continue };
+        let page_surf = bake_clean_page(base, page);
+        let path = clean_page_path(out_dir, page);
+        let mut ok = true;
+        if let Err(e) = page_surf.save_tga(&path.to_string_lossy()) {
+            eprintln!("menu: {}: {}", path.display(), e);
+            ok = false;
+        }
+        if let Some(state) = assets.cyan[page].as_ref() {
+            let hover = bake_clean_state(state, &page_surf, page);
+            let path = hover_page_path(out_dir, page);
+            if let Err(e) = hover.save_tga(&path.to_string_lossy()) {
+                eprintln!("menu: {}: {}", path.display(), e);
+                ok = false;
+            }
+        }
+        if ok {
+            written.push(page);
+        }
+    }
+    written
+}
+
+/// The baked page for `page`, or None when the cache has not been built.
+fn clean_page_path(out_dir: &Path, page: usize) -> std::path::PathBuf {
+    out_dir.join(format!("page{}_clean.tga", page + 1))
+}
+
 fn wipe_baked_captions(s: &mut Surface, base: &TgaImage, page: usize) {
     let pw = base.width as i32;
     let ph = base.height as i32;
@@ -1141,6 +1552,23 @@ fn wipe_baked_captions(s: &mut Surface, base: &TgaImage, page: usize) {
             }
         }
     }
+    // The ON/OFF pills ship with Chinese captions and are drawn as-is; the
+    // caption classifier below (which scans the left column) would punch holes
+    // in them, so their rectangles are protected first.
+    for h in page_hots(page) {
+        if !matches!(h.act, Act::Off(_)) {
+            continue;
+        }
+        let x0 = (h.x - 6).max(0);
+        let y0 = (h.y - 6).max(0);
+        let x1 = (h.x + h.w + 6).min(pw);
+        let y1 = (h.y + h.h + 6).min(ph);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                protect[(y * pw + x) as usize] = true;
+            }
+        }
+    }
     for y in 0..ph {
         for x in 0..(430.min(pw)) {
             let i = (y * pw + x) as usize;
@@ -1150,7 +1578,9 @@ fn wipe_baked_captions(s: &mut Surface, base: &TgaImage, page: usize) {
         }
     }
     for h in page_hots(page) {
-        if !matches!(h.act, Act::Opt(_, _) | Act::Off(_)) {
+        // Only option buttons. The ON/OFF pills (`Act::Off`) keep the baked
+        // Chinese captions they already ship with.
+        if !matches!(h.act, Act::Opt(_, _)) {
             continue;
         }
         let x0 = (h.x + 6).max(0);
@@ -1315,12 +1745,13 @@ fn body_on_row(s: &Surface, mask: &[bool], pw: i32, x: i32, y: i32) -> Option<[u
 /// each caption area from a clean pixel so the baked letters are gone and the
 /// face stays a smooth gradient. A per-pixel brightness test leaves ridges.
 fn wipe_chrome_captions(s: &mut Surface) {
-    for i in 0..3 {
-        let x = TABS_X + i * TAB_W;
-        repaint_from_column(s, x + 8, x + 16, TABS_Y + 8, TAB_W - 32, 18);
-    }
+    // The tab strip already ships its English "OPTION 1/2/3" captions in all
+    // three states and they match the labels the engine wants, so it is
+    // blitted untouched (repainting it from a column left a flat grey band).
     s.fill_rect(NAV_BAR_X + 2, NAV_Y + 2, (BAR_W - 4) as u32, (NAV_H - 4) as u32, [0, 0, 0, 255]);
-    flatten_pill(s, DEF_X + 6, DEF_Y + 3, DEF_W - 12, DEF_H - 6);
+    // The default button sheet already ships Chinese (恢复默认设置) with its
+    // gear and pill in all three states, so it is blitted as-is; flattening it
+    // here used to leave a pale band under the vector caption.
 }
 
 fn repaint_from_column(s: &mut Surface, src_x: i32, x: i32, y: i32, w: i32, h: i32) {
@@ -1397,33 +1828,40 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
     for lab in page_labs(page).iter().chain(chrome_labs().iter()) {
         let size = menu_px(lab.size, wh);
         let (bx, by, bw, bh) = (mapx(lab.x), mapy(lab.y), mapw(lab.x, lab.w), maph(lab.y, lab.h));
+        // Tracking is authored in layout units and scaled with the window,
+        // like every other measurement on this screen.
+        let track = lab.tracking * wh / 720;
         // English under the Chinese (Window, Full Screen, …) is not drawn.
         // A second line is kept only when it is itself Chinese, such as 音量OFF.
         let sub_is_cjk = lab.sub.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
         if lab.sub.is_empty() || !sub_is_cjk {
             stamps.push(crate::render::text::Label {
-                text: spread_cjk(lab.text),
+                text: lab.text.to_string(),
                 x: bx,
                 y: by,
                 w: bw,
                 h: bh,
                 size,
                 center: lab.center,
-                rgb: [255, 255, 255],
+                rgb: lab.color,
+                tracking: track,
             });
         } else {
+            // Main line on five eighths, sub line on the rest with a fixed gap
+            // between them, so a two-line button does not drift with its height.
             let gap = (bh / 8).max(4);
             let top = ((bh - gap) * 5 / 8).max(1);
             let sub_h = (bh - top - gap).max(1);
             stamps.push(crate::render::text::Label {
-                text: spread_cjk(lab.text),
+                text: lab.text.to_string(),
                 x: bx,
                 y: by,
                 w: bw,
                 h: top,
                 size,
                 center: true,
-                rgb: [255, 255, 255],
+                rgb: lab.color,
+                tracking: track,
             });
             stamps.push(crate::render::text::Label {
                 text: lab.sub.to_string(),
@@ -1431,24 +1869,16 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
                 y: by + top + gap,
                 w: bw,
                 h: sub_h,
-                size: menu_px((lab.size * 2 / 3).max(11), wh),
+                size: menu_px(lab.sub_size, wh),
                 center: true,
-                rgb: [255, 255, 255],
+                rgb: lab.sub_color,
+                tracking: 0,
             });
         }
     }
-    for (i, line) in helps.iter().enumerate() {
-        stamps.push(crate::render::text::Label {
-            text: (*line).to_string(),
-            x: 40,
-            y: wh + i as i32 * help_h as i32,
-            w: ww - 80,
-            h: help_h as i32,
-            size: menu_px(17, wh),
-            center: true,
-            rgb: [255, 255, 255],
-        });
-    }
+    // The help sheet (sys_0304X) already carries this text in Chinese, so
+    // nothing is stamped over it. Drawing vector text on top produced two
+    // different typefaces stacked on the same line.
     stamps.push(crate::render::text::Label {
         text: "向导信息".to_string(),
         x: mapx(GUIDE_X),
@@ -1457,7 +1887,8 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
         h: help_h as i32,
         size: menu_px(14, wh),
         center: false,
-        rgb: [255, 255, 255],
+        rgb: ink::SUB,
+        tracking: 0,
     });
     // One canvas for the whole page: the labels are re-tinted per frame, so
     // they have to come back as a buffer with the glyph coverage in alpha.
@@ -1468,18 +1899,25 @@ fn build_menu_text(page: usize, ww: i32, wh: i32) -> Option<MenuText> {
     Some(MenuText { ww, wh, page, buf, help_h, help_n: helps.len() })
 }
 
-fn blit_tint(surf: &mut Surface, rgba: &[u8], w: u32, h: u32, x: i32, y: i32, rgb: [u8; 3]) {
+/// Blit a label canvas with the colours it was built with.
+///
+/// The canvas is rendered once per page and window size, so the per-element
+/// inks - pale teal for a heading, muted cyan-grey for a scale, white for a
+/// button - travel in its own RGB channels. A single tint on the way out would
+/// flatten all of them back to one colour, which is what made the page look
+/// like it was assembled from two different screens.
+fn blit_ink(surf: &mut Surface, rgba: &[u8], w: u32, h: u32, x: i32, y: i32) {
     for row in 0..h as i32 {
         for col in 0..w as i32 {
             let i = ((row as u32 * w + col as u32) * 4) as usize;
             if i + 3 >= rgba.len() {
                 return;
             }
-            let a = rgba[i + 3];
-            if a == 0 {
+            let px = [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]];
+            if px[3] == 0 {
                 continue;
             }
-            surf.blend_pixel(x + col, y + row, [rgb[0], rgb[1], rgb[2], a]);
+            surf.blend_pixel(x + col, y + row, px);
         }
     }
 }
@@ -1487,10 +1925,9 @@ fn blit_tint(surf: &mut Surface, rgba: &[u8], w: u32, h: u32, x: i32, y: i32, rg
 fn paint_menu_text(frame: &mut Surface, text: &MenuText, help_row: Option<usize>) {
     let ww = text.ww as u32;
     let wh = text.wh.max(0) as u32;
-    let rgb = [214u8, 244, 248];
     let main = (wh as usize) * (ww as usize) * 4;
     if text.buf.len() >= main {
-        blit_tint(frame, &text.buf[..main], ww, wh, 0, 0, rgb);
+        blit_ink(frame, &text.buf[..main], ww, wh, 0, 0);
     }
     let row_bytes = (text.help_h as usize) * (ww as usize) * 4;
     let idx = match help_row {
@@ -1505,7 +1942,7 @@ fn paint_menu_text(frame: &mut Surface, text: &MenuText, help_row: Option<usize>
         } else {
             GUIDE_Y * text.wh / 720
         };
-        blit_tint(frame, &text.buf[start..end], ww, text.help_h, 0, y, rgb);
+        blit_ink(frame, &text.buf[start..end], ww, text.help_h, 0, y);
     }
 }
 
@@ -1692,8 +2129,13 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
             compose(&mut s, &assets, st, &scr);
             if cn && menu_text.is_some() {
                 s.fill_rect(GUIDE_X, GUIDE_Y, GUIDE_W as u32, GUIDE_H as u32, [0, 0, 0, 255]);
-                if let Some(base) = assets.base[scr.page].as_ref() {
-                    wipe_baked_captions(&mut s, base, scr.page);
+                // Only the page art needs the wipe, and only when it has not
+                // been baked already: with a clean page in the cache this is
+                // the one branch that does no pixel work at all.
+                if assets.clean[scr.page].is_none() {
+                    if let Some(base) = assets.base[scr.page].as_ref() {
+                        wipe_baked_captions(&mut s, base, scr.page);
+                    }
                 }
                 wipe_chrome_captions(&mut s);
             }
@@ -1748,13 +2190,197 @@ pub fn apply(st: &Settings, mx: Option<&crate::audio::mixer::Mixer>) {
 mod tests {
     use super::*;
 
+    /// Every caption has to stay inside the box the page artwork gave it: a
+    /// baseline that drifts down puts a label on the rule under it, and one
+    /// that drifts up clips it against the row above. This is the check the
+    /// layout change has to keep passing, on all three pages.
+    /// With a baked clean page present, `compose` must blit it and leave the
+    /// page free of original captions before the text layer is stamped. That
+    /// is the whole point of the cache: no per-frame pixel classification.
+    #[test]
+    fn clean_page_needs_no_wipe() {
+        let dirs = [
+            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let mut assets = Assets::load(&dirs);
+        let Some(base) = assets.base[0].as_ref() else { return };
+        // Build the clean page from the same art, so the test does not depend
+        // on the derived cache being generated in this checkout.
+        let baked = bake_clean_page(base, 0);
+        assets.clean = [
+            Some(TgaImage {
+                width: baked.width,
+                height: baked.height,
+                rgba: baked.pixels.clone(),
+            }),
+            None,
+            None,
+        ];
+        let st = Settings::default();
+        let scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None };
+        let mut s = Surface::new(W, H, [0, 0, 0, 255]);
+        compose(&mut s, &assets, &st, &scr);
+        let at = |s: &Surface, x: u32, y: u32| {
+            let i = ((y * s.width + x) * 4) as usize;
+            s.pixels[i] as u32 + s.pixels[i + 1] as u32 + s.pixels[i + 2] as u32
+        };
+        // The same caption area the fallback test inspects: after a clean
+        // compose there must be no bright baked glyph left on the left plate.
+        let mut bright = 0u32;
+        for y in (PAGE_Y as u32 + 20)..(PAGE_Y as u32 + 50) {
+            for x in (PAGE_X as u32 + 40)..(PAGE_X as u32 + 280) {
+                let sum = at(&s, x, y);
+                if sum > 400 {
+                    bright += 1;
+                }
+            }
+        }
+        assert_eq!(bright, 0, "clean page still shows the baked caption");
+    }
+
+    #[test]
+    fn every_label_stays_inside_its_box() {
+        let Some(f) = crate::render::text::VectorFont::open(
+            crate::render::text::DEFAULT_FONT,
+            crate::render::DIALOG_FONT_720,
+        ) else {
+            return;
+        };
+        let mut checked = 0usize;
+        for page in 0..3 {
+            for lab in page_labs(page).iter().chain(chrome_labs().iter()) {
+                if lab.text.is_empty() {
+                    continue;
+                }
+                assert!(f.set_size(lab.size), "size {} refused", lab.size);
+                let m = f.metrics();
+                let line = m.ascender - m.descender;
+                let (above, below) = f.ink_bounds(lab.text);
+                // Same rule labels_rgba uses.
+                let baseline = if line <= lab.h {
+                    lab.y + (lab.h - line) / 2 + m.ascender
+                } else {
+                    lab.y + (lab.h - (above + below)) / 2 + above
+                };
+                let top = baseline - above;
+                let bottom = baseline + below;
+                assert!(
+                    top >= lab.y - 2,
+                    "page {page} {:?}: ink top {top} above box {} (baseline {baseline})",
+                    lab.text,
+                    lab.y
+                );
+                assert!(
+                    bottom <= lab.y + lab.h + 2,
+                    "page {page} {:?}: ink bottom {bottom} below box {} (h {})",
+                    lab.text,
+                    lab.y + lab.h,
+                    lab.h
+                );
+                let w = f.measure_tracked(lab.text, lab.tracking);
+                assert!(
+                    w <= lab.w,
+                    "page {page} {:?}: width {w} over box {}",
+                    lab.text,
+                    lab.w
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 60, "only {checked} labels checked");
+    }
+
+    /// Tracking is real letter spacing, not spaces in the string: the label
+    /// text itself must stay free of padding characters, and the rendered
+    /// width must grow by exactly tracking * (chars - 1).
+    /// The bake is the clean base: no caption ink may survive in the label
+    /// column, while the heading bars and section rules must.
+    #[test]
+    fn baked_page_drops_captions_keeps_structure() {
+        let dirs = [
+            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
+            Path::new("/home/lrxin/wa2-native/data/bg"),
+        ];
+        let assets = Assets::load(&dirs);
+        let Some(base) = assets.base[0].as_ref() else { return };
+        let baked = bake_clean_page(base, 0);
+        // 1) Caption column: white-ish ink is gone (white captions would be
+        //    ~700 summed; the structures are dim teal, under 300).
+        // The ON/OFF pills in that strip keep their baked captions on purpose;
+        // their white rims would otherwise count as ink.
+        let pills: Vec<(i32, i32, i32, i32)> = page_hots(0)
+            .iter()
+            .filter(|h| matches!(h.act, Act::Off(_)))
+            .map(|h| (h.x - 6, h.y - 6, h.x + h.w + 6, h.y + h.h + 6))
+            .collect();
+        let mut ink = 0u32;
+        for y in 0..PAGE_H as u32 {
+            for x in 8..478u32 {
+                if pills
+                    .iter()
+                    .any(|&(x0, y0, x1, y1)| {
+                        let (px, py) = (x as i32, y as i32);
+                        px >= x0 && px < x1 && py >= y0 && py < y1
+                    })
+                {
+                    continue;
+                }
+                let i = ((y * baked.width + x) * 4) as usize;
+                let p = [baked.pixels[i], baked.pixels[i + 1], baked.pixels[i + 2]];
+                let sum = p[0] as u32 + p[1] as u32 + p[2] as u32;
+                if sum > 400 && !dim_teal_structure(p) {
+                    ink += 1;
+                }
+            }
+        }
+        assert_eq!(ink, 0, "baked label column still has caption ink ({ink} px)");
+        // 2) The heading bar next to 画面设置 survives.
+        let bar = |x: u32, y: u32| {
+            let i = ((y * baked.width + x) * 4) as usize;
+            dim_teal_structure([baked.pixels[i], baked.pixels[i + 1], baked.pixels[i + 2]])
+        };
+        let bars = (0..140u32).filter(|&y| bar(28, y)).count();
+        assert!(bars > 10, "heading bar was eaten ({bars} px)");
+        // 3) A section rule survives: the one right of 画面设置.
+        let rules = (300..1000u32).filter(|&x| bar(x, 28)).count();
+        assert!(rules > 100, "section rule was eaten ({rules} px)");
+    }
+
+    #[test]
+    fn tracking_widens_without_polluting_the_string() {
+        let Some(f) = crate::render::text::VectorFont::open(
+            crate::render::text::DEFAULT_FONT,
+            18,
+        ) else {
+            return;
+        };
+        let labs = page_labs(0);
+        let head = labs.iter().find(|l| l.text == "画面设置").expect("group head");
+        assert_eq!(head.tracking, 1, "headings get a little air");
+        assert!(!head.text.contains(' '), "no spaces in the label text");
+        let plain = f.measure("画面设置");
+        let tracked = f.measure_tracked("画面设置", head.tracking);
+        assert_eq!(tracked, plain + head.tracking * ("画面设置".chars().count() as i32 - 1));
+        // A left label is not letter-spaced: at 22px with a space between every
+        // glyph it read looser than the button text it labels.
+        let row = labs.iter().find(|l| l.text == "画面模式").expect("row label");
+        assert_eq!(row.tracking, 0, "row labels stay tight");
+    }
+
+    /// The fallback path: with no baked clean page (a data tree without the
+    /// cache), the runtime still has to remove the original captions from the
+    /// composed page. The normal path - blitting a clean page - is covered by
+    /// `clean_page_needs_no_wipe`.
     #[test]
     fn baked_page_captions_are_replaced_by_the_background() {
         let dirs = [
             Path::new("/home/lrxin/wa2-native/data/bg_cn"),
             Path::new("/home/lrxin/wa2-native/data/bg"),
         ];
-        let assets = Assets::load(&dirs);
+        let mut assets = Assets::load(&dirs);
+        // Force the old path even if the cache exists in this checkout.
+        assets.clean = [None, None, None];
         let base = assets.base[0].as_ref().expect("page art");
         let st = Settings::default();
         let scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None };
@@ -1818,16 +2444,18 @@ mod tests {
         }
         assert!(btn_left < 24, "button caption still bright: {btn_left} px");
         wipe_chrome_captions(&mut s);
+        // The tab strip is blitted untouched: its baked English captions match
+        // the labels the engine wants, so the idle tab must still show them.
         let margin = at(&s, (TABS_X + TAB_W + 16) as u32, (TABS_Y + 16) as u32);
-        let mut tab_left = 0u32;
+        let mut tab_ink = 0u32;
         for y in (TABS_Y as u32 + 12)..(TABS_Y as u32 + 26) {
             for x in (TABS_X as u32 + TAB_W as u32 + 20)..(TABS_X as u32 + TAB_W as u32 * 2 - 20) {
                 if at(&s, x, y) > margin + 50 {
-                    tab_left += 1;
+                    tab_ink += 1;
                 }
             }
         }
-        assert!(tab_left < 12, "idle tab caption remains: {tab_left} px, margin {margin}");
+        assert!(tab_ink > 20, "idle tab lost its baked caption: {tab_ink} px");
     }
 
     #[test]

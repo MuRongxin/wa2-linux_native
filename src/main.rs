@@ -139,10 +139,17 @@ fn main() {
             // settings screen stops repairing pixels on every state change.
             let Some(d) = data::Data::resolve() else { return };
             // Same search order the settings screen uses: the Chinese overlay
-            // sheets first, then the original.
-            let cn = d.bg_cn();
-            let bg = d.bg();
-            let dirs: Vec<&std::path::Path> = if cn.is_dir() { vec![&cn, &bg] } else { vec![&bg] };
+            // sheets first, then the original. The 1x trees come first on
+            // purpose - the menu draws at logical size and the 4x upscaler
+            // mangled some of its sheets.
+            let mut dirs_buf: Vec<std::path::PathBuf> = Vec::new();
+            for name in ["bg_cn", "bg", "bg_cn_8x", "bg_8x"] {
+                let p = d.root.join(name);
+                if p.is_dir() {
+                    dirs_buf.push(p);
+                }
+            }
+            let dirs: Vec<&std::path::Path> = dirs_buf.iter().map(|p| p.as_path()).collect();
             let out = std::path::Path::new(&std::env::var("WA2_DATA").unwrap_or_else(|_| "data".into()))
                 .join("cache/ui/menu");
             let pages = menu::bake_clean_pages(&dirs, &out);
