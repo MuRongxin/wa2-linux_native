@@ -1722,6 +1722,8 @@ fn run_game_at(
     set_render_art_scale(win);
     let mut resume = resume;
     let script_dir = s.script_dir.as_path();
+    let bg_dirs = s.bg_dirs();
+    let ui = UiSound::resolve(&bg_dirs);
     const W: u32 = 1280;
     const H: u32 = 720;
     // The art is laid out at 1280x720 and stretched to the window; the
@@ -2559,7 +2561,14 @@ fn run_game_at(
                 }
                 vm::lscr::Event::Movie { name } => {
                     eprintln!("  movie: {}", name);
-                    let _ = play_movie(win, &s.movie_dir, &name, mixer.as_ref());
+                    let _ = play_movie(
+                        win,
+                        &s.movie_dir,
+                        &name,
+                        mixer.as_ref(),
+                        &bg_dirs,
+                        Some(&ui),
+                    );
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::Choice { options } => {
@@ -6036,6 +6045,89 @@ enum SpecialPick {
     Back,
 }
 
+#[derive(Clone, Copy, Default)]
+struct SpecialStats {
+    entered: [u32; 5],
+    visited: u8,
+}
+
+impl SpecialStats {
+    fn index(pick: &SpecialPick) -> Option<usize> {
+        match pick {
+            SpecialPick::Novel => Some(0),
+            SpecialPick::Cg => Some(1),
+            SpecialPick::Replay => Some(2),
+            SpecialPick::Music => Some(3),
+            SpecialPick::Voice => Some(4),
+            SpecialPick::Notice | SpecialPick::Back => None,
+        }
+    }
+
+    fn label(&self, cn: bool) -> String {
+        let names = if cn { ["小说", "CG", "时间线", "音乐", "语音"] }
+            else { ["小説", "CG", "年表", "音楽", "ボイス"] };
+        let visited = self.visited.count_ones();
+        format!(
+            "{} {}/5　{} {}　{} {}　{} {}　{} {}　{} {}",
+            if cn { "已浏览" } else { "閲覧" },
+            visited,
+            names[0], self.entered[0],
+            names[1], self.entered[1],
+            names[2], self.entered[2],
+            names[3], self.entered[3],
+            names[4], self.entered[4],
+        )
+    }
+}
+
+fn special_stats_path(dirs: &[&std::path::Path]) -> Option<std::path::PathBuf> {
+    dirs.iter().find_map(|d| d.parent().map(|root| root.join("save").join("special_stats.tsv")))
+}
+
+fn load_special_stats(dirs: &[&std::path::Path]) -> SpecialStats {
+    let Some(path) = special_stats_path(dirs) else { return SpecialStats::default() };
+    let Ok(text) = std::fs::read_to_string(path) else { return SpecialStats::default() };
+    let mut stats = SpecialStats::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let value = value.trim();
+        match key {
+            "visited" => stats.visited = value.parse::<u8>().unwrap_or(0) & 0x1f,
+            k if k.starts_with("entered_") => {
+                if let Ok(i) = k[8..].parse::<usize>() {
+                    if let Some(slot) = stats.entered.get_mut(i) {
+                        *slot = value.parse().unwrap_or(0);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+fn save_special_stats(dirs: &[&std::path::Path], stats: SpecialStats) {
+    let Some(path) = special_stats_path(dirs) else { return };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() { return; }
+    let mut text = format!("version=1\nvisited={}\n", stats.visited);
+    for (i, count) in stats.entered.iter().enumerate() {
+        text.push_str(&format!("entered_{i}={count}\n"));
+    }
+    let tmp = path.with_extension("tsv.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
+fn record_special_visit(dirs: &[&std::path::Path], pick: &SpecialPick) {
+    let Some(i) = SpecialStats::index(pick) else { return };
+    let mut stats = load_special_stats(dirs);
+    stats.visited |= 1 << i;
+    stats.entered[i] = stats.entered[i].saturating_add(1);
+    save_special_stats(dirs, stats);
+}
+
 fn crop_image(
     image: &codec::tga::TgaImage,
     x: u32,
@@ -6407,6 +6499,7 @@ fn run_special(
     } else {
         ["デジタルノベル", "CGモード", "タイムライン", "サウンドモード", "ボイス", "戻る"]
     };
+    let stats = load_special_stats(bg_dirs);
     let head_text = if cn { "特别内容" } else { "スペシャル" };
     let mut label_px = 0u32;
     // Font generation the menu/heading bitmaps were rasterized with; the page
@@ -6562,6 +6655,8 @@ fn run_special(
             );
         }
         draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
+        let stats_label = stats.label(cn);
+        draw_label(&mut frame, &stats_label, 15, 0, H as i32 - 36, true, ww as u32, wh as u32);
         if let Some(ref sheet) = weather {
             snow.ensure(ww, wh, sheet);
             snow.paint(&mut frame, wh);
@@ -7201,61 +7296,65 @@ fn run_title(
                     set_render_art_scale(win);
                     notice = None;
                 }
-                3 => match run_special(
-                    win,
-                    bg_dirs,
-                    cn,
-                    mixer,
-                    Some(&ui),
-                ) {
-                    SpecialPick::Novel => {
-                        if let Some(id) = browse_novels(win, bg_dirs, cn, mixer, Some(&ui)) {
-                            picked = TitleAction::Jump(id);
-                            break;
-                        }
-                        notice = None;
-                    }
-                    SpecialPick::Replay => {
-                        if let Some(id) = timeline::run(
-                            win,
-                            font,
-                            bg_dirs,
-                            script_dir,
-                            cn,
-                            mixer,
-                            Some(&ui),
-                        ) {
-                            picked = TitleAction::Jump(id);
-                            break;
-                        }
-                        notice = None;
-                    }
-                    SpecialPick::Cg => {
-                        if cg::cg_stems(bg_dirs).is_empty() {
-                            notice = Some(notice_text);
-                        } else {
-                            browse_cg(win, bg_dirs, cn, mixer, Some(&ui));
+                3 => {
+                    let special_pick = run_special(
+                        win,
+                        bg_dirs,
+                        cn,
+                        mixer,
+                        Some(&ui),
+                    );
+                    record_special_visit(bg_dirs, &special_pick);
+                    match special_pick {
+                        SpecialPick::Novel => {
+                            if let Some(id) = browse_novels(win, bg_dirs, cn, mixer, Some(&ui)) {
+                                picked = TitleAction::Jump(id);
+                                break;
+                            }
                             notice = None;
                         }
-                    }
-                    SpecialPick::Music => {
-                        // The music player drives the BGM category itself;
-                        // park the title/special track while it runs.
-                        if let (Some(mx), Some(slot)) = (mixer.as_ref(), bgm_slot.take()) {
-                            mx.stop(slot);
+                        SpecialPick::Replay => {
+                            if let Some(id) = timeline::run(
+                                win,
+                                font,
+                                bg_dirs,
+                                script_dir,
+                                cn,
+                                mixer,
+                                Some(&ui),
+                            ) {
+                                picked = TitleAction::Jump(id);
+                                break;
+                            }
+                            notice = None;
                         }
-                        let bgm_dir = script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
-                        run_music(win, bg_dirs, &bgm_dir, cn, mixer, Some(&ui));
-                        bgm_slot = start_title_bgm(mixer, bg_dirs);
-                        notice = None;
+                        SpecialPick::Cg => {
+                            if cg::cg_stems(bg_dirs).is_empty() {
+                                notice = Some(notice_text);
+                            } else {
+                                browse_cg(win, bg_dirs, cn, mixer, Some(&ui));
+                                notice = None;
+                            }
+                        }
+                        SpecialPick::Music => {
+                            // The music player drives the BGM category itself;
+                            // park the title/special track while it runs.
+                            if let (Some(mx), Some(slot)) = (mixer.as_ref(), bgm_slot.take()) {
+                                mx.stop(slot);
+                            }
+                            let bgm_dir = script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
+                            run_music(win, bg_dirs, &bgm_dir, cn, mixer, Some(&ui));
+                            bgm_slot = start_title_bgm(mixer, bg_dirs);
+                            notice = None;
+                        }
+                        SpecialPick::Voice => {
+                            browse_voice_messages(win, bg_dirs, cn, mixer, Some(&ui));
+                            notice = None;
+                        }
+                        SpecialPick::Back => notice = None,
+                        SpecialPick::Notice => notice = Some(notice_text),
                     }
-                    SpecialPick::Voice => {
-                        browse_voice_messages(win, bg_dirs, cn, mixer, Some(&ui));
-                        notice = None;
-                    }
-                    SpecialPick::Back => notice = None,
-                    SpecialPick::Notice => notice = Some(notice_text),
-                },
+                }
                 4 => {
                     picked = TitleAction::Quit;
                     break;
@@ -7282,6 +7381,8 @@ fn play_movie(
     movie_dir: &std::path::Path,
     name: &str,
     mixer: Option<&audio::Mixer>,
+    bg_dirs: &[&std::path::Path],
+    ui: Option<&UiSound>,
 ) -> Option<()> {
     let cands = [
         name.to_ascii_lowercase(),
@@ -7327,7 +7428,29 @@ fn play_movie(
         loop {
             match win.poll_input() {
                 sdl2::Input::None | sdl2::Input::Pointer { pressed: false, .. } => {}
-                _ => break 'play,
+                sdl2::Input::Advance
+                | sdl2::Input::Back
+                | sdl2::Input::Right
+                | sdl2::Input::RightClick
+                | sdl2::Input::Choice(_)
+                | sdl2::Input::Pointer { pressed: true, .. } => {
+                    let snapshot = render::Surface {
+                        width: movie.width,
+                        height: movie.height,
+                        pixels: frame.clone(),
+                    }
+                    .scaled_to(1280, 720);
+                    let message = if std::env::var_os("WA2_LANG").as_deref() == Some(std::ffi::OsStr::new("jp")) {
+                        "ムービーをスキップしますか？"
+                    } else {
+                        "要跳过影片吗？"
+                    };
+                    if ask_yes_no(win, &snapshot, bg_dirs, message, mixer, ui).unwrap_or(true) {
+                        break 'play;
+                    }
+                }
+                sdl2::Input::Quit => break 'play,
+                _ => {}
             }
             let now = std::time::Instant::now();
             if now >= deadline { break; }
@@ -7489,6 +7612,25 @@ mod ui_sound_tests {
         for k in [UiSe::Move, UiSe::Confirm, UiSe::Cancel, UiSe::Page] {
             assert!(ui.path(k).is_none(), "{k:?} should be silent");
         }
+    }
+
+    #[test]
+    fn special_stats_have_one_counter_per_content_page() {
+        let mut stats = SpecialStats::default();
+        for pick in [
+            SpecialPick::Novel,
+            SpecialPick::Cg,
+            SpecialPick::Replay,
+            SpecialPick::Music,
+            SpecialPick::Voice,
+        ] {
+            let i = SpecialStats::index(&pick).unwrap();
+            stats.visited |= 1 << i;
+            stats.entered[i] += 1;
+        }
+        assert_eq!(stats.visited.count_ones(), 5);
+        assert!(stats.label(true).contains("已浏览 5/5"));
+        assert_eq!(SpecialStats::index(&SpecialPick::Back), None);
     }
 }
 

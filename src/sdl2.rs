@@ -91,6 +91,13 @@ pub struct Sdl {
     f_destroy_renderer: unsafe extern "C" fn(*mut c_void),
     f_destroy_window: unsafe extern "C" fn(*mut c_void),
     f_delay: unsafe extern "C" fn(u32),
+    f_create_cursor: Option<unsafe extern "C" fn(*const u8, *const u8, c_int, c_int, c_int, c_int) -> *mut c_void>,
+    f_set_cursor: Option<unsafe extern "C" fn(*mut c_void)>,
+    f_free_cursor: Option<unsafe extern "C" fn(*mut c_void)>,
+    f_show_cursor: Option<unsafe extern "C" fn(c_int) -> c_int>,
+    cursor_normal: *mut c_void,
+    cursor_hover: *mut c_void,
+    cursor_pressed: *mut c_void,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +158,35 @@ unsafe fn sym(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
     if p.is_null() { None } else { Some(p) }
 }
 
+/// Return SDL's 1-bit cursor data and mask for the normal, hover and pressed
+/// states. SDL copies these buffers during `SDL_CreateCursor`, so stack arrays
+/// are sufficient here.
+fn cursor_bitmap(kind: u8) -> ([u8; 32], [u8; 32]) {
+    let mut data = [0u8; 32];
+    let mut mask = [0u8; 32];
+    let mut pixel = |x: usize, y: usize, black: bool| {
+        if x >= 16 || y >= 16 { return; }
+        let i = y * 2 + x / 8;
+        let bit = 0x80 >> (x & 7);
+        mask[i] |= bit;
+        if black { data[i] |= bit; }
+    };
+    for y in 0..16usize {
+        let tip_w = if kind == 1 { (y + 2).min(13) } else { (y + 1).min(11) };
+        for x in 0..=tip_w {
+            let border = x == 0 || x == tip_w || y == 0;
+            pixel(x, y, border || kind == 2);
+        }
+        if y >= 8 {
+            let stem = if kind == 1 { 5..=9 } else { 4..=8 };
+            for x in stem {
+                pixel(x, y, kind == 2 || x == 5 || x == 8);
+            }
+        }
+    }
+    (data, mask)
+}
+
 impl Sdl {
     /// Try to open a window + streaming texture. Returns None if SDL2 is
     /// unavailable or window creation fails (e.g. no display).
@@ -194,6 +230,14 @@ impl Sdl {
         let f_destroy_renderer: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(sym(lib, "SDL_DestroyRenderer")?);
         let f_destroy_window: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(sym(lib, "SDL_DestroyWindow")?);
         let f_delay: unsafe extern "C" fn(u32) = std::mem::transmute(sym(lib, "SDL_Delay")?);
+        let f_create_cursor = sym(lib, "SDL_CreateCursor")
+            .map(|p| std::mem::transmute(p));
+        let f_set_cursor = sym(lib, "SDL_SetCursor")
+            .map(|p| std::mem::transmute(p));
+        let f_free_cursor = sym(lib, "SDL_FreeCursor")
+            .map(|p| std::mem::transmute(p));
+        let f_show_cursor = sym(lib, "SDL_ShowCursor")
+            .map(|p| std::mem::transmute(p));
 
         // Choose the pulse audio driver BEFORE any SDL_Init (PipeWire system):
         // SDL picks the driver at init time from SDL_AUDIODRIVER.
@@ -247,7 +291,7 @@ impl Sdl {
         if texture.is_null() {
             return None;
         }
-        Some(Sdl {
+        let mut sdl = Sdl {
             _lib: lib,
             window,
             renderer,
@@ -269,7 +313,54 @@ impl Sdl {
             f_destroy_renderer,
             f_destroy_window,
             f_delay,
-        })
+            f_create_cursor,
+            f_set_cursor,
+            f_free_cursor,
+            f_show_cursor,
+            cursor_normal: std::ptr::null_mut(),
+            cursor_hover: std::ptr::null_mut(),
+            cursor_pressed: std::ptr::null_mut(),
+        };
+        sdl.enable_game_cursor();
+        Some(sdl)
+    }
+
+    /// Install a small high-contrast game cursor. The original resource tree
+    /// does not ship a standalone cursor image, so this uses the same cyan /
+    /// dark outline language as the UI and keeps all three interaction states
+    /// visible without relying on a desktop theme.
+    fn enable_game_cursor(&mut self) {
+        let (Some(create), Some(set), Some(show)) =
+            (self.f_create_cursor, self.f_set_cursor, self.f_show_cursor)
+        else {
+            return;
+        };
+        let normal = cursor_bitmap(0);
+        let hover = cursor_bitmap(1);
+        let pressed = cursor_bitmap(2);
+        unsafe {
+            self.cursor_normal = create(normal.0.as_ptr(), normal.1.as_ptr(), 16, 16, 1, 1);
+            self.cursor_hover = create(hover.0.as_ptr(), hover.1.as_ptr(), 16, 16, 1, 1);
+            self.cursor_pressed = create(pressed.0.as_ptr(), pressed.1.as_ptr(), 16, 16, 1, 1);
+            if !self.cursor_normal.is_null() {
+                set(self.cursor_normal);
+                show(1);
+            }
+        }
+    }
+
+    fn set_cursor_visual(&mut self, pressed: bool, hover: bool) {
+        let Some(set) = self.f_set_cursor else { return };
+        let cursor = if pressed {
+            self.cursor_pressed
+        } else if hover {
+            self.cursor_hover
+        } else {
+            self.cursor_normal
+        };
+        if !cursor.is_null() {
+            unsafe { set(cursor); }
+        }
     }
 
     /// Upload `surf` pixels to the texture and present, scaled to the window.
@@ -404,6 +495,7 @@ impl Sdl {
                         let state = u32::from_ne_bytes([ev[16], ev[17], ev[18], ev[19]]);
                         let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
                         let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
+                        self.set_cursor_visual(state & 1 != 0, state & 1 == 0);
                         out = if state & 1 != 0 {
                             Input::Drag { x, y }
                         } else {
@@ -431,6 +523,7 @@ impl Sdl {
                     let button = ev[16];
                     let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
                     let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
+                    self.set_cursor_visual(true, false);
                     out = if button == 3 {
                         Input::RightClick
                     } else {
@@ -440,6 +533,7 @@ impl Sdl {
                     // Same layout as the button-down event. A click is this
                     // release without a drag in between.
                     let button = ev[16];
+                    self.set_cursor_visual(false, false);
                     if button == 1
                         && matches!(
                             out,
@@ -703,6 +797,13 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
 impl Drop for Sdl {
     fn drop(&mut self) {
         unsafe {
+            if let Some(free) = self.f_free_cursor {
+                for cursor in [self.cursor_normal, self.cursor_hover, self.cursor_pressed] {
+                    if !cursor.is_null() {
+                        free(cursor);
+                    }
+                }
+            }
             (self.f_destroy_texture)(self.texture);
             (self.f_destroy_renderer)(self.renderer);
             (self.f_destroy_window)(self.window);
@@ -803,5 +904,22 @@ pub fn sdl_get_error() -> String {
         let f: unsafe extern "C" fn() -> *const c_char = std::mem::transmute(p);
         let e = f();
         if e.is_null() { "".into() } else { std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_bitmap;
+
+    #[test]
+    fn game_cursor_has_three_visible_states() {
+        let normal = cursor_bitmap(0);
+        let hover = cursor_bitmap(1);
+        let pressed = cursor_bitmap(2);
+        assert!(normal.1.iter().any(|&b| b != 0));
+        assert!(hover.1.iter().any(|&b| b != 0));
+        assert!(pressed.1.iter().any(|&b| b != 0));
+        assert_ne!(normal, hover);
+        assert_ne!(normal, pressed);
     }
 }
