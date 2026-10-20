@@ -1,0 +1,212 @@
+//! CG mode: the list, its thumbnails, and the on-disk thumbnail cache.
+//!
+//! The list is every event CG (`v%06d`) shipped in the picture trees. Layer
+//! pieces (`_bg`, `_chr`, `_chreff`, ...) are parts of one picture, not pictures
+//! of their own, so they are dropped.
+//!
+//! Thumbnails never come from an upscaled master. Two cheap sources exist:
+//!
+//!   * `tv{number}.tga` - the 256x144 copy the original ships next to every CG
+//!     it lists, which is why the CG screen can draw a whole page instantly;
+//!   * the unscaled original tree (`bg/`, 1280x720 TGA), reduced here and
+//!     written to `data/cache/cg_thumbs` so the next visit is a file read.
+//!
+//! A cached thumbnail is only trusted while it is at least as new as the
+//! picture it was made from.
+
+use crate::codec::image;
+use crate::codec::tga::{self, TgaImage};
+use crate::render::Surface;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+/// Grid shape. Five 240px cells plus the gaps fill the 1280px layout exactly.
+pub const COLS: usize = 5;
+pub const ROWS: usize = 4;
+pub const PER_PAGE: usize = COLS * ROWS;
+
+/// Working thumbnail size; matches the `tv*` copies the original ships.
+pub const THUMB_W: u32 = 256;
+pub const THUMB_H: u32 = 144;
+
+/// Parts of a single composed picture, listed as separate files in the trees.
+/// Every suffix the trees actually ship: these are the parts one composed CG
+/// is assembled from (`v103200_fence` is its fence overlay, for instance).
+const LAYER_SUFFIXES: [&str; 8] =
+    ["_bg", "_chr", "_chreff", "_ev", "_fg", "_eff", "_fence", "_mask"];
+const EXTS: [&str; 6] = ["tga", "TGA", "webp", "WEBP", "bmp", "BMP"];
+
+/// Every event CG in the picture trees, sorted, keyed by its stem.
+pub fn cg_stems(dirs: &[&Path]) -> Vec<String> {
+    let mut found: HashMap<String, String> = HashMap::new();
+    for dir in dirs {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let lower = name.to_ascii_lowercase();
+            let Some(stem) = lower.rfind('.').map(|i| &lower[..i]) else { continue };
+            if !stem.starts_with('v') || LAYER_SUFFIXES.iter().any(|s| stem.ends_with(s)) {
+                continue;
+            }
+            // Keep the original casing: file names are mostly lower case, but
+            // looking a picture up has to try what is actually on disk first.
+            let original = name.rfind('.').map(|i| name[..i].to_string()).unwrap_or(name.clone());
+            found.entry(stem.to_string()).or_insert(original);
+        }
+    }
+    let mut stems: Vec<String> = found.into_values().collect();
+    stems.sort();
+    stems
+}
+
+/// A thumbnail for `stem`, or `None` when the picture cannot be reduced to one
+/// without touching an upscaled master.
+pub fn load_thumb(dirs: &[&Path], stem: &str) -> Option<TgaImage> {
+    let source = picture_path(dirs, stem)?;
+    let cache = cache_path(stem);
+    if cache_is_fresh(&cache, &source) {
+        if let Ok(img) = image::decode_file(&cache) {
+            return Some(img);
+        }
+    }
+    let img = make_thumb(dirs, stem, &source)?;
+    write_cache(&cache, &img);
+    Some(img)
+}
+
+fn make_thumb(dirs: &[&Path], stem: &str, source: &Path) -> Option<TgaImage> {
+    // 1. The original's own small copy: 256x144, already the right size.
+    if let Some(tv) = shipped_thumb(dirs, stem) {
+        if let Ok(img) = image::decode_file(&tv) {
+            if img.width == THUMB_W && img.height == THUMB_H {
+                return Some(img);
+            }
+            return Some(shrink(&img, THUMB_W, THUMB_H));
+        }
+    }
+    // 2. The unscaled original. A 4x/8x master would be a second of decoding
+    //    for a 240px cell, so this deliberately refuses to look at one.
+    if source_art_scale(source) > 1 {
+        return None;
+    }
+    let full = image::decode_file(source).ok()?;
+    if full.width <= THUMB_W && full.height <= THUMB_H {
+        return Some(full);
+    }
+    Some(shrink(&full, THUMB_W, THUMB_H))
+}
+
+/// Area-average `img` down to `w`x`h`.
+fn shrink(img: &TgaImage, w: u32, h: u32) -> TgaImage {
+    let mut s = Surface::new(img.width, img.height, [0, 0, 0, 255]);
+    s.pixels.clone_from_slice(&img.rgba);
+    s.thumbnail(w, h)
+}
+
+/// The same picture as `tv{number}`, the small copy the original ships.
+fn shipped_thumb(dirs: &[&Path], stem: &str) -> Option<PathBuf> {
+    let number = stem.strip_prefix('v')?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    picture_path(dirs, &format!("tv{number}"))
+}
+
+/// Locate a picture across the trees, preferring the unscaled original: its
+/// TGAs decode in about ten milliseconds while a 4x WebP takes hundreds.
+fn picture_path(dirs: &[&Path], stem: &str) -> Option<PathBuf> {
+    let mut best: Option<(u32, PathBuf)> = None;
+    for dir in dirs {
+        let scale = image::dir_art_scale(dir);
+        for name in name_variants(stem) {
+            let p = dir.join(&name);
+            if p.is_file() && best.as_ref().map_or(true, |(s, _)| scale < *s) {
+                best = Some((scale, p));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// `<stem>` plus its case variants, crossed with every extension the trees use.
+fn name_variants(stem: &str) -> Vec<String> {
+    let mut stems = vec![stem.to_string()];
+    for v in [stem.to_lowercase(), stem.to_uppercase()] {
+        if !stems.contains(&v) {
+            stems.push(v);
+        }
+    }
+    let mut out = Vec::with_capacity(stems.len() * EXTS.len());
+    for s in stems {
+        for e in EXTS {
+            out.push(format!("{s}.{e}"));
+        }
+    }
+    out
+}
+
+fn source_art_scale(path: &Path) -> u32 {
+    image::source_art_scale(path).max(1)
+}
+
+fn cache_root() -> PathBuf {
+    let base = std::env::var_os("WA2_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"));
+    base.join("cache").join("cg_thumbs")
+}
+
+fn cache_path(stem: &str) -> PathBuf {
+    cache_root().join(format!("{}.tga", stem.to_lowercase()))
+}
+
+fn cache_is_fresh(cache: &Path, source: &Path) -> bool {
+    let (Ok(a), Ok(b)) = (mtime(cache), mtime(source)) else { return false };
+    a >= b
+}
+
+fn mtime(path: &Path) -> Result<SystemTime, ()> {
+    path.metadata().and_then(|m| m.modified()).map_err(|_| ())
+}
+
+/// Best effort: a half-written cache file would simply be regenerated, so the
+/// write does not need to be atomic.
+fn write_cache(path: &Path, img: &TgaImage) {
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = std::fs::write(path, tga::encode(img));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_pieces_are_not_listed_as_pictures_of_their_own() {
+        let base = std::env::temp_dir().join(format!("wa2-cg-test-{}", std::process::id()));
+        let dir = base.join("bg");
+        let _ = std::fs::create_dir_all(&dir);
+        for name in ["v100100.tga", "v100200.tga", "v100200_bg.tga", "v100200_chr.tga", "b100400.tga"] {
+            let _ = std::fs::write(dir.join(name), b"");
+        }
+        let dirs: [&Path; 1] = [dir.as_path()];
+        let stems = cg_stems(&dirs);
+        assert_eq!(stems, vec!["v100100".to_string(), "v100200".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn name_variants_cover_case_and_extension() {
+        let v = name_variants("v101700");
+        assert!(v.contains(&"v101700.tga".to_string()));
+        assert!(v.contains(&"V101700.TGA".to_string()));
+        assert!(v.contains(&"v101700.webp".to_string()));
+    }
+}
+

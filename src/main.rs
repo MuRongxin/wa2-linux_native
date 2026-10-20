@@ -2,6 +2,7 @@ mod archive;
 mod artcache;
 mod audio;
 mod codec;
+mod cg;
 mod cmdbar;
 mod data;
 mod ft2;
@@ -5235,56 +5236,86 @@ fn play_ui_se(mixer: Option<&audio::Mixer>, path: Option<&Path>) {
 
 /// CG stills from `bg/v*.tga`. Left and right (or the two halves of the
 /// screen) page through them; Esc or the right button returns to the title.
-fn cg_names(dirs: &[&std::path::Path]) -> Vec<String> {
-    let mut names = Vec::new();
-    for d in dirs {
-        let rd = match std::fs::read_dir(d) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().into_owned();
-            let low = name.to_ascii_lowercase();
-            if low.starts_with('v')
-                && (low.ends_with(".tga") || low.ends_with(".webp"))
-                && !names.iter().any(|n: &String| n.eq_ignore_ascii_case(&name))
-            {
-                names.push(name);
-            }
-        }
-    }
-    names.sort();
-    names
-}
-
-fn browse_cg(win: &mut sdl2::Sdl, font: &render::Font, dirs: &[&std::path::Path], names: &[String]) {
-    if names.is_empty() {
-        return;
-    }
+/// CG mode: a grid of thumbnails, then a zoomable full view of one picture.
+///
+/// The grid reads the small copies the original ships (`tv*`, see
+/// `cg::load_thumb`), so a page of twenty cells costs a few file reads
+/// instead of twenty high-resolution decodes.
+fn browse_cg(win: &mut sdl2::Sdl, dirs: &[&std::path::Path], cn: bool) {
     const W: u32 = 1280;
     const H: u32 = 720;
-    let mut i = 0usize;
+    // Five 240px cells plus the 8px gaps span the layout exactly:
+    // 5*240 + 4*8 = 1232, leaving a 24px margin on each side.
+    const CELL_W: u32 = 240;
+    const CELL_H: u32 = 144;
+    const GAP: u32 = 8;
+    const GRID_X: i32 = 24;
+    const GRID_Y: i32 = 64;
+
+    let stems = cg::cg_stems(dirs);
+    if stems.is_empty() {
+        return;
+    }
+    let pages = stems.len().div_ceil(cg::PER_PAGE);
+    let mut sel = 0usize;
+    let mut thumbs: std::collections::HashMap<String, Option<codec::tga::TgaImage>> =
+        std::collections::HashMap::new();
     loop {
-        let img = load_background(dirs, &names[i]).unwrap_or_else(|| solid_bg(W, H, [0, 0, 0]));
-        let mut surf = render::render_scene_ex(&img, "", font, W, H, &[], None, false, None, None, 255, 0, &[]);
-        let caption = format!("{}   {} / {}", names[i], i + 1, names.len());
-        if let Some((rw, rh, rgba)) =
-            render::text::with_ui_font(22, |f| f.block_rgba(&[caption], 700, 40, 22)).flatten()
-        {
-            surf.fill_rect(24, H as i32 - rh as i32 - 28, rw + 16, rh + 8, [0, 0, 0, 160]);
-            surf.blit_rgba(&rgba, rw, rh, 32, H as i32 - rh as i32 - 24);
+        let page = sel / cg::PER_PAGE;
+        let mut frame = render::Surface::new(W, H, [6, 14, 26, 255]);
+        let info = format!("{}   {} / {}   第 {} / {} 页", stems[sel], sel + 1, stems.len(), page + 1, pages);
+        let head = if cn { "CG 鉴赏" } else { "CG 鑑賞" };
+        draw_label(&mut frame, head, 26, 24, 18, false);
+        draw_label(&mut frame, &info, 18, 1000, 24, false);
+        for row in 0..cg::ROWS {
+            for col in 0..cg::COLS {
+                let idx = page * cg::PER_PAGE + row * cg::COLS + col;
+                let Some(stem) = stems.get(idx) else { continue };
+                let (cx, cy) = cell_origin(col, row, GRID_X, GRID_Y, CELL_W, CELL_H, GAP);
+                let entry = thumbs
+                    .entry(stem.clone())
+                    .or_insert_with(|| cg::load_thumb(dirs, stem));
+                match entry {
+                    Some(img) => {
+                        // A 256x144 picture keeps its 16:9 shape inside a 5:3 cell.
+                        let dh = (CELL_W * img.height / img.width.max(1)).min(CELL_H);
+                        let inset = ((CELL_H - dh) / 2) as i32;
+                        frame.blit_region_scaled(img, 0, 0, img.width, img.height,
+                            cx, cy + inset, CELL_W, dh, 255);
+                    }
+                    None => {
+                        frame.fill_rect(cx, cy, CELL_W, CELL_H, [16, 32, 48, 255]);
+                        draw_label(&mut frame, stem, 16, cx + 8, cy + 60, false);
+                    }
+                }
+                if idx == sel {
+                    highlight_cell(&mut frame, cx, cy, CELL_W, CELL_H);
+                }
+            }
         }
-        win.present(&surf);
+        let hint = if cn { "方向键选择　滚轮翻页　回车/点击放大　Esc 返回" }
+            else { "方向キー選択　ホイールでページ　Enter/クリックで拡大　Esc 戻る" };
+        draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true);
+        win.present(&frame);
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => return,
-            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Down => i = (i + 1) % names.len(),
-            sdl2::Input::Up => i = (i + names.len() - 1) % names.len(),
-            sdl2::Input::Pointer { x, y, pressed: true } => {
-                let (sx, _) = win.surface_pos(x, y, W, H);
-                if sx < (W as i32) / 2 {
-                    i = (i + names.len() - 1) % names.len();
-                } else {
-                    i = (i + 1) % names.len();
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
+            sdl2::Input::Advance => view_cg(win, dirs, &stems, &mut sel, cn),
+            sdl2::Input::Left => sel = sel.saturating_sub(1),
+            sdl2::Input::Right => sel = (sel + 1).min(stems.len() - 1),
+            sdl2::Input::Up => sel = sel.saturating_sub(cg::COLS),
+            sdl2::Input::Down => sel = (sel + cg::COLS).min(stems.len() - 1),
+            sdl2::Input::Wheel { y } => {
+                let next = if y > 0 { page.saturating_sub(1) } else { (page + 1).min(pages - 1) };
+                sel = (next * cg::PER_PAGE).min(stems.len() - 1);
+            }
+            sdl2::Input::Pointer { x, y, pressed } => {
+                let (sx, sy) = win.surface_pos(x, y, W, H);
+                if let Some(idx) = cell_at(sx, sy, page, GRID_X, GRID_Y, CELL_W, CELL_H, GAP, &stems) {
+                    if idx != sel {
+                        sel = idx;
+                    } else if pressed {
+                        view_cg(win, dirs, &stems, &mut sel, cn);
+                    }
                 }
             }
             _ => win.delay(16),
@@ -5292,6 +5323,177 @@ fn browse_cg(win: &mut sdl2::Sdl, font: &render::Font, dirs: &[&std::path::Path]
     }
 }
 
+/// Cell origin inside the grid, in layout pixels.
+fn cell_origin(col: usize, row: usize, gx: i32, gy: i32, cw: u32, ch: u32, gap: u32) -> (i32, i32) {
+    (gx + col as i32 * (cw + gap) as i32, gy + row as i32 * (ch + gap) as i32)
+}
+
+/// Which cell a layout point lands on, if the page really has a CG there.
+fn cell_at(
+    x: i32,
+    y: i32,
+    page: usize,
+    gx: i32,
+    gy: i32,
+    cw: u32,
+    ch: u32,
+    gap: u32,
+    stems: &[String],
+) -> Option<usize> {
+    if x < gx || y < gy {
+        return None;
+    }
+    let stride_x = (cw + gap) as i32;
+    let stride_y = (ch + gap) as i32;
+    let col = (x - gx) / stride_x;
+    let row = (y - gy) / stride_y;
+    if col < 0 || row < 0 || col >= cg::COLS as i32 || row >= cg::ROWS as i32 {
+        return None;
+    }
+    // Inside a cell, not in the gap between two of them.
+    if x - gx - col * stride_x >= cw as i32 || y - gy - row * stride_y >= ch as i32 {
+        return None;
+    }
+    let idx = page * cg::PER_PAGE + row as usize * cg::COLS + col as usize;
+    (idx < stems.len()).then_some(idx)
+}
+
+fn highlight_cell(frame: &mut render::Surface, cx: i32, cy: i32, cw: u32, ch: u32) {
+    let gold = [226, 196, 120, 255];
+    frame.fill_rect(cx - 2, cy - 2, cw + 4, 2, gold);
+    frame.fill_rect(cx - 2, cy + ch as i32, cw + 4, 2, gold);
+    frame.fill_rect(cx - 2, cy - 2, 2, ch + 4, gold);
+    frame.fill_rect(cx + cw as i32, cy - 2, 2, ch + 4, gold);
+}
+
+/// One line of UI text on a dark plate. `centre` lays it out across the 1280px
+/// layout width instead of at `x`, which is what the hint lines want.
+fn draw_label(
+    frame: &mut render::Surface,
+    text: &str,
+    size: u32,
+    x: i32,
+    y: i32,
+    centre: bool,
+) {
+    if let Some((w, h, rgba)) = render::text::with_ui_font(size, |f| f.line_rgba(text, size)).flatten() {
+        let left = if centre { (1280 - w as i32) / 2 } else { x };
+        frame.fill_rect(left - 6, y - 4, w + 12, h + 8, [6, 16, 28, 200]);
+        frame.blit_rgba(&rgba, w, h, left, y);
+    }
+}
+
+/// Zoom levels the full view steps through. 1.0 shows the whole picture.
+const CG_ZOOMS: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
+
+/// How much of the visible area one arrow press moves.
+const PAN_STEP: f32 = 0.125;
+
+/// Full view of one CG: zoom with the wheel, pan by dragging or the arrows.
+///
+/// `sel` stays on the last picture looked at, so the grid comes back where the
+/// player left it.
+fn view_cg(
+    win: &mut sdl2::Sdl,
+    dirs: &[&std::path::Path],
+    stems: &[String],
+    sel: &mut usize,
+    cn: bool,
+) {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let mut zoom = 0usize;
+    let mut centre: Option<(f32, f32)> = None;
+    let mut img: Option<codec::tga::TgaImage> = None;
+    let mut loaded: Option<String> = None;
+    let mut last: Option<(i32, i32)> = None;
+    loop {
+        let stem = stems[*sel].clone();
+        if loaded.as_deref() != Some(stem.as_str()) {
+            img = load_background(dirs, &format!("{stem}.tga"));
+            loaded = Some(stem.clone());
+            centre = None;
+        }
+        let z = CG_ZOOMS[zoom];
+        let mut frame = render::Surface::new(W, H, [0, 0, 0, 255]);
+        if let Some(ref im) = img {
+            let vw = im.width as f32 / z;
+            let vh = im.height as f32 / z;
+            let (cx, cy) = centre.unwrap_or((im.width as f32 / 2.0, im.height as f32 / 2.0));
+            let sx = (cx - vw / 2.0).clamp(0.0, (im.width as f32 - vw).max(0.0));
+            let sy = (cy - vh / 2.0).clamp(0.0, (im.height as f32 - vh).max(0.0));
+            // Area-averaging while shrinking means the window shows the same
+            // crop whatever the source resolution behind it is.
+            frame.blit_region_scaled(im, sx as i32, sy as i32, vw.max(1.0) as u32, vh.max(1.0) as u32,
+                0, 0, W, H, 255);
+            let scale = if z == 1.0 {
+                String::from(if cn { "全图" } else { "全体" })
+            } else {
+                format!("x{:.1}", z)
+            };
+            let label = format!("{}  {}  {} / {}", stem, scale, *sel + 1, stems.len());
+            draw_label(&mut frame, &label, 18, 24, 20, false);
+        }
+        let hint = if cn { "←→切换 CG　滚轮/回车缩放　拖动移动　Esc 返回一览" }
+            else { "←→CG切替　ホイール/Enter拡大　ドラッグ移動　Esc 一覧へ" };
+        draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true);
+        win.present(&frame);
+        match win.poll_input() {
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
+            sdl2::Input::Left => *sel = sel.saturating_sub(1),
+            sdl2::Input::Right => *sel = (*sel + 1).min(stems.len() - 1),
+            sdl2::Input::Wheel { y } => zoom = step_zoom(zoom, y > 0),
+            sdl2::Input::Advance => zoom = step_zoom(zoom, true),
+            sdl2::Input::Up => pan_by(&mut centre, img.as_ref(), 0.0, -PAN_STEP, z),
+            sdl2::Input::Down => pan_by(&mut centre, img.as_ref(), 0.0, PAN_STEP, z),
+            // Dragging pulls the picture along with the cursor.
+            sdl2::Input::Drag { x, y } => {
+                let (sx, sy) = win.surface_pos(x, y, W, H);
+                if let Some((px, py)) = last {
+                    pan_by(&mut centre, img.as_ref(),
+                        -(sx - px) as f32 / W as f32,
+                        -(sy - py) as f32 / H as f32, z);
+                }
+                last = Some((sx, sy));
+            }
+            sdl2::Input::Pointer { x, y, .. } => {
+                last = Some(win.surface_pos(x, y, W, H));
+            }
+            sdl2::Input::Release { .. } => last = None,
+            _ => win.delay(16),
+        }
+        if CG_ZOOMS[zoom] == 1.0 {
+            centre = None;
+        }
+    }
+}
+
+fn step_zoom(zoom: usize, up: bool) -> usize {
+    if up {
+        (zoom + 1).min(CG_ZOOMS.len() - 1)
+    } else {
+        zoom.saturating_sub(1)
+    }
+}
+
+/// Move the view centre by a fraction of the visible area, keeping it inside
+/// the picture so no empty band shows. Fractions keep every caller independent
+/// of how large the decoded source behind the window happens to be.
+fn pan_by(
+    centre: &mut Option<(f32, f32)>,
+    img: Option<&codec::tga::TgaImage>,
+    fx: f32,
+    fy: f32,
+    zoom: f32,
+) {
+    let Some(im) = img else { return };
+    let vw = im.width as f32 / zoom;
+    let vh = im.height as f32 / zoom;
+    let (cx, cy) = centre.unwrap_or((im.width as f32 / 2.0, im.height as f32 / 2.0));
+    let nx = (cx + fx * vw).clamp(vw / 2.0, (im.width as f32 - vw / 2.0).max(vw / 2.0));
+    let ny = (cy + fy * vh).clamp(vh / 2.0, (im.height as f32 - vh / 2.0).max(vh / 2.0));
+    *centre = Some((nx, ny));
+}
 /// Pick one of the two electronic-novel chains.  They are real script roots
 /// (5000 and 5100), so entering one through the normal game runner preserves
 /// its backgrounds, text, voice and save/rewind behaviour.
@@ -6561,11 +6763,10 @@ fn run_title(
                         notice = None;
                     }
                     SpecialPick::Cg => {
-                        let names = cg_names(bg_dirs);
-                        if names.is_empty() {
+                        if cg::cg_stems(bg_dirs).is_empty() {
                             notice = Some(notice_text);
                         } else {
-                            browse_cg(win, font, bg_dirs, &names);
+                            browse_cg(win, bg_dirs, cn);
                             notice = None;
                         }
                     }
