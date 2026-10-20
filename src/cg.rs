@@ -7,7 +7,7 @@
 //! Thumbnails never come from an upscaled master. Two cheap sources exist:
 //!
 //!   * `tv{number}.tga` - the 256x144 copy the original ships next to every CG
-//!     it lists, which is why the CG screen can draw a whole page instantly;
+//!     it lists;
 //!   * the unscaled original tree (`bg/`, 1280x720 TGA), reduced here and
 //!     written to `data/cache/cg_thumbs` so the next visit is a file read.
 //!
@@ -26,9 +26,10 @@ pub const COLS: usize = 5;
 pub const ROWS: usize = 4;
 pub const PER_PAGE: usize = COLS * ROWS;
 
-/// Working thumbnail size; matches the `tv*` copies the original ships.
-pub const THUMB_W: u32 = 256;
-pub const THUMB_H: u32 = 144;
+/// Working thumbnail size. It is larger than the original `tv*` copy so the
+/// fullscreen grid does not have to enlarge a 256px bitmap.
+pub const THUMB_W: u32 = 480;
+pub const THUMB_H: u32 = 270;
 
 /// Parts of a single composed picture, listed as separate files in the trees.
 /// Every suffix the trees actually ship: these are the parts one composed CG
@@ -70,34 +71,39 @@ pub fn load_thumb(dirs: &[&Path], stem: &str) -> Option<TgaImage> {
     let cache = cache_path(stem);
     if cache_is_fresh(&cache, &source) {
         if let Ok(img) = image::decode_file(&cache) {
+            if debug_cg() {
+                eprintln!("cg: thumb {} cache={} {}x{} source={}", stem, cache.display(), img.width, img.height, source.display());
+            }
             return Some(img);
         }
     }
     let img = make_thumb(dirs, stem, &source)?;
     write_cache(&cache, &img);
+    if debug_cg() {
+        eprintln!("cg: thumb {} generated={} {}x{} source={}", stem, cache.display(), img.width, img.height, source.display());
+    }
     Some(img)
 }
 
 fn make_thumb(dirs: &[&Path], stem: &str, source: &Path) -> Option<TgaImage> {
-    // 1. The original's own small copy: 256x144, already the right size.
-    if let Some(tv) = shipped_thumb(dirs, stem) {
-        if let Ok(img) = image::decode_file(&tv) {
-            if img.width == THUMB_W && img.height == THUMB_H {
-                return Some(img);
-            }
-            return Some(shrink(&img, THUMB_W, THUMB_H));
-        }
-    }
-    // 2. The unscaled original. A 4x/8x master would be a second of decoding
-    //    for a 240px cell, so this deliberately refuses to look at one.
+    // Prefer the unscaled original when it exists. The shipped tv* copy is
+    // only 256px wide and becomes visibly soft in a fullscreen grid.
     if source_art_scale(source) > 1 {
+        // A 4x/8x master would be expensive to decode for a grid cell, so use
+        // the original small copy when no 1x picture was shipped.
+        if let Some(tv) = shipped_thumb(dirs, stem) {
+            if let Ok(img) = image::decode_file(&tv) {
+                return Some(shrink(&img, THUMB_W, THUMB_H));
+            }
+        }
         return None;
     }
     let full = image::decode_file(source).ok()?;
-    if full.width <= THUMB_W && full.height <= THUMB_H {
-        return Some(full);
-    }
     Some(shrink(&full, THUMB_W, THUMB_H))
+}
+
+fn debug_cg() -> bool {
+    std::env::var_os("WA2_DEBUG_CG").is_some()
 }
 
 /// Area-average `img` down to `w`x`h`.

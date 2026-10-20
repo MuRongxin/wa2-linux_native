@@ -5257,45 +5257,58 @@ fn browse_cg(win: &mut sdl2::Sdl, dirs: &[&std::path::Path], cn: bool) {
         return;
     }
     let pages = stems.len().div_ceil(cg::PER_PAGE);
+    eprintln!("cg: {} images, {} pages", stems.len(), pages);
     let mut sel = 0usize;
+    let mut debug_page = usize::MAX;
     let mut thumbs: std::collections::HashMap<String, Option<codec::tga::TgaImage>> =
         std::collections::HashMap::new();
     loop {
         let page = sel / cg::PER_PAGE;
-        let mut frame = render::Surface::new(W, H, [6, 14, 26, 255]);
+        let (ww, wh) = win.window_size();
+        let ww = ww.max(1) as u32;
+        let wh = wh.max(1) as u32;
+        let mut frame = render::Surface::new(ww, wh, [6, 14, 26, 255]);
+        if std::env::var_os("WA2_DEBUG_CG").is_some() && page != debug_page {
+            eprintln!("cg: grid page={} selection={} window={}x{}", page + 1, stems[sel], ww, wh);
+            debug_page = page;
+        }
         let info = format!("{}   {} / {}   第 {} / {} 页", stems[sel], sel + 1, stems.len(), page + 1, pages);
         let head = if cn { "CG 鉴赏" } else { "CG 鑑賞" };
-        draw_label(&mut frame, head, 26, 24, 18, false);
-        draw_label(&mut frame, &info, 18, 1000, 24, false);
+        draw_label(&mut frame, head, 26, 24, 18, false, ww, wh);
+        draw_label(&mut frame, &info, 18, 1000, 24, false, ww, wh);
         for row in 0..cg::ROWS {
             for col in 0..cg::COLS {
                 let idx = page * cg::PER_PAGE + row * cg::COLS + col;
                 let Some(stem) = stems.get(idx) else { continue };
-                let (cx, cy) = cell_origin(col, row, GRID_X, GRID_Y, CELL_W, CELL_H, GAP);
+                let (lx, ly) = cell_origin(col, row, GRID_X, GRID_Y, CELL_W, CELL_H, GAP);
+                let cx = lx * ww as i32 / W as i32;
+                let cy = ly * wh as i32 / H as i32;
+                let cw = (CELL_W * ww / W).max(1);
+                let ch = (CELL_H * wh / H).max(1);
                 let entry = thumbs
                     .entry(stem.clone())
                     .or_insert_with(|| cg::load_thumb(dirs, stem));
                 match entry {
                     Some(img) => {
                         // A 256x144 picture keeps its 16:9 shape inside a 5:3 cell.
-                        let dh = (CELL_W * img.height / img.width.max(1)).min(CELL_H);
-                        let inset = ((CELL_H - dh) / 2) as i32;
+                        let dh = (cw * img.height / img.width.max(1)).min(ch);
+                        let inset = ((ch - dh) / 2) as i32;
                         frame.blit_region_scaled(img, 0, 0, img.width, img.height,
-                            cx, cy + inset, CELL_W, dh, 255);
+                            cx, cy + inset, cw, dh, 255);
                     }
                     None => {
-                        frame.fill_rect(cx, cy, CELL_W, CELL_H, [16, 32, 48, 255]);
-                        draw_label(&mut frame, stem, 16, cx + 8, cy + 60, false);
+                        frame.fill_rect(cx, cy, cw, ch, [16, 32, 48, 255]);
+                        draw_label(&mut frame, stem, 16, lx + 8, ly + 60, false, ww, wh);
                     }
                 }
                 if idx == sel {
-                    highlight_cell(&mut frame, cx, cy, CELL_W, CELL_H);
+                    highlight_cell(&mut frame, cx, cy, cw, ch);
                 }
             }
         }
         let hint = if cn { "方向键选择　滚轮翻页　回车/点击放大　Esc 返回" }
             else { "方向キー選択　ホイールでページ　Enter/クリックで拡大　Esc 戻る" };
-        draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true);
+        draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true, ww, wh);
         win.present(&frame);
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
@@ -5375,11 +5388,21 @@ fn draw_label(
     x: i32,
     y: i32,
     centre: bool,
+    ww: u32,
+    wh: u32,
 ) {
-    if let Some((w, h, rgba)) = render::text::with_ui_font(size, |f| f.line_rgba(text, size)).flatten() {
-        let left = if centre { (1280 - w as i32) / 2 } else { x };
-        frame.fill_rect(left - 6, y - 4, w + 12, h + 8, [6, 16, 28, 200]);
-        frame.blit_rgba(&rgba, w, h, left, y);
+    let px = ((size as u64 * wh as u64 + 360) / 720).max(8) as u32;
+    if let Some((w, h, rgba)) = render::text::with_ui_font(px, |f| f.line_rgba(text, px)).flatten() {
+        let left = if centre {
+            (ww as i32 - w as i32) / 2
+        } else {
+            x * ww as i32 / 1280
+        };
+        let top = y * wh as i32 / 720;
+        let pad_x = (6 * ww as i32 / 1280).max(3);
+        let pad_y = (4 * wh as i32 / 720).max(2);
+        frame.fill_rect(left - pad_x, top - pad_y, w + pad_x as u32 * 2, h + pad_y as u32 * 2, [6, 16, 28, 200]);
+        frame.blit_rgba(&rgba, w, h, left, top);
     }
 }
 
@@ -5413,9 +5436,19 @@ fn view_cg(
             img = load_background(dirs, &format!("{stem}.tga"));
             loaded = Some(stem.clone());
             centre = None;
+            if std::env::var_os("WA2_DEBUG_CG").is_some() {
+                if let Some(ref im) = img {
+                    eprintln!("cg: view {} decoded={}x{} window={:?}", stem, im.width, im.height, win.window_size());
+                } else {
+                    eprintln!("cg: view {} FAILED to decode", stem);
+                }
+            }
         }
         let z = CG_ZOOMS[zoom];
-        let mut frame = render::Surface::new(W, H, [0, 0, 0, 255]);
+        let (ww, wh) = win.window_size();
+        let ww = ww.max(1) as u32;
+        let wh = wh.max(1) as u32;
+        let mut frame = render::Surface::new(ww, wh, [0, 0, 0, 255]);
         if let Some(ref im) = img {
             let vw = im.width as f32 / z;
             let vh = im.height as f32 / z;
@@ -5425,18 +5458,18 @@ fn view_cg(
             // Area-averaging while shrinking means the window shows the same
             // crop whatever the source resolution behind it is.
             frame.blit_region_scaled(im, sx as i32, sy as i32, vw.max(1.0) as u32, vh.max(1.0) as u32,
-                0, 0, W, H, 255);
+                0, 0, ww, wh, 255);
             let scale = if z == 1.0 {
                 String::from(if cn { "全图" } else { "全体" })
             } else {
                 format!("x{:.1}", z)
             };
             let label = format!("{}  {}  {} / {}", stem, scale, *sel + 1, stems.len());
-            draw_label(&mut frame, &label, 18, 24, 20, false);
+            draw_label(&mut frame, &label, 18, 24, 20, false, ww, wh);
         }
         let hint = if cn { "←→切换 CG　滚轮/回车缩放　拖动移动　Esc 返回一览" }
             else { "←→CG切替　ホイール/Enter拡大　ドラッグ移動　Esc 一覧へ" };
-        draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true);
+        draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true, ww, wh);
         win.present(&frame);
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
@@ -5549,106 +5582,280 @@ fn browse_novels(win: &mut sdl2::Sdl, dirs: &[&std::path::Path], cn: bool) -> Op
 /// The original 「ボイスメッセージ」 page is a small character-card player.
 /// The shipped 9001..9005 banks contain the five heroine message groups and
 /// sys_07200..07204 are their corresponding profile cards.
+/// Voice message page layout, kept next to its helpers so the hit tests and
+/// the drawing cannot drift apart.
+const VOICE_PANEL: (i32, i32, u32, u32) = (700, 88, 556, 532);
+const VOICE_ROW_X: i32 = 716;
+const VOICE_ROW_W: u32 = 524;
+const VOICE_ROW_H: u32 = 52;
+const VOICE_ROW_PITCH: i32 = 60;
+const VOICE_ROW_Y0: i32 = 176;
+/// Only this many rows fit between the title and the stop button.
+const VOICE_MAX_ROWS: usize = 5;
+const VOICE_BTN: (i32, i32, u32, u32) = (716, 520, 220, 56);
+
+/// The original 「ボイスメッセージ」 page: pick a character card, pick one of
+/// her messages, play it, stop it.
+///
+/// Every card and every clip that exists is selectable from the first visit -
+/// there is no "heard it before" gate. What the page tracks is what the
+/// original shows: the open card, the selected message, whether something is
+/// playing, and an explicit notice when the audio is missing (no clips shipped
+/// for that character, or no audio device at all).
 fn browse_voice_messages(
     win: &mut sdl2::Sdl,
     dirs: &[&std::path::Path],
     cn: bool,
     mixer: Option<&audio::Mixer>,
-    cursor: Option<&std::path::Path>,
 ) {
     const W: u32 = 1280;
     const H: u32 = 720;
+
     let names = if cn { ["冬马和纱", "小木曾雪菜", "小春", "千晶", "麻理"] }
         else { ["冬馬かずさ", "小木曾雪菜", "小春", "千晶", "麻理"] };
     let voice_dir = dirs.iter().find_map(|d| d.parent()).map(|p| p.join("voice"));
-    let mut clips: Vec<Vec<std::path::PathBuf>> = Vec::new();
-    for bank in 1..=5 {
-        let mut rows = Vec::new();
-        if let Some(dir) = voice_dir.as_ref() {
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for ent in rd.flatten() {
-                    let p = ent.path();
-                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                    if stem.starts_with(&format!("900{}_", bank)) {
-                        rows.push(p);
-                    }
+    // One directory scan for all five banks.
+    let mut clips: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); names.len()];
+    if let Some(dir) = voice_dir.as_ref() {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                // Files are `900{character}_{index:04}_{char}.OGG`.
+                let Some(rest) = stem.strip_prefix("900") else { continue };
+                let Some(bank) = rest.get(0..1).and_then(|v| v.parse::<usize>().ok()) else { continue };
+                if rest.get(1..2) != Some("_") || bank == 0 || bank > names.len() {
+                    continue;
                 }
+                clips[bank - 1].push(p);
             }
         }
-        rows.sort();
-        clips.push(rows);
     }
-    if clips.iter().all(|v| v.is_empty()) {
-        return;
+    for rows in clips.iter_mut() {
+        rows.sort();
     }
     eprintln!(
-        "voice messages: {} banks, clips={:?}",
-        clips.iter().filter(|v| !v.is_empty()).count(),
-        clips.iter().map(Vec::len).collect::<Vec<_>>()
+        "voice messages: {}",
+        clips.iter()
+            .enumerate()
+            .map(|(i, v)| format!("{}={}", names[i], v.len()))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
-    let cards: Vec<Option<codec::tga::TgaImage>> = (0..5)
-        .map(|i| load_background(dirs, &format!("sys_0720{}.tga", i)))
+    if clips.iter().all(|v| v.is_empty()) {
+        eprintln!("voice messages: no 900x_* clips under {:?}; page not shown", voice_dir);
+        return;
+    }
+    let cards: Vec<Option<codec::tga::TgaImage>> = (0..names.len())
+        .map(|i| load_background(dirs, &format!("sys_0720{i}.tga")))
         .collect();
+
+    let n_chars = names.len();
     let mut character = 0usize;
     let mut line = 0usize;
-    let mut playing: Option<usize> = None;
+    // Stream slot plus what it belongs to, so its row can be marked playing.
+    let mut playing: Option<(usize, usize, usize)> = None;
     loop {
-        let mut frame = cards[character].as_ref().map(surface_from_tga)
-            .unwrap_or_else(|| render::Surface::new(W, H, [8, 24, 38, 255]));
-        if let Some((w, h, rgba)) = render::text::with_ui_font(22, |f| f.line_rgba(names[character], 22)).flatten() {
-            frame.fill_rect(34, 600, w + 24, h + 16, [0, 12, 30, 190]);
-            frame.blit_rgba(&rgba, w, h, 46, 608);
-        }
+        let (ww, wh) = win.window_size();
+        let ww = ww.max(1) as u32;
+        let wh = wh.max(1) as u32;
+        let sx = |x: i32| x * ww as i32 / W as i32;
+        let sy = |y: i32| y * wh as i32 / H as i32;
+        let sw = |w: u32| (w * ww / W).max(1);
+        let sh = |h: u32| (h * wh / H).max(1);
         let count = clips[character].len();
-        let status = if count == 0 {
-            if cn { "暂无语音消息" } else { "ボイスメッセージなし" }
-        } else {
-            // The resource has no text transcript; identify the playable clip
-            // without inventing dialogue text.
-            if cn { "按回车试听　左右切换语音" } else { "Enterで再生　左右で音声選択" }
-        };
-        if let Some((w, h, rgba)) = render::text::with_ui_font(18, |f| f.line_rgba(status, 18)).flatten() {
-            frame.fill_rect(760, 620, w + 24, h + 16, [0, 12, 30, 190]);
-            frame.blit_rgba(&rgba, w, h, 772, 628);
-        }
-        if count > 0 {
-            let text = format!("{}/{}", line + 1, count);
-            if let Some((w, h, rgba)) = render::text::with_ui_font(20, |f| f.line_rgba(&text, 20)).flatten() {
-                frame.blit_rgba(&rgba, w, h, 1160, 628);
+        // A clip that ended on its own clears the marker.
+        if let (Some(mx), Some((slot, _, _))) = (mixer, playing) {
+            if mx.finished(slot) {
+                playing = None;
             }
         }
+        let mut frame = render::Surface::new(ww, wh, [8, 24, 38, 255]);
+        if let Some(card) = cards[character].as_ref() {
+            frame.blit_region_scaled(card, 0, 0, card.width, card.height, 0, 0, ww, wh, 255);
+        }
+        frame.fill_rect(sx(VOICE_PANEL.0), sy(VOICE_PANEL.1), sw(VOICE_PANEL.2), sh(VOICE_PANEL.3), [4, 14, 28, 205]);
+        frame.fill_rect(sx(VOICE_PANEL.0), sy(VOICE_PANEL.1), sw(VOICE_PANEL.2), sh(2), [140, 200, 225, 190]);
+        let head = format!("{}  900{}", names[character], character + 1);
+        draw_label(&mut frame, &head, 26, VOICE_ROW_X + 4, VOICE_PANEL.1 + 20, false, ww, wh);
+        if count == 0 {
+            let msg = if cn { "暂无语音消息" } else { "ボイスメッセージなし" };
+            let why = match voice_dir.as_ref() {
+                Some(d) if cn => format!("{} 下没有 900{}_*.OGG", d.display(), character + 1),
+                Some(d) => format!("900{}_*.OGG not found in {}", character + 1, d.display()),
+                None => String::from(if cn { "找不到 voice 目录" } else { "voice ディレクトリなし" }),
+            };
+            draw_label(&mut frame, msg, 22, VOICE_ROW_X + 4, VOICE_ROW_Y0 + 4, false, ww, wh);
+            draw_label(&mut frame, &why, 16, VOICE_ROW_X + 4, VOICE_ROW_Y0 + 46, false, ww, wh);
+        } else {
+            for i in 0..count.min(VOICE_MAX_ROWS) {
+                let y = VOICE_ROW_Y0 + i as i32 * VOICE_ROW_PITCH;
+                let selected = i == line;
+                let sounds = playing.map(|(_, c, l)| c == character && l == i).unwrap_or(false);
+                let (fill, bar) = match (selected, sounds) {
+                    (true, true) => ([52, 128, 150, 235], [240, 210, 130, 255]),
+                    (true, false) => ([30, 74, 104, 230], [180, 220, 235, 235]),
+                    (false, true) => ([36, 86, 108, 180], [140, 190, 210, 200]),
+                    (false, false) => ([16, 40, 62, 200], [90, 140, 170, 120]),
+                };
+                frame.fill_rect(sx(VOICE_ROW_X), sy(y), sw(VOICE_ROW_W), sh(VOICE_ROW_H), fill);
+                frame.fill_rect(sx(VOICE_ROW_X), sy(y), sw(4), sh(VOICE_ROW_H), bar);
+                let label = if cn { format!("语音消息 {}", i + 1) }
+                    else { format!("ボイスメッセージ {}", i + 1) };
+                draw_label(&mut frame, &label, 20, VOICE_ROW_X + 18, y + 14, false, ww, wh);
+                let mark = match (sounds, selected) {
+                    (true, _) => Some(if cn { "播放中" } else { "再生中" }),
+                    (false, true) => Some(if cn { "回车播放" } else { "Enter" }),
+                    _ => None,
+                };
+                if let Some(m) = mark {
+                    draw_label(&mut frame, m, 18, VOICE_ROW_X + VOICE_ROW_W as i32 - 130, y + 15, false, ww, wh);
+                }
+            }
+            if count > VOICE_MAX_ROWS {
+                let more = format!("... {} / {}", line + 1, count);
+                draw_label(&mut frame, &more, 16, VOICE_ROW_X + 4,
+                    VOICE_ROW_Y0 + VOICE_MAX_ROWS as i32 * VOICE_ROW_PITCH, false, ww, wh);
+            }
+        }
+        // The button stays drawn either way so the layout never jumps.
+        let armed = playing.is_some();
+        frame.fill_rect(sx(VOICE_BTN.0), sy(VOICE_BTN.1), sw(VOICE_BTN.2), sh(VOICE_BTN.3),
+            if armed { [60, 96, 120, 235] } else { [24, 44, 62, 200] });
+        frame.fill_rect(sx(VOICE_BTN.0), sy(VOICE_BTN.1), sw(VOICE_BTN.2), sh(2),
+            if armed { [200, 170, 110, 220] } else { [90, 130, 155, 150] });
+        let btn_text = if cn {
+            if armed { "停止 (空格)" } else { "停止" }
+        } else if armed {
+            "停止 (Space)"
+        } else {
+            "停止"
+        };
+        draw_label(&mut frame, btn_text, 20, VOICE_BTN.0 + 18, VOICE_BTN.1 + 16, false, ww, wh);
+        let hint = match (mixer.is_some(), count > 0) {
+            (false, _) if cn => "音频设备不可用，无法试听　Esc 返回",
+            (false, _) => "オーディオ機器なし　Esc 戻る",
+            (true, true) if cn => "↑↓ 切换角色　←→ 选择语音　空格 播放/停止　Esc 返回",
+            (true, true) => "↑↓ キャラ切替　←→ 音声選択　Space 再生/停止　Esc 戻る",
+            (true, false) if cn => "↑↓ 切换角色　Esc 返回",
+            (true, false) => "↑↓ キャラ切替　Esc 戻る",
+        };
+        draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true, ww, wh);
         win.present(&frame);
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
-                if let (Some(mx), Some(slot)) = (mixer, playing.take()) { mx.stop(slot); }
+                voice_stop(mixer, &mut playing);
                 return;
             }
-            sdl2::Input::Up => { character = (character + 4) % 5; line = 0; }
-            sdl2::Input::Down => { character = (character + 1) % 5; line = 0; }
-            sdl2::Input::Left => if count > 0 { line = (line + count - 1) % count; },
-            sdl2::Input::Right => if count > 0 { line = (line + 1) % count; },
+            // Changing character or message always stops the current clip.
+            sdl2::Input::Up => {
+                character = (character + n_chars - 1) % n_chars;
+                voice_stop(mixer, &mut playing);
+                voice_clamp(&mut line, clips[character].len());
+            }
+            sdl2::Input::Down => {
+                character = (character + 1) % n_chars;
+                voice_stop(mixer, &mut playing);
+                voice_clamp(&mut line, clips[character].len());
+            }
+            sdl2::Input::Left if count > 0 => {
+                line = (line + count - 1) % count;
+                voice_stop(mixer, &mut playing);
+            }
+            sdl2::Input::Right if count > 0 => {
+                line = (line + 1) % count;
+                voice_stop(mixer, &mut playing);
+            }
             sdl2::Input::Advance | sdl2::Input::Choice(_) => {
-                if let (Some(mx), Some(path)) = (mixer, clips[character].get(line)) {
-                    if let Some(slot) = playing.take() { mx.stop(slot); }
-                    let slot = mx.play_cat(&path.to_string_lossy(), 1.0, false, audio::mixer::CAT_VOICE);
-                    if slot != usize::MAX {
-                        playing = Some(slot);
-                        eprintln!("voice message: {} -> {}", names[character], path.display());
-                    }
+                if playing.is_some() {
+                    voice_stop(mixer, &mut playing);
+                } else if let Some(path) = clips[character].get(line) {
+                    let ok = voice_play(mixer, &mut playing, path, character, line);
+                    eprintln!(
+                        "voice message: {} {} -> {}",
+                        names[character],
+                        if ok { "playing" } else { "FAILED" },
+                        path.display(),
+                    );
                 }
             }
             sdl2::Input::Pointer { x, y, pressed: true } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
-                if sy < 360 && sx < 640 { character = (character + 4) % 5; line = 0; }
-                else if sy < 360 { character = (character + 1) % 5; line = 0; }
-                else if count > 0 { line = (line + 1) % count; }
+                if point_in(sx, sy, VOICE_BTN) {
+                    voice_stop(mixer, &mut playing);
+                } else if let Some(i) = voice_row_at(sx, sy, count) {
+                    if i != line {
+                        line = i;
+                        voice_stop(mixer, &mut playing);
+                    } else if playing.is_some() {
+                        voice_stop(mixer, &mut playing);
+                    } else if let Some(path) = clips[character].get(i) {
+                        voice_play(mixer, &mut playing, path, character, i);
+                    }
+                } else if sy < 360 {
+                    // Card art above the panel: left half back, right half on.
+                    character = if sx < 640 {
+                        (character + n_chars - 1) % n_chars
+                    } else {
+                        (character + 1) % n_chars
+                    };
+                    voice_stop(mixer, &mut playing);
+                    voice_clamp(&mut line, clips[character].len());
+                }
             }
             _ => win.delay(16),
         }
-        let _ = cursor;
     }
 }
 
+/// Stop whatever the page is playing and forget the marker.
+fn voice_stop(mixer: Option<&audio::Mixer>, playing: &mut Option<(usize, usize, usize)>) {
+    if let (Some(mx), Some((slot, _, _))) = (mixer, playing.take()) {
+        mx.stop(slot);
+    }
+}
+
+/// Start one message, replacing anything already playing. False when there is
+/// no audio device or the decoder could not be started.
+fn voice_play(
+    mixer: Option<&audio::Mixer>,
+    playing: &mut Option<(usize, usize, usize)>,
+    path: &std::path::Path,
+    character: usize,
+    line: usize,
+) -> bool {
+    let Some(mx) = mixer else { return false };
+    voice_stop(mixer, playing);
+    let slot = mx.play_cat(&path.to_string_lossy(), 1.0, false, audio::mixer::CAT_VOICE);
+    if slot == usize::MAX {
+        return false;
+    }
+    *playing = Some((slot, character, line));
+    true
+}
+
+/// Keep the selected row inside a bank that may be shorter than the last one.
+fn voice_clamp(line: &mut usize, count: usize) {
+    if *line >= count {
+        *line = count.saturating_sub(1);
+    }
+}
+
+fn point_in(x: i32, y: i32, r: (i32, i32, u32, u32)) -> bool {
+    x >= r.0 && x < r.0 + r.2 as i32 && y >= r.1 && y < r.1 + r.3 as i32
+}
+
+/// Which message row a layout point lands on, if the bank has it.
+fn voice_row_at(x: i32, y: i32, count: usize) -> Option<usize> {
+    let i = (y - VOICE_ROW_Y0) / VOICE_ROW_PITCH;
+    if i < 0 || i as usize >= count.min(VOICE_MAX_ROWS) {
+        return None;
+    }
+    if !point_in(x, y, (VOICE_ROW_X, VOICE_ROW_Y0 + i * VOICE_ROW_PITCH, VOICE_ROW_W, VOICE_ROW_H)) {
+        return None;
+    }
+    Some(i as usize)
+}
 /// 「特别模式」. Labels are the system font. The highlight bar and the logo
 /// stay the original art. 「时间线」 replaces the atlas row 场景回放.
 enum SpecialPick {
@@ -6782,7 +6989,7 @@ fn run_title(
                         notice = None;
                     }
                     SpecialPick::Voice => {
-                        browse_voice_messages(win, bg_dirs, cn, mixer.as_ref(), cursor.as_deref());
+                        browse_voice_messages(win, bg_dirs, cn, mixer.as_ref());
                         notice = None;
                     }
                     SpecialPick::Back => notice = None,
