@@ -68,6 +68,7 @@ const SDLK_END: i32 = 77;
 const SDLK_TAB: i32 = 43;
 const SDLK_r: i32 = 21;
 const SDLK_f: i32 = 9;
+const SDLK_t: i32 = 23;
 
 pub struct Sdl {
     _lib: *mut c_void,
@@ -150,6 +151,8 @@ pub enum NavKey {
     Reset,
     /// Back to the newest save's scene.
     Focus,
+    /// Cycle the timeline route/chapter filter.
+    Filter,
 }
 
 unsafe fn sym(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
@@ -483,6 +486,7 @@ impl Sdl {
                         SDLK_TAB => out = Input::Nav(NavKey::Tab),
                         SDLK_r => out = Input::Nav(NavKey::Reset),
                         SDLK_f => out = Input::Nav(NavKey::Focus),
+                        SDLK_t => out = Input::Nav(NavKey::Filter),
                         _ => {}
                     }
                 } else if etype == SDL_MOUSEMOTION {

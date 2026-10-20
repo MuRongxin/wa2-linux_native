@@ -28,6 +28,9 @@ pub(super) struct PaintState<'a> {
     pub preview: &'a Preview,
     /// One header label per chart band, in chart.bands order.
     pub headers: &'a [Option<Label>],
+    /// When set, matching chapter nodes stay bright and other nodes remain
+    /// visible but subdued. Filtering is a view operation, never a graph edit.
+    pub filter: Option<&'a Chapter>,
 }
 
 // Layout owned by paint. The banner is 0..36, the chapter header bar is the
@@ -57,8 +60,8 @@ const TAG_BG: [u8; 4] = [0, 8, 20, 210];
 
 pub(super) fn paint(s: &mut Surface, st: &PaintState) {
     s.fill_rect(0, 0, W as u32, H as u32, BG);
-    draw_bands(s, st.chart, st.view);
-    let tags = draw_edges(s, st.chart, st.view);
+    draw_bands(s, st.chart, st.view, st.filter);
+    let tags = draw_edges(s, st.chart, st.view, st.filter);
     draw_nodes(s, st);
     draw_edge_tags(s, &tags);
     draw_top(s, st);
@@ -309,7 +312,7 @@ fn curved_edge(s: &mut Surface, ax: i32, ay: i32, ex: i32, ey: i32, thick: i32, 
 /// its lane extent, with brighter boundary rules. The fill is pre-blended with
 /// the chart background (opaque) so the whole chart can still be redrawn with
 /// the fast rect-copy path each frame.
-fn draw_bands(s: &mut Surface, chart: &Chart, view: &View) {
+fn draw_bands(s: &mut Surface, chart: &Chart, view: &View, filter: Option<&Chapter>) {
     let zoom = view.zoom;
     for band in &chart.bands {
         let x0 = (nav::world_x(band.first_col) * zoom - view.scroll_x).round() as i32 - 5;
@@ -327,8 +330,10 @@ fn draw_bands(s: &mut Surface, chart: &Chart, view: &View) {
         if x1 - x0 < 2 || y1 - y0 < 4 {
             continue;
         }
-        s.fill_rect(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32, band_fill(band.chapter));
-        let edge = band_edge(band.chapter);
+        let active = filter.map(|f| std::ptr::eq(f, band.chapter)).unwrap_or(true);
+        let fill = if active { band_fill(band.chapter) } else { mix(BG, band.chapter.color, 7) };
+        s.fill_rect(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32, fill);
+        let edge = if active { band_edge(band.chapter) } else { mix(BG, band.chapter.color, 20) };
         s.fill_rect(x0, y0, (x1 - x0) as u32, 1, edge);
         s.fill_rect(x0, y1 - 1, (x1 - x0) as u32, 1, edge);
         s.fill_rect(x0, y0, 1, (y1 - y0) as u32, edge);
@@ -350,16 +355,22 @@ struct EdgeTag {
     tint: [u8; 3],
 }
 
-fn draw_edges(s: &mut Surface, chart: &Chart, view: &View) -> Vec<EdgeTag> {
+fn draw_edges(s: &mut Surface, chart: &Chart, view: &View, filter: Option<&Chapter>) -> Vec<EdgeTag> {
     let zoom = view.zoom;
     let mut tags: Vec<EdgeTag> = Vec::new();
     let mut tagged = vec![false; chart.nodes.len()];
     for node in &chart.nodes {
+        if let Some(f) = filter {
+            if !std::ptr::eq(f, node.chapter) { continue; }
+        }
         let (x, y, w, h) = nav::place(node, view);
         let ax = x + w;
         let ay = y + h / 2;
         for edge in &node.next {
             let target = &chart.nodes[edge.to];
+            if let Some(f) = filter {
+                if !std::ptr::eq(f, target.chapter) { continue; }
+            }
             let (tx, ty, tw, th) = nav::place(target, view);
             let ex = tx - EDGE_GAP;
             let ey = ty + th / 2;
@@ -457,6 +468,9 @@ fn draw_nodes(s: &mut Surface, st: &PaintState) {
             blit_scaled(s, img, x, y, w, h);
         } else {
             s.fill_rect(x, y, w.max(1) as u32, h.max(1) as u32, [10, 30, 60, 255]);
+        }
+        if st.filter.map(|f| !std::ptr::eq(f, node.chapter)).unwrap_or(false) {
+            s.fill_rect(x, y, w.max(1) as u32, h.max(1) as u32, [1, 12, 28, 170]);
         }
         if i == st.sel {
             frame_rect(s, x, y, w, h, 3, GOLD);
@@ -575,6 +589,14 @@ fn draw_top(s: &mut Surface, st: &PaintState) {
                 right = x + 8;
             }
         }
+    }
+    if let Some(filter) = st.filter {
+        let text = format!("筛选：{}　(T切换 / R清除)", filter.title);
+        with_label(&text, 14, |label| {
+            let x = (W - label.w as i32 - 12).max(4);
+            s.fill_rect(x - 5, HEADER_TOP + 5, label.w + 10, label.h + 4, [0, 8, 20, 235]);
+            blit_tinted_clip(s, label, x, HEADER_TOP + 7, route_ink(filter), W - 3);
+        });
     }
 }
 
@@ -904,6 +926,7 @@ mod tests {
             view,
             preview,
             headers: &[],
+            filter: None,
         }
     }
 

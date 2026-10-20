@@ -1070,6 +1070,37 @@ fn stop_voice(mx: &audio::Mixer, voice_stream: &mut Option<usize>) {
     }
 }
 
+/// Scenario ids listed by the original sample-play table (`9999.bnr`).
+/// The table is deliberately explicit: ordinary scenes must never inherit the
+/// H-scene voice rule just because they happen to show an event CG.
+const H_SCENE_IDS: [&str; 18] = [
+    "1012_030_2", "2031", "2312", "2313", "2401", "2402", "2504", "2507",
+    "2511", "2513", "3001", "3015", "3210", "3901", "3902", "3904", "3906", "3907",
+];
+
+fn is_h_scene_id(scene: &str) -> bool {
+    H_SCENE_IDS.iter().any(|candidate| *candidate == scene)
+}
+
+/// Character ids that the settings page classifies as female. Unknown ids are
+/// treated as male for the female-only H-scene mode, which avoids accidentally
+/// playing an unclassified male voice.
+fn is_female_voice_char(char_id: u32) -> bool {
+    matches!(char_id, 1 | 2 | 3 | 4 | 5 | 16 | 19 | 23 | 24 | 25)
+}
+
+fn h_scene_voice_allowed(settings: &menu::Settings, scene: &str, char_id: u32) -> bool {
+    if !is_h_scene_id(scene) {
+        return true;
+    }
+    match settings.ero_voice {
+        0 => false,
+        1 => true,
+        2 => is_female_voice_char(char_id),
+        _ => true,
+    }
+}
+
 /// Start one line's voice. `page_voice` stops whatever was still playing.
 fn play_voice(
     mx: &audio::Mixer,
@@ -1077,6 +1108,7 @@ fn play_voice(
     settings: &menu::Settings,
     voice_stream: &mut Option<usize>,
     cue: vm::lscr::VoiceCue,
+    scene: &str,
 ) {
     if settings.page_voice == 1 {
         stop_voice(mx, voice_stream);
@@ -1085,6 +1117,10 @@ fn play_voice(
         .map(|row| settings.char_voice[row] == 0)
         .unwrap_or(false);
     if muted {
+        return;
+    }
+    if !h_scene_voice_allowed(settings, scene, cue.char_id) {
+        eprintln!("  voice: H-scene rule filtered {}_{:04}_{:02}", cue.scenario, cue.line, cue.char_id);
         return;
     }
     if let Some(vf) = voices.find(cue) {
@@ -2181,7 +2217,7 @@ fn run_game_at(
                     if !cmd_skip {
                         if let (Some(mx), Some(vi), Some(cue)) = (mixer.as_ref(), voices.as_ref(), cue) {
                             skipped_voice = None;
-                            play_voice(mx, vi, &settings, &mut voice_stream, cue);
+                            play_voice(mx, vi, &settings, &mut voice_stream, cue, &current_id);
                         } else if settings.page_voice == 1 {
                             skipped_voice = None;
                             if let Some(mx) = mixer.as_ref() {
@@ -2787,7 +2823,7 @@ fn run_game_at(
                                                         if cmd_skip {
                                                             stop_voice(mx, &mut voice_stream);
                                                         } else if let (Some(cue), Some(vi)) = (skipped_voice.take(), voices.as_ref()) {
-                                                            play_voice(mx, vi, &settings, &mut voice_stream, cue);
+                                                            play_voice(mx, vi, &settings, &mut voice_stream, cue, &current_id);
                                                         }
                                                     }
                                                 },
@@ -3247,7 +3283,7 @@ fn run_game_at(
                                                     if cmd_skip {
                                                         stop_voice(mx, &mut voice_stream);
                                                     } else if let (Some(cue), Some(vi)) = (skipped_voice.take(), voices.as_ref()) {
-                                                        play_voice(mx, vi, &settings, &mut voice_stream, cue);
+                                                        play_voice(mx, vi, &settings, &mut voice_stream, cue, &current_id);
                                                     }
                                                 }
                                             },
@@ -3676,7 +3712,7 @@ fn rewind_step(
     );
     if announce {
         if let (Some(mx), Some(vi), Some(cue)) = (mixer, voices, dest.voice) {
-            play_voice(mx, vi, settings, voice_stream, cue);
+            play_voice(mx, vi, settings, voice_stream, cue, &dest.scene);
         }
     }
     eprintln!("rewind: scene {} pc {}", dest.scene, dest.vm.pc);
@@ -7631,6 +7667,19 @@ mod ui_sound_tests {
         assert_eq!(stats.visited.count_ones(), 5);
         assert!(stats.label(true).contains("已浏览 5/5"));
         assert_eq!(SpecialStats::index(&SpecialPick::Back), None);
+    }
+
+    #[test]
+    fn h_scene_voice_rule_only_affects_the_explicit_sample_play_scenes() {
+        let mut st = menu::Settings::default();
+        st.ero_voice = 0;
+        assert!(!h_scene_voice_allowed(&st, "2031", 2));
+        assert!(h_scene_voice_allowed(&st, "2001", 2));
+        st.ero_voice = 2;
+        assert!(h_scene_voice_allowed(&st, "2031", 2));
+        assert!(!h_scene_voice_allowed(&st, "2031", 10));
+        st.ero_voice = 1;
+        assert!(h_scene_voice_allowed(&st, "2031", 10));
     }
 }
 

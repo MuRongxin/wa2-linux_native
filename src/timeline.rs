@@ -199,6 +199,7 @@ pub fn run(
         .clamp(nav::ZOOM_MIN, nav::ZOOM_MAX);
     let mut view = View { zoom: start_zoom, target_zoom: start_zoom, scroll_x: 0.0, scroll_y: 0.0 };
     nav::focus_view(&chart, sel, &mut view);
+    let mut filter: Option<&'static chapters::Chapter> = None;
     let mut hover: Option<usize> = None;
     let mut hold: Option<nav::Hold> = None;
     let mut cursor = (W / 2, (CHART_TOP + PREVIEW_TOP) / 2);
@@ -229,6 +230,7 @@ pub fn run(
                 view: &view,
                 preview: &preview,
                 headers: &headers,
+                filter,
             },
         );
         win.present(&frame);
@@ -279,6 +281,13 @@ pub fn run(
             }
             sdl2::Input::Nav(sdl2::NavKey::Reset) => {
                 nav::reset_view(&chart, &mut view);
+                filter = None;
+                crate::play_ui(mixer, ui, crate::UiSe::Page);
+            }
+            sdl2::Input::Nav(sdl2::NavKey::Filter) => {
+                filter = cycle_filter(&chart, sel, filter);
+                sel = ensure_filter_selection(&chart, sel, filter);
+                nav::focus_view(&chart, sel, &mut view);
                 crate::play_ui(mixer, ui, crate::UiSe::Page);
             }
             sdl2::Input::Nav(sdl2::NavKey::Focus) => {
@@ -292,6 +301,7 @@ pub fn run(
                 if let Some(band) = chart.bands.get((n as usize).saturating_sub(1)) {
                     if let Some(i) = chart.nodes.iter().position(|node| std::ptr::eq(node.chapter, band.chapter)) {
                         sel = i;
+                        filter = Some(band.chapter);
                         nav::focus_view(&chart, sel, &mut view);
                         crate::play_ui(mixer, ui, crate::UiSe::Page);
                     }
@@ -355,7 +365,52 @@ pub fn run(
             }
             _ => win.delay(16),
         }
+        if let Some(f) = filter {
+            let visible = chart.nodes.get(sel).is_some_and(|node| std::ptr::eq(node.chapter, f));
+            if !visible {
+                sel = ensure_filter_selection(&chart, sel, filter);
+                nav::focus_view(&chart, sel, &mut view);
+            }
+        }
     }
+}
+
+fn cycle_filter(
+    chart: &Chart,
+    sel: usize,
+    current: Option<&'static chapters::Chapter>,
+) -> Option<&'static chapters::Chapter> {
+    let mut choices: Vec<&'static chapters::Chapter> = Vec::new();
+    for band in &chart.bands {
+        if !choices.iter().any(|chapter| std::ptr::eq(*chapter, band.chapter)) {
+            choices.push(band.chapter);
+        }
+    }
+    if choices.is_empty() { return None; }
+    match current {
+        None => chart.nodes.get(sel).map(|node| node.chapter),
+        Some(chapter) => {
+            let Some(i) = choices.iter().position(|candidate| std::ptr::eq(*candidate, chapter)) else {
+                return Some(choices[0]);
+            };
+            choices.get(i + 1).copied()
+        }
+    }
+}
+
+fn ensure_filter_selection(
+    chart: &Chart,
+    sel: usize,
+    filter: Option<&'static chapters::Chapter>,
+) -> usize {
+    let Some(chapter) = filter else { return sel };
+    if chart.nodes.get(sel).is_some_and(|node| std::ptr::eq(node.chapter, chapter)) {
+        return sel;
+    }
+    chart.nodes
+        .iter()
+        .position(|node| std::ptr::eq(node.chapter, chapter))
+        .unwrap_or(sel)
 }
 
 /// Offline consistency report for the chart (wa2-native timeline-check).
@@ -451,5 +506,24 @@ mod tests {
             let count = chart.bands.iter().filter(|b| std::ptr::eq(b.chapter, node.chapter)).count();
             assert_eq!(count, 1, "{} belongs to {} bands", node.id, count);
         }
+    }
+
+    #[test]
+    fn route_filter_cycles_and_keeps_selection_inside_the_chapter() {
+        let dir = Path::new("data/script");
+        if !dir.is_dir() {
+            return;
+        }
+        let nodes = graph::build_nodes(dir);
+        let bands = chapters::bands(&nodes);
+        let chart = Chart { nodes, here: None, bands };
+        if chart.nodes.is_empty() {
+            return;
+        }
+        let first = cycle_filter(&chart, 0, None).expect("first chapter filter");
+        let selected = ensure_filter_selection(&chart, 0, Some(first));
+        assert!(std::ptr::eq(chart.nodes[selected].chapter, first));
+        let next = cycle_filter(&chart, selected, Some(first));
+        assert!(next.is_some_and(|chapter| !std::ptr::eq(chapter, first)));
     }
 }
