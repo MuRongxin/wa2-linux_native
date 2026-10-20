@@ -151,6 +151,8 @@ pub fn run(
     bg_dirs: &[&Path],
     script_dir: &Path,
     cn: bool,
+    mixer: Option<&crate::audio::mixer::Mixer>,
+    ui: Option<&crate::UiSound>,
 ) -> Option<String> {
     let _ = font;
     let mut cover = Surface::new(W as u32, H as u32, BG);
@@ -232,41 +234,58 @@ pub fn run(
         win.present(&frame);
 
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick => return None,
-            sdl2::Input::Advance => return Some(chart.nodes[sel].id.clone()),
-            sdl2::Input::Back | sdl2::Input::Left => {
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
+                crate::play_ui(mixer, ui, crate::UiSe::Cancel);
+                return None;
+            }
+            sdl2::Input::Advance => {
+                crate::play_ui(mixer, ui, crate::UiSe::Confirm);
+                return Some(chart.nodes[sel].id.clone());
+            }
+            sdl2::Input::Left => {
                 sel = nav::step(&chart, sel, -1);
                 nav::focus_view(&chart, sel, &mut view);
+                crate::play_ui(mixer, ui, crate::UiSe::Move);
             }
             sdl2::Input::Right => {
                 sel = nav::step(&chart, sel, 1);
                 nav::focus_view(&chart, sel, &mut view);
+                crate::play_ui(mixer, ui, crate::UiSe::Move);
             }
             sdl2::Input::Up => {
                 sel = nav::step_lane(&chart, sel, -1);
                 nav::focus_view(&chart, sel, &mut view);
+                crate::play_ui(mixer, ui, crate::UiSe::Move);
             }
             sdl2::Input::Down => {
                 sel = nav::step_lane(&chart, sel, 1);
                 nav::focus_view(&chart, sel, &mut view);
+                crate::play_ui(mixer, ui, crate::UiSe::Move);
             }
             sdl2::Input::Nav(sdl2::NavKey::Home) => {
                 sel = nav::home(&chart);
                 nav::focus_view(&chart, sel, &mut view);
+                crate::play_ui(mixer, ui, crate::UiSe::Move);
             }
             sdl2::Input::Nav(sdl2::NavKey::End) => {
                 sel = nav::end(&chart, sel);
                 nav::focus_view(&chart, sel, &mut view);
+                crate::play_ui(mixer, ui, crate::UiSe::Move);
             }
             sdl2::Input::Nav(sdl2::NavKey::Tab) => {
                 sel = nav::step_chapter(&chart, sel, 1);
                 nav::focus_view(&chart, sel, &mut view);
+                crate::play_ui(mixer, ui, crate::UiSe::Page);
             }
-            sdl2::Input::Nav(sdl2::NavKey::Reset) => nav::reset_view(&chart, &mut view),
+            sdl2::Input::Nav(sdl2::NavKey::Reset) => {
+                nav::reset_view(&chart, &mut view);
+                crate::play_ui(mixer, ui, crate::UiSe::Page);
+            }
             sdl2::Input::Nav(sdl2::NavKey::Focus) => {
                 if let Some(here) = chart.here {
                     sel = here;
                     nav::focus_view(&chart, sel, &mut view);
+                    crate::play_ui(mixer, ui, crate::UiSe::Move);
                 }
             }
             sdl2::Input::Choice(n) => {
@@ -274,10 +293,14 @@ pub fn run(
                     if let Some(i) = chart.nodes.iter().position(|node| std::ptr::eq(node.chapter, band.chapter)) {
                         sel = i;
                         nav::focus_view(&chart, sel, &mut view);
+                        crate::play_ui(mixer, ui, crate::UiSe::Page);
                     }
                 }
             }
-            sdl2::Input::Wheel { y } => nav::wheel(&mut view, y),
+            sdl2::Input::Wheel { y } => {
+                nav::wheel(&mut view, y);
+                crate::play_ui(mixer, ui, crate::UiSe::Page);
+            }
             sdl2::Input::Drag { x, y } => {
                 let (sx, sy) = win.surface_pos(x, y, W as u32, H as u32);
                 cursor = (sx, sy);
@@ -313,17 +336,21 @@ pub fn run(
                     let page = (W - 80).max(200);
                     view.scroll_x += dir as f32 * page as f32;
                     nav::clamp_view(&chart, &mut view);
+                    crate::play_ui(mixer, ui, crate::UiSe::Page);
                     continue;
                 }
                 if nav::hit_preview(sx, sy) {
+                    crate::play_ui(mixer, ui, crate::UiSe::Confirm);
                     return Some(chart.nodes[sel].id.clone());
                 }
                 if let Some(i) = nav::hit_node(&chart, &view, sx, sy) {
                     if i == sel {
+                        crate::play_ui(mixer, ui, crate::UiSe::Confirm);
                         return Some(chart.nodes[sel].id.clone());
                     }
                     sel = i;
                     hover = Some(i);
+                    crate::play_ui(mixer, ui, crate::UiSe::Move);
                 }
             }
             _ => win.delay(16),

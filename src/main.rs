@@ -582,7 +582,14 @@ fn main() {
                 require_chinese_font();
             }
             let mut rt = Runtime::new(&win, &session);
-            match run_title(&mut win, &font, &session.bg_dirs(), &session.script_dir, !session.bg_cn_trees.is_empty()) {
+            match run_title(
+                &mut win,
+                &font,
+                &session.bg_dirs(),
+                &session.script_dir,
+                !session.bg_cn_trees.is_empty(),
+                rt.mixer.as_ref(),
+            ) {
                 TitleAction::Start => {
                     eprintln!("title: starting scene {}", start_id);
                     if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
@@ -3157,7 +3164,8 @@ fn run_game_at(
                                         1 => {
                                             let dirs = s.bg_dirs();
                                             let mut st = menu::Settings::load();
-                                            menu::run(win, &dirs, &mut st, mixer.as_ref());
+                                            let ui = UiSound::resolve(&dirs);
+                                            menu::run(win, &dirs, &mut st, mixer.as_ref(), Some(&ui));
                                             settings = menu::Settings::load();
                                             menu::apply(&settings, mixer.as_ref());
                                             // The font may have changed too, and
@@ -3183,12 +3191,16 @@ fn run_game_at(
                                                 &last_text,
                                                 bgm_track.map(|(id, _)| id),
                                             );
+                                            let dirs = s.bg_dirs();
+                                            let ui = UiSound::resolve(&dirs);
                                             saveload::run(
                                                 win,
-                                                &s.bg_dirs(),
+                                                &dirs,
                                                 saveload::Mode::Save,
                                                 Some(st),
                                                 Some(&cur_surf),
+                                                mixer.as_ref(),
+                                                Some(&ui),
                                             );
                                         }
                                         _ => {}
@@ -3821,6 +3833,8 @@ fn ask_yes_no(
     frame: &render::Surface,
     dirs: &[&std::path::Path],
     message: &str,
+    mixer: Option<&audio::Mixer>,
+    ui: Option<&UiSound>,
 ) -> Option<bool> {
     let plate = load_background(dirs, "sys_00100.tga");
     let buttons = load_background(dirs, "sys_00101.tga");
@@ -3844,17 +3858,29 @@ fn ask_yes_no(
         let surf = paint_confirm(frame, plate.as_ref(), buttons.as_ref(), text.as_ref(), hover);
         win.present(&surf);
         match win.poll_input() {
-            sdl2::Input::Quit => return None,
-            sdl2::Input::Back | sdl2::Input::Left | sdl2::Input::RightClick => return Some(false),
+            sdl2::Input::Quit => {
+                play_ui(mixer, ui, UiSe::Cancel);
+                return None;
+            }
+            sdl2::Input::Back | sdl2::Input::Left | sdl2::Input::RightClick => {
+                play_ui(mixer, ui, UiSe::Cancel);
+                return Some(false);
+            }
+            sdl2::Input::Advance | sdl2::Input::Right => {
+                play_ui(mixer, ui, UiSe::Confirm);
+                return Some(true);
+            }
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, 1280, 720);
                 mx = sx;
                 my = sy;
                 if pressed {
                     if in_box(sx, sy, boxes[0]) {
+                        play_ui(mixer, ui, UiSe::Confirm);
                         return Some(true);
                     }
                     if in_box(sx, sy, boxes[1]) {
+                        play_ui(mixer, ui, UiSe::Cancel);
                         return Some(false);
                     }
                 }
@@ -3928,7 +3954,9 @@ fn handle_cmd(
                 };
             };
             let message = if cn { "要读取快速存档吗？" } else { "クイックロードしますか？" };
-            match ask_yes_no(win, frame, &s.bg_dirs(), message) {
+            let dirs = s.bg_dirs();
+            let ui = UiSound::resolve(&dirs);
+            match ask_yes_no(win, frame, &dirs, message, mixer, Some(&ui)) {
                 Some(true) => {
                     eprintln!("scene {} | quick load confirmed", current_id);
                     CmdOutcome::Loaded(st)
@@ -3948,12 +3976,34 @@ fn handle_cmd(
                 last_text,
                 bgm,
             );
-            saveload::run(win, &s.bg_dirs(), saveload::Mode::Save, Some(st), Some(frame));
+            let dirs = s.bg_dirs();
+            let ui = UiSound::resolve(&dirs);
+            saveload::run(
+                win,
+                &dirs,
+                saveload::Mode::Save,
+                Some(st),
+                Some(frame),
+                mixer,
+                Some(&ui),
+            );
             CmdOutcome::Stay
         }
         cmdbar::Cmd::Load => {
             if let Some(st) =
-                saveload::run(win, &s.bg_dirs(), saveload::Mode::Load, None, Some(frame))
+                {
+                    let dirs = s.bg_dirs();
+                    let ui = UiSound::resolve(&dirs);
+                    saveload::run(
+                        win,
+                        &dirs,
+                        saveload::Mode::Load,
+                        None,
+                        Some(frame),
+                        mixer,
+                        Some(&ui),
+                    )
+                }
             {
                 CmdOutcome::Loaded(st)
             } else {
@@ -3962,7 +4012,9 @@ fn handle_cmd(
         }
         cmdbar::Cmd::Config => {
             let mut st = menu::Settings::load();
-            menu::run(win, &s.bg_dirs(), &mut st, mixer);
+            let dirs = s.bg_dirs();
+            let ui = UiSound::resolve(&dirs);
+            menu::run(win, &dirs, &mut st, mixer, Some(&ui));
             *settings = menu::Settings::load();
             menu::apply(settings, mixer);
             refresh_dialog_font(s.cn, vfont.as_deref_mut());
@@ -5241,7 +5293,13 @@ fn play_ui_se(mixer: Option<&audio::Mixer>, path: Option<&Path>) {
 /// The grid reads the small copies the original ships (`tv*`, see
 /// `cg::load_thumb`), so a page of twenty cells costs a few file reads
 /// instead of twenty high-resolution decodes.
-fn browse_cg(win: &mut sdl2::Sdl, dirs: &[&std::path::Path], cn: bool) {
+fn browse_cg(
+    win: &mut sdl2::Sdl,
+    dirs: &[&std::path::Path],
+    cn: bool,
+    mixer: Option<&audio::Mixer>,
+    ui: Option<&UiSound>,
+) {
     const W: u32 = 1280;
     const H: u32 = 720;
     // Five 240px cells plus the 8px gaps span the layout exactly:
@@ -5311,23 +5369,59 @@ fn browse_cg(win: &mut sdl2::Sdl, dirs: &[&std::path::Path], cn: bool) {
         draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true, ww, wh);
         win.present(&frame);
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
-            sdl2::Input::Advance => view_cg(win, dirs, &stems, &mut sel, cn),
-            sdl2::Input::Left => sel = sel.saturating_sub(1),
-            sdl2::Input::Right => sel = (sel + 1).min(stems.len() - 1),
-            sdl2::Input::Up => sel = sel.saturating_sub(cg::COLS),
-            sdl2::Input::Down => sel = (sel + cg::COLS).min(stems.len() - 1),
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
+                play_ui(mixer, ui, UiSe::Cancel);
+                return;
+            }
+            sdl2::Input::Advance => {
+                play_ui(mixer, ui, UiSe::Confirm);
+                view_cg(win, dirs, &stems, &mut sel, cn, mixer, ui);
+            }
+            sdl2::Input::Left => {
+                let next = sel.saturating_sub(1);
+                if next != sel {
+                    sel = next;
+                    play_ui(mixer, ui, UiSe::Move);
+                }
+            }
+            sdl2::Input::Right => {
+                let next = (sel + 1).min(stems.len() - 1);
+                if next != sel {
+                    sel = next;
+                    play_ui(mixer, ui, UiSe::Move);
+                }
+            }
+            sdl2::Input::Up => {
+                let next = sel.saturating_sub(cg::COLS);
+                if next != sel {
+                    sel = next;
+                    play_ui(mixer, ui, UiSe::Move);
+                }
+            }
+            sdl2::Input::Down => {
+                let next = (sel + cg::COLS).min(stems.len() - 1);
+                if next != sel {
+                    sel = next;
+                    play_ui(mixer, ui, UiSe::Move);
+                }
+            }
             sdl2::Input::Wheel { y } => {
                 let next = if y > 0 { page.saturating_sub(1) } else { (page + 1).min(pages - 1) };
-                sel = (next * cg::PER_PAGE).min(stems.len() - 1);
+                let moved = (next * cg::PER_PAGE).min(stems.len() - 1);
+                if moved != sel {
+                    sel = moved;
+                    play_ui(mixer, ui, UiSe::Page);
+                }
             }
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 if let Some(idx) = cell_at(sx, sy, page, GRID_X, GRID_Y, CELL_W, CELL_H, GAP, &stems) {
                     if idx != sel {
                         sel = idx;
+                        play_ui(mixer, ui, UiSe::Move);
                     } else if pressed {
-                        view_cg(win, dirs, &stems, &mut sel, cn);
+                        play_ui(mixer, ui, UiSe::Confirm);
+                        view_cg(win, dirs, &stems, &mut sel, cn, mixer, ui);
                     }
                 }
             }
@@ -5422,6 +5516,8 @@ fn view_cg(
     stems: &[String],
     sel: &mut usize,
     cn: bool,
+    mixer: Option<&audio::Mixer>,
+    ui: Option<&UiSound>,
 ) {
     const W: u32 = 1280;
     const H: u32 = 720;
@@ -5472,11 +5568,34 @@ fn view_cg(
         draw_label(&mut frame, hint, 18, 0, H as i32 - 34, true, ww, wh);
         win.present(&frame);
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => return,
-            sdl2::Input::Left => *sel = sel.saturating_sub(1),
-            sdl2::Input::Right => *sel = (*sel + 1).min(stems.len() - 1),
-            sdl2::Input::Wheel { y } => zoom = step_zoom(zoom, y > 0),
-            sdl2::Input::Advance => zoom = step_zoom(zoom, true),
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
+                play_ui(mixer, ui, UiSe::Cancel);
+                return;
+            }
+            sdl2::Input::Left => {
+                if *sel > 0 {
+                    *sel -= 1;
+                    play_ui(mixer, ui, UiSe::Page);
+                }
+            }
+            sdl2::Input::Right => {
+                if *sel + 1 < stems.len() {
+                    *sel += 1;
+                    play_ui(mixer, ui, UiSe::Page);
+                }
+            }
+            sdl2::Input::Wheel { y } => {
+                let next = step_zoom(zoom, y > 0);
+                if next != zoom {
+                    zoom = next;
+                    play_ui(mixer, ui, UiSe::Move);
+                }
+            }
+            sdl2::Input::Advance => {
+                let next = step_zoom(zoom, true);
+                zoom = next;
+                play_ui(mixer, ui, UiSe::Move);
+            }
             sdl2::Input::Up => pan_by(&mut centre, img.as_ref(), 0.0, -PAN_STEP, z),
             sdl2::Input::Down => pan_by(&mut centre, img.as_ref(), 0.0, PAN_STEP, z),
             // Dragging pulls the picture along with the cursor.
@@ -5530,7 +5649,13 @@ fn pan_by(
 /// Pick one of the two electronic-novel chains.  They are real script roots
 /// (5000 and 5100), so entering one through the normal game runner preserves
 /// its backgrounds, text, voice and save/rewind behaviour.
-fn browse_novels(win: &mut sdl2::Sdl, dirs: &[&std::path::Path], cn: bool) -> Option<String> {
+fn browse_novels(
+    win: &mut sdl2::Sdl,
+    dirs: &[&std::path::Path],
+    cn: bool,
+    mixer: Option<&audio::Mixer>,
+    ui: Option<&UiSound>,
+) -> Option<String> {
     const W: u32 = 1280;
     const H: u32 = 720;
     let ids = ["5000", "5100"];
@@ -5564,14 +5689,38 @@ fn browse_novels(win: &mut sdl2::Sdl, dirs: &[&std::path::Path], cn: bool) -> Op
         }
         win.present(&frame);
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => return None,
-            sdl2::Input::Up => sel = (sel + 1) % 2,
-            sdl2::Input::Down => sel = (sel + 1) % 2,
-            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Choice(_) => return Some(ids[sel].to_string()),
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => {
+                crate::play_ui(mixer, ui, UiSe::Cancel);
+                return None;
+            }
+            sdl2::Input::Up => {
+                sel = (sel + 1) % 2;
+                crate::play_ui(mixer, ui, UiSe::Move);
+            }
+            sdl2::Input::Down => {
+                sel = (sel + 1) % 2;
+                crate::play_ui(mixer, ui, UiSe::Move);
+            }
+            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Choice(_) => {
+                crate::play_ui(mixer, ui, UiSe::Confirm);
+                return Some(ids[sel].to_string());
+            }
             sdl2::Input::Pointer { x, y, pressed: true } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
-                if (300..376).contains(&sy) { return Some(ids[0].to_string()); }
-                if (376..460).contains(&sy) { return Some(ids[1].to_string()); }
+                if (300..376).contains(&sy) {
+                    if sel != 0 {
+                        crate::play_ui(mixer, ui, UiSe::Move);
+                    }
+                    crate::play_ui(mixer, ui, UiSe::Confirm);
+                    return Some(ids[0].to_string());
+                }
+                if (376..460).contains(&sy) {
+                    if sel != 1 {
+                        crate::play_ui(mixer, ui, UiSe::Move);
+                    }
+                    crate::play_ui(mixer, ui, UiSe::Confirm);
+                    return Some(ids[1].to_string());
+                }
                 let _ = sx;
             }
             _ => win.delay(16),
@@ -5607,6 +5756,7 @@ fn browse_voice_messages(
     dirs: &[&std::path::Path],
     cn: bool,
     mixer: Option<&audio::Mixer>,
+    ui: Option<&UiSound>,
 ) {
     const W: u32 = 1280;
     const H: u32 = 720;
@@ -5745,6 +5895,7 @@ fn browse_voice_messages(
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
                 voice_stop(mixer, &mut playing);
+                play_ui(mixer, ui, UiSe::Cancel);
                 return;
             }
             // Changing character or message always stops the current clip.
@@ -5752,25 +5903,33 @@ fn browse_voice_messages(
                 character = (character + n_chars - 1) % n_chars;
                 voice_stop(mixer, &mut playing);
                 voice_clamp(&mut line, clips[character].len());
+                play_ui(mixer, ui, UiSe::Move);
             }
             sdl2::Input::Down => {
                 character = (character + 1) % n_chars;
                 voice_stop(mixer, &mut playing);
                 voice_clamp(&mut line, clips[character].len());
+                play_ui(mixer, ui, UiSe::Move);
             }
             sdl2::Input::Left if count > 0 => {
                 line = (line + count - 1) % count;
+                play_ui(mixer, ui, UiSe::Move);
                 voice_stop(mixer, &mut playing);
             }
             sdl2::Input::Right if count > 0 => {
                 line = (line + 1) % count;
+                play_ui(mixer, ui, UiSe::Move);
                 voice_stop(mixer, &mut playing);
             }
             sdl2::Input::Advance | sdl2::Input::Choice(_) => {
                 if playing.is_some() {
                     voice_stop(mixer, &mut playing);
+                    play_ui(mixer, ui, UiSe::Cancel);
                 } else if let Some(path) = clips[character].get(line) {
                     let ok = voice_play(mixer, &mut playing, path, character, line);
+                    if ok {
+                        play_ui(mixer, ui, UiSe::Confirm);
+                    }
                     eprintln!(
                         "voice message: {} {} -> {}",
                         names[character],
@@ -5782,15 +5941,22 @@ fn browse_voice_messages(
             sdl2::Input::Pointer { x, y, pressed: true } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 if point_in(sx, sy, VOICE_BTN) {
-                    voice_stop(mixer, &mut playing);
+                    if playing.is_some() {
+                        voice_stop(mixer, &mut playing);
+                        play_ui(mixer, ui, UiSe::Cancel);
+                    }
                 } else if let Some(i) = voice_row_at(sx, sy, count) {
                     if i != line {
                         line = i;
                         voice_stop(mixer, &mut playing);
+                        play_ui(mixer, ui, UiSe::Move);
                     } else if playing.is_some() {
                         voice_stop(mixer, &mut playing);
+                        play_ui(mixer, ui, UiSe::Cancel);
                     } else if let Some(path) = clips[character].get(i) {
-                        voice_play(mixer, &mut playing, path, character, i);
+                        if voice_play(mixer, &mut playing, path, character, i) {
+                            play_ui(mixer, ui, UiSe::Confirm);
+                        }
                     }
                 } else if sy < 360 {
                     // Card art above the panel: left half back, right half on.
@@ -5801,6 +5967,7 @@ fn browse_voice_messages(
                     };
                     voice_stop(mixer, &mut playing);
                     voice_clamp(&mut line, clips[character].len());
+                    play_ui(mixer, ui, UiSe::Move);
                 }
             }
             _ => win.delay(16),
@@ -5917,17 +6084,65 @@ fn menu_labels(items: &[&str], size: u32) -> Vec<Option<(u32, u32, Vec<u8>)>> {
         .collect()
 }
 
-/// Title highlight change. `SE_9011` is the short two-tap click.
-fn cursor_se_path(bg_dirs: &[&std::path::Path]) -> Option<std::path::PathBuf> {
-    let mut roots = Vec::new();
-    for d in bg_dirs {
-        if let Some(p) = d.parent() {
-            roots.push(p.to_path_buf());
+// Menu sounds. Every screen names what it is doing (`UiSe`) instead of
+// picking an SE id, so the mapping lives in exactly one place.
+
+/// `WA2.exe` wraps its SE player three times in one cluster: 0x40ea10 and
+/// 0x40ea30 push 0x22c9 (`SE_8905`) and 0x40ea50 pushes 0x22c7 (`SE_8903`).
+/// The archives only ship `SE_8905`, so cancel falls back to it instead of
+/// staying silent. `SE_9011` is the short two-tap click the title highlight
+/// and the menu cursor move to.
+const SE_UI: u32 = 8905;
+const SE_UI_CANCEL: u32 = 8903;
+const SE_CLICK: u32 = 9011;
+
+/// Which menu sound an interaction wants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UiSe {
+    Move,
+    Confirm,
+    Cancel,
+    /// Page flips and prev/next paging: the cursor click, not the menu chime.
+    Page,
+}
+
+/// The four menu sounds, resolved once per screen.
+pub struct UiSound {
+    mv: Option<std::path::PathBuf>,
+    ok: Option<std::path::PathBuf>,
+    cancel: Option<std::path::PathBuf>,
+    page: Option<std::path::PathBuf>,
+}
+
+impl UiSound {
+    /// Resolve every role. `dirs` are the art trees; `se/` sits next to them.
+    pub fn resolve(dirs: &[&std::path::Path]) -> UiSound {
+        let mv = find_se(dirs, SE_CLICK);
+        let ok = find_se(dirs, SE_UI);
+        UiSound {
+            mv: mv.clone(),
+            ok: ok.clone(),
+            cancel: find_se(dirs, SE_UI_CANCEL).or(ok),
+            page: mv,
         }
     }
-    for root in roots {
-        for name in ["SE_9011.WAV", "SE_9011.wav", "SE_9011.OGG", "SE_9011.ogg"] {
-            let p = root.join("se").join(name);
+
+    pub fn path(&self, kind: UiSe) -> Option<&std::path::Path> {
+        match kind {
+            UiSe::Move => self.mv.as_deref(),
+            UiSe::Confirm => self.ok.as_deref(),
+            UiSe::Cancel => self.cancel.as_deref(),
+            UiSe::Page => self.page.as_deref(),
+        }
+    }
+}
+
+/// `SE_{id:04}` next to the art trees, in either container format.
+fn find_se(dirs: &[&std::path::Path], id: u32) -> Option<std::path::PathBuf> {
+    for d in dirs {
+        let Some(root) = d.parent() else { continue };
+        for ext in ["WAV", "wav", "OGG", "ogg"] {
+            let p = root.join("se").join(format!("SE_{id:04}.{ext}"));
             if p.is_file() {
                 return Some(p);
             }
@@ -5936,11 +6151,14 @@ fn cursor_se_path(bg_dirs: &[&std::path::Path]) -> Option<std::path::PathBuf> {
     None
 }
 
-fn play_cursor(mx: Option<&audio::Mixer>, se: Option<&std::path::Path>) {
-    let (Some(mx), Some(se)) = (mx, se) else { return };
-    mx.play_cat(&se.to_string_lossy(), 1.0, false, audio::mixer::CAT_SE);
+/// Play one menu sound through the mixer at the SE group volume.
+pub fn play_ui(mixer: Option<&audio::Mixer>, sounds: Option<&UiSound>, kind: UiSe) {
+    let (Some(mx), Some(s)) = (mixer, sounds) else { return };
+    let Some(p) = s.path(kind) else { return };
+    if mx.play_cat(&p.to_string_lossy(), 1.0, false, audio::mixer::CAT_SE) != usize::MAX {
+        eprintln!("  SE: menu {:?} -> {}", kind, p.display());
+    }
 }
-
 /// Font size that has the same height, in window pixels, as `layout_px` on
 /// the 720-tall layout. Labels are drawn after the scene is scaled, so this
 /// is the size they must be rasterized at.
@@ -6156,7 +6374,7 @@ fn run_special(
     bg_dirs: &[&std::path::Path],
     cn: bool,
     mixer: Option<&audio::Mixer>,
-    cursor: Option<&std::path::Path>,
+    ui: Option<&UiSound>,
 ) -> SpecialPick {
     const W: u32 = 1280;
     const H: u32 = 720;
@@ -6228,17 +6446,21 @@ fn run_special(
         }
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => {
+                play_ui(mixer, ui, UiSe::Cancel);
                 return SpecialPick::Back;
             }
             sdl2::Input::Up => {
                 sel = (sel + N - 1) % N;
-                play_cursor(mixer, cursor);
+                play_ui(mixer, ui, UiSe::Move);
             }
             sdl2::Input::Down => {
                 sel = (sel + 1) % N;
-                play_cursor(mixer, cursor);
+                play_ui(mixer, ui, UiSe::Move);
             }
-            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Choice(_) => return pick(sel),
+            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Choice(_) => {
+                play_ui(mixer, ui, UiSe::Confirm);
+                return pick(sel);
+            }
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 if let Some(i) = (0..N).find(|i| {
@@ -6247,9 +6469,10 @@ fn run_special(
                 }) {
                     if i != sel {
                         sel = i;
-                        play_cursor(mixer, cursor);
+                        play_ui(mixer, ui, UiSe::Move);
                     }
                     if pressed {
+                        play_ui(mixer, ui, UiSe::Confirm);
                         return pick(sel);
                     }
                 }
@@ -6358,7 +6581,7 @@ fn run_music(
     bgm_dir: &std::path::Path,
     cn: bool,
     mixer: Option<&audio::Mixer>,
-    cursor: Option<&std::path::Path>,
+    ui: Option<&UiSound>,
 ) {
     const W: u32 = 1280;
     const H: u32 = 720;
@@ -6399,21 +6622,25 @@ fn run_music(
 
     loop {
         match win.poll_input() {
-            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => break,
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => {
+                play_ui(mixer, ui, UiSe::Cancel);
+                break;
+            }
             sdl2::Input::Up => {
                 if !tracks.is_empty() {
                     selected = (selected + tracks.len() - 1) % tracks.len();
-                    play_cursor(mixer, cursor);
+                    play_ui(mixer, ui, UiSe::Move);
                 }
             }
             sdl2::Input::Down => {
                 if !tracks.is_empty() {
                     selected = (selected + 1) % tracks.len();
-                    play_cursor(mixer, cursor);
+                    play_ui(mixer, ui, UiSe::Move);
                 }
             }
             sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Choice(_) => {
                 if let Some((id, path)) = tracks.get(selected) {
+                    play_ui(mixer, ui, UiSe::Confirm);
                     if let Some(mx) = mixer {
                         if let Some((_, slot)) = playing.take() { mx.stop(slot); }
                         let slot = mx.play_cat(&path.to_string_lossy(), 1.0, true, audio::mixer::CAT_BGM);
@@ -6439,9 +6666,10 @@ fn run_music(
                         if index < tracks.len() {
                             if selected != index {
                                 selected = index;
-                                play_cursor(mixer, cursor);
+                                play_ui(mixer, ui, UiSe::Move);
                             }
                             if pressed {
+                                play_ui(mixer, ui, UiSe::Confirm);
                                 if let Some(mx) = mixer {
                                 if let Some((_, slot)) = playing.take() { mx.stop(slot); }
                                 let (id, path) = &tracks[selected];
@@ -6673,12 +6901,16 @@ fn start_title_bgm(mixer: Option<&audio::Mixer>, bg_dirs: &[&std::path::Path]) -
 /// mixer, and with it the stream.
 ///
 /// `WA2_TITLE_AUTO=<n>` pre-selects item `n` and confirms it (verification runs).
+/// Title screen. `mixer` is the Runtime's: opening a second device inside one
+/// process fails (SDL allows one), which used to leave the title - and every
+/// screen it opens - silent.
 fn run_title(
     win: &mut sdl2::Sdl,
     font: &render::Font,
     bg_dirs: &[&std::path::Path],
     script_dir: &std::path::Path,
     cn: bool,
+    mixer: Option<&audio::Mixer>,
 ) -> TitleAction {
     const W: u32 = 1280;
     const H: u32 = 720;
@@ -6733,14 +6965,16 @@ fn run_title(
     let startup = menu::Settings::load();
     win.set_fullscreen(startup.win_disp == 1);
     set_render_art_scale(win);
-    let mixer = audio::Mixer::new(win);
-    if let Some(ref mx) = mixer {
+    if let Some(mx) = mixer {
         menu::apply(&startup, Some(mx));
     }
-    let mut bgm_slot = start_title_bgm(mixer.as_ref(), bg_dirs);
-    let cursor = cursor_se_path(bg_dirs);
+    let mut bgm_slot = start_title_bgm(mixer, bg_dirs);
+    let ui = UiSound::resolve(bg_dirs);
 
     let item_y = |i: usize| (Y0 + i as i32 * PITCH) as f32;
+    // What the player picked. Collected instead of returned so the title BGM
+    // can be stopped on the way out of every path.
+    let picked: TitleAction;
     let mut sel = 0usize;
     let mut notice: Option<&str> = None;
     let mut bar_y = item_y(0);
@@ -6765,12 +6999,12 @@ fn run_title(
                 sdl2::Input::Up => {
                     sel = (sel + N - 1) % N;
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
-                    play_cursor(mixer.as_ref(), cursor.as_deref());
+                    play_ui(mixer, Some(&ui), UiSe::Move);
                 }
                 sdl2::Input::Down => {
                     sel = (sel + 1) % N;
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
-                    play_cursor(mixer.as_ref(), cursor.as_deref());
+                    play_ui(mixer, Some(&ui), UiSe::Move);
                 }
                 sdl2::Input::Advance | sdl2::Input::Right => confirm = true,
                 sdl2::Input::Choice(k) => {
@@ -6778,7 +7012,10 @@ fn run_title(
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
                     confirm = true;
                 }
-                sdl2::Input::Quit => return TitleAction::Quit,
+                sdl2::Input::Quit => {
+                    picked = TitleAction::Quit;
+                    break;
+                }
                 // Pointer: hovering highlights the item under the cursor, a
                 // click on an item confirms it. The original is mouse-driven,
                 // so this is the primary way to pick a menu entry.
@@ -6792,7 +7029,7 @@ fn run_title(
                             sel = i;
                             flash_until =
                                 std::time::Instant::now() + std::time::Duration::from_millis(160);
-                            play_cursor(mixer.as_ref(), cursor.as_deref());
+                            play_ui(mixer, Some(&ui), UiSe::Move);
                         }
                         if pressed {
                             confirm = true;
@@ -6930,14 +7167,28 @@ fn run_title(
         if confirm {
             if notice.is_some() {
                 notice = None;
+                play_ui(mixer, Some(&ui), UiSe::Cancel);
                 continue;
             }
+            play_ui(mixer, Some(&ui), UiSe::Confirm);
             match sel {
-                0 => return TitleAction::Start,
+                0 => {
+                    picked = TitleAction::Start;
+                    break;
+                }
                 // 「继续游戏」: the load screen. A picked slot resumes the game.
                 1 => {
-                    if let Some(snap) = saveload::run(win, bg_dirs, saveload::Mode::Load, None, None) {
-                        return TitleAction::Load(snap);
+                    if let Some(snap) = saveload::run(
+                        win,
+                        bg_dirs,
+                        saveload::Mode::Load,
+                        None,
+                        None,
+                        mixer,
+                        Some(&ui),
+                    ) {
+                        picked = TitleAction::Load(snap);
+                        break;
                     }
                     notice = None;
                 }
@@ -6945,7 +7196,7 @@ fn run_title(
                     // 「系统设置」: the game's own option screen.
                     let mut st = menu::Settings::load();
                     menu::apply(&st, None);
-                    menu::run(win, bg_dirs, &mut st, None);
+                    menu::run(win, bg_dirs, &mut st, mixer, Some(&ui));
                     win.set_fullscreen(st.win_disp == 1);
                     set_render_art_scale(win);
                     notice = None;
@@ -6954,18 +7205,28 @@ fn run_title(
                     win,
                     bg_dirs,
                     cn,
-                    mixer.as_ref(),
-                    cursor.as_deref(),
+                    mixer,
+                    Some(&ui),
                 ) {
                     SpecialPick::Novel => {
-                        if let Some(id) = browse_novels(win, bg_dirs, cn) {
-                            return TitleAction::Jump(id);
+                        if let Some(id) = browse_novels(win, bg_dirs, cn, mixer, Some(&ui)) {
+                            picked = TitleAction::Jump(id);
+                            break;
                         }
                         notice = None;
                     }
                     SpecialPick::Replay => {
-                        if let Some(id) = timeline::run(win, font, bg_dirs, script_dir, cn) {
-                            return TitleAction::Jump(id);
+                        if let Some(id) = timeline::run(
+                            win,
+                            font,
+                            bg_dirs,
+                            script_dir,
+                            cn,
+                            mixer,
+                            Some(&ui),
+                        ) {
+                            picked = TitleAction::Jump(id);
+                            break;
                         }
                         notice = None;
                     }
@@ -6973,7 +7234,7 @@ fn run_title(
                         if cg::cg_stems(bg_dirs).is_empty() {
                             notice = Some(notice_text);
                         } else {
-                            browse_cg(win, bg_dirs, cn);
+                            browse_cg(win, bg_dirs, cn, mixer, Some(&ui));
                             notice = None;
                         }
                     }
@@ -6984,23 +7245,30 @@ fn run_title(
                             mx.stop(slot);
                         }
                         let bgm_dir = script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
-                        run_music(win, bg_dirs, &bgm_dir, cn, mixer.as_ref(), cursor.as_deref());
-                        bgm_slot = start_title_bgm(mixer.as_ref(), bg_dirs);
+                        run_music(win, bg_dirs, &bgm_dir, cn, mixer, Some(&ui));
+                        bgm_slot = start_title_bgm(mixer, bg_dirs);
                         notice = None;
                     }
                     SpecialPick::Voice => {
-                        browse_voice_messages(win, bg_dirs, cn, mixer.as_ref());
+                        browse_voice_messages(win, bg_dirs, cn, mixer, Some(&ui));
                         notice = None;
                     }
                     SpecialPick::Back => notice = None,
                     SpecialPick::Notice => notice = Some(notice_text),
                 },
-                4 => return TitleAction::Quit,
+                4 => {
+                    picked = TitleAction::Quit;
+                    break;
+                }
                 _ => notice = Some(notice_text),
             }
         }
         win.delay(16);
     }
+    if let (Some(mx), Some(slot)) = (mixer, bgm_slot.take()) {
+        mx.stop(slot);
+    }
+    picked
 }
 
 /// Play a movie (`mvNN` token) from the movie directory.
@@ -7172,6 +7440,56 @@ fn print_usage() {
     println!("  wa2-native scene <txt> <font> <charset> <bg.tga> <out.tga>  render a scene");
     println!("  wa2-native font-test <font.tga> <charset.txt> <out.tga> [text]  atlas glyph sheet");
     println!("  wa2-native font-sample <out.tga> [w] [h]  vector-font specimen sheet (WA2_FONT*)");
+}
+
+#[cfg(test)]
+mod ui_sound_tests {
+    use super::*;
+
+    /// A fake art tree: `<root>/bg` plus the `se/` directory next to it.
+    fn tree(files: &[&str]) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        let root = std::env::temp_dir().join(format!("wa2-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let se = root.join("se");
+        std::fs::create_dir_all(root.join("bg")).unwrap();
+        std::fs::create_dir_all(&se).unwrap();
+        for f in files {
+            std::fs::write(se.join(f), b"").unwrap();
+        }
+        let dirs: Vec<std::path::PathBuf> = vec![root.join("bg")];
+        (root, dirs)
+    }
+
+    #[test]
+    fn every_role_resolves_to_the_ids_the_exe_pushes() {
+        let (_root, dirs) = tree(&["SE_9011.WAV", "SE_8905.WAV"]);
+        let refs: Vec<&std::path::Path> = dirs.iter().map(|d| d.as_path()).collect();
+        let ui = UiSound::resolve(&refs);
+        let name = |k: UiSe| ui.path(k).map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+        assert_eq!(name(UiSe::Move).as_deref(), Some("SE_9011.WAV"));
+        assert_eq!(name(UiSe::Page).as_deref(), Some("SE_9011.WAV"));
+        assert_eq!(name(UiSe::Confirm).as_deref(), Some("SE_8905.WAV"));
+    }
+
+    /// SE_8903 (0x22c7, the third UI wrapper) is not in the archives, so cancel
+    /// has to fall back to SE_8905 rather than going silent.
+    #[test]
+    fn a_missing_cancel_sound_falls_back_to_the_menu_chime() {
+        let (_root, dirs) = tree(&["SE_8905.WAV", "SE_9011.WAV"]);
+        let refs: Vec<&std::path::Path> = dirs.iter().map(|d| d.as_path()).collect();
+        let ui = UiSound::resolve(&refs);
+        assert_eq!(ui.path(UiSe::Cancel), ui.path(UiSe::Confirm));
+    }
+
+    #[test]
+    fn with_nothing_shipped_every_role_is_silent_not_a_crash() {
+        let (_root, dirs) = tree(&[]);
+        let refs: Vec<&std::path::Path> = dirs.iter().map(|d| d.as_path()).collect();
+        let ui = UiSound::resolve(&refs);
+        for k in [UiSe::Move, UiSe::Confirm, UiSe::Cancel, UiSe::Page] {
+            assert!(ui.path(k).is_none(), "{k:?} should be silent");
+        }
+    }
 }
 
 #[cfg(test)]

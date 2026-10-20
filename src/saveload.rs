@@ -145,6 +145,8 @@ pub fn run(
     mode: Mode,
     snap: Option<SaveState>,
     frame: Option<&Surface>,
+    mixer: Option<&crate::audio::mixer::Mixer>,
+    ui: Option<&crate::UiSound>,
 ) -> Option<SaveState> {
     let assets = Assets::load(dirs);
     let mut mode = mode;
@@ -186,13 +188,20 @@ pub fn run(
 
         let mut activate: Option<usize> = None;
         match win.poll_input() {
-            sdl2::Input::Quit => return None,
-            sdl2::Input::Back | sdl2::Input::Left => return None,
-            sdl2::Input::RightClick => return None,
+            sdl2::Input::Quit | sdl2::Input::Back | sdl2::Input::RightClick => {
+                crate::play_ui(mixer, ui, crate::UiSe::Cancel);
+                return None;
+            }
             // 1 / 2 switch between saving and loading; the shipped banner only
             // carries the Japanese word for whichever mode was opened.
-            sdl2::Input::Choice(1) if snap.is_some() && frame.is_some() => mode = Mode::Save,
-            sdl2::Input::Choice(2) => mode = Mode::Load,
+            sdl2::Input::Choice(1) if snap.is_some() && frame.is_some() => {
+                mode = Mode::Save;
+                crate::play_ui(mixer, ui, crate::UiSe::Page);
+            }
+            sdl2::Input::Choice(2) => {
+                mode = Mode::Load;
+                crate::play_ui(mixer, ui, crate::UiSe::Page);
+            }
             sdl2::Input::Up => {
                 if scr.cursor == 0 {
                     scr.page = (scr.page + pages - 1) % pages;
@@ -200,6 +209,7 @@ pub fn run(
                 } else {
                     scr.cursor -= 1;
                 }
+                crate::play_ui(mixer, ui, crate::UiSe::Move);
             }
             sdl2::Input::Down => {
                 if scr.cursor + 1 >= save::cells_on_page(scr.page) {
@@ -208,14 +218,23 @@ pub fn run(
                 } else {
                     scr.cursor += 1;
                 }
+                crate::play_ui(mixer, ui, crate::UiSe::Move);
             }
-            sdl2::Input::Advance | sdl2::Input::Right => activate = Some(scr.cursor),
+            sdl2::Input::Advance | sdl2::Input::Right => {
+                activate = Some(scr.cursor);
+                crate::play_ui(mixer, ui, crate::UiSe::Confirm);
+            }
             sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 if let Some(i) = cell_at(sx, sy, scr.page) {
+                    let moved = scr.cursor != i;
                     scr.cursor = i;
+                    if moved {
+                        crate::play_ui(mixer, ui, crate::UiSe::Move);
+                    }
                     if pressed {
                         activate = Some(i);
+                        crate::play_ui(mixer, ui, crate::UiSe::Confirm);
                     }
                 }
             }

@@ -3685,7 +3685,13 @@ fn reset_fonts(st: &mut Settings) {
 ///
 /// `mx` is used for the little sample sound behind the volume rows; when no
 /// mixer is available those buttons just log.
-pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::audio::mixer::Mixer>) {
+pub fn run(
+    win: &mut Sdl,
+    dirs: &[&Path],
+    st: &mut Settings,
+    mx: Option<&crate::audio::mixer::Mixer>,
+    ui: Option<&crate::UiSound>,
+) {
     let assets = Assets::load(dirs);
     if !assets.available() {
         eprintln!("menu: option screen artwork missing, cannot open");
@@ -3728,6 +3734,19 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
         // must not reach the page (F-02).
         let modal = font_list.is_some() || style_panel.is_some();
         let mut opened_list = false;
+        if modal {
+            match input {
+                sdl2::Input::Up | sdl2::Input::Down | sdl2::Input::Left
+                | sdl2::Input::Right | sdl2::Input::Wheel { .. } => {
+                    crate::play_ui(mx, ui, crate::UiSe::Move);
+                }
+                sdl2::Input::Advance => crate::play_ui(mx, ui, crate::UiSe::Confirm),
+                sdl2::Input::Back | sdl2::Input::RightClick | sdl2::Input::Quit => {
+                    crate::play_ui(mx, ui, crate::UiSe::Cancel);
+                }
+                _ => {}
+            }
+        }
         // The style panel is modal: while it is open it owns the keyboard and
         // the page underneath stops seeing clicks. Esc/right-click close the
         // panel only.
@@ -3805,7 +3824,21 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
         }
         // While the list or the panel is open (or opened this frame) the page
         // sees nothing at all.
-        match page_input(modal, opened_list, input) {
+        let page_event = page_input(modal, opened_list, input);
+        if !modal && !opened_list {
+            match page_event {
+                sdl2::Input::Up | sdl2::Input::Down => {
+                    crate::play_ui(mx, ui, crate::UiSe::Move);
+                }
+                sdl2::Input::Choice(_) => crate::play_ui(mx, ui, crate::UiSe::Page),
+                sdl2::Input::Quit => crate::play_ui(mx, ui, crate::UiSe::Cancel),
+                sdl2::Input::Advance | sdl2::Input::Right => {
+                    crate::play_ui(mx, ui, crate::UiSe::Confirm);
+                }
+                _ => {}
+            }
+        }
+        match page_event {
             sdl2::Input::Quit => {
                 win.set_fullscreen(st.win_disp == 1);
                 break;
@@ -3857,12 +3890,20 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 let hots = page_hots(scr.page);
                 let h = hit(scr.page, &hots, sx, sy);
+                let old_hover = scr.hover;
                 scr.hover = h.filter(|i| !is_nav(*i));
                 scr.nav_hover = h.filter(|i| is_nav(*i));
+                if old_hover != scr.hover {
+                    crate::play_ui(mx, ui, crate::UiSe::Move);
+                }
                 if let Some(i) = h {
                     if pressed {
-                        activate = if is_nav(i) { nav_act(i) } else { Some(hots[i].act) };
+                        let action = if is_nav(i) { nav_act(i) } else { Some(hots[i].act) };
+                        activate = action;
                         click_at = (sx, sy);
+                        if !matches!(action, Some(Act::Close)) {
+                            crate::play_ui(mx, ui, crate::UiSe::Confirm);
+                        }
                     }
                 }
                 // The font block owns the band inside page 1's 文本设置
@@ -3903,6 +3944,7 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
 
         if let Some(a) = activate {
             if a == Act::Close {
+                crate::play_ui(mx, ui, crate::UiSe::Cancel);
                 win.set_fullscreen(st.win_disp == 1);
                 break;
             }
