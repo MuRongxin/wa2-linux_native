@@ -675,8 +675,8 @@ fn main() {
                             println!("  [sound] ACT{} {:?}", opcode, args),
                         vm::lscr::Event::Tint { name } => println!("  [tint] {}", if name.is_empty() { "<none>" } else { &name }),
                         vm::lscr::Event::Movie { name } => println!("  [mv  ] {}", name),
-                        vm::lscr::Event::Sprite { char_id, series, variant, slot, frames } =>
-                            println!("  [spr ] char={} series={} variant={} slot={} frames={}", char_id, series, variant, slot, frames),
+                        vm::lscr::Event::Sprite { char_id, series, variant, slot, frames, kind } =>
+                            println!("  [spr ] {:?} char={} series={} variant={} slot={} frames={}", kind, char_id, series, variant, slot, frames),
                         vm::lscr::Event::SpriteExit { char_id, frames } =>
                             println!("  [spr-] char={} frames={}", char_id, frames),
                         vm::lscr::Event::SpriteFocus { char_id } => println!("  [fo-c] {}", char_id),
@@ -2236,7 +2236,7 @@ fn run_game_at(
                     backlog.push(logged);
                     if backlog.len() > 200 { backlog.remove(0); }
                 }
-                vm::lscr::Event::Sprite { char_id, series, variant, slot, frames } => {
+                vm::lscr::Event::Sprite { char_id, series, variant, slot, frames, kind } => {
                     let old = clone_surf(&cur_surf);
                     let mut changed = false;
                     if let Some(bank) = bank.as_mut() {
@@ -2253,8 +2253,8 @@ fn run_game_at(
                                 }
                                 if let Some(dst) = slots.get_mut(idx) {
                                     eprintln!(
-                                        "  sprite: {} ({}x source, char {}, slot {}, {}f)",
-                                        name, src_scale, char_id, idx, frames
+                                        "  sprite: {} {:?} ({}x source, char {}, slot {}, {}f)",
+                                        name, kind, src_scale, char_id, idx, frames
                                     );
                                     *dst = Some(ActiveSprite { char_id, name, img, art_scale, src_scale });
                                     changed = true;

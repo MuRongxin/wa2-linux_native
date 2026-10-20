@@ -275,7 +275,14 @@ pub enum Event {
     ///
     /// `frames` is the crossfade length at 60 fps. ACT154 carries it in the
     /// record; ACT155 (the entrance) has none, so it uses 15.
-    Sprite { char_id: u32, series: u32, variant: u32, slot: u32, frames: u32 },
+    Sprite {
+        char_id: u32,
+        series: u32,
+        variant: u32,
+        slot: u32,
+        frames: u32,
+        kind: SpriteKind,
+    },
     /// ACT156 `(char_id, 0, frames)`: that character leaves. `frames` is the
     /// exit length at 60 fps.
     SpriteExit { char_id: u32, frames: u32 },
@@ -292,6 +299,16 @@ pub enum Event {
     Jump { target: String, kind: String },
     /// End of script.
     End,
+}
+
+/// K16/ACT155 is a new entrance; K16/ACT154 changes the expression of a
+/// character already occupying a stage slot. Keeping the distinction in the
+/// event stream lets the renderer match their transition semantics without
+/// changing the decoded sprite payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpriteKind {
+    Enter,
+    Change,
 }
 
 pub struct Interp<'a> {
@@ -747,7 +764,14 @@ impl<'a> Interp<'a> {
                     } else {
                         self.ints.get(3).copied().unwrap_or(0).max(0) as u32
                     };
-                    return Some(Event::Sprite { char_id, series, variant, slot, frames });
+                    return Some(Event::Sprite {
+                        char_id,
+                        series,
+                        variant,
+                        slot,
+                        frames,
+                        kind: if id == 155 { SpriteKind::Enter } else { SpriteKind::Change },
+                    });
                 }
                 None
             }
