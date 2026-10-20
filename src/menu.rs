@@ -98,12 +98,6 @@ const FROW_STYLE_W: i32 = 252;
 /// The marker that says the box opens a list rather than stepping a value.
 const FROW_DOWN_W: i32 = 22;
 
-/// Source rectangle of the caption-free 252x36 button plate in the baked clean
-/// page: the 「全文」 two-column button on the 文本快进模式 row. The font rows
-/// copy it (and its cyan hover state) so their controls have the artwork's own
-/// bevel, border and interior instead of a hand-drawn flat plate.
-const PLATE_SRC: (i32, i32, u32, u32) = (458, 118, 252, 36);
-
 /// The list that opens under a font row.
 const LST_X: i32 = 458;
 const LST_W: i32 = 470;
@@ -815,11 +809,6 @@ pub struct Assets {
     hover: [Option<TgaImage>; 3],
     gold: [Option<TgaImage>; 3],
     cyan: [Option<TgaImage>; 3],
-    /// The game's own pale snowflake plate (`sys_00110`), used to skin the
-    /// custom modals (font list, dialogue-style panel) with the same glowing
-    /// rounded frame the rest of the interface uses instead of a hand-drawn
-    /// rectangle.
-    panel_plate: Option<TgaImage>,
     header: Option<TgaImage>,
     tabs: Option<TgaImage>,
     nav: Option<TgaImage>,
@@ -919,7 +908,6 @@ impl Assets {
                 load(dirs, "sys_03211.tga"),
                 load(dirs, "sys_03221.tga"),
             ],
-            panel_plate: load(dirs, "sys_00110.tga"),
             header: load(dirs, "sys_03000.tga"),
             tabs: load(dirs, "sys_03011.tga"),
             nav: load(dirs, "sys_03020.tga"),
@@ -2563,169 +2551,119 @@ fn build_font_rows(st: &Settings, scr: &Screen, ww: i32, wh: i32) -> Option<Font
     Some(FontRows { sig: font_rows_sig(st, scr, ww, wh), w, h, buf })
 }
 
-/// Plate for one control: dark at rest, a cyan wash under the cursor.
-fn flat_plate(frame: &mut Surface, x: i32, y: i32, w: i32, h: i32, hovered: bool, on: bool, border: [u8; 4]) {
-    let body = if hovered {
-        [36, 176, 196, 255]
-    } else if on {
-        [26, 62, 74, 255]
-    } else {
-        [20, 26, 34, 255]
-    };
-    frame.fill_rect(x, y, w.max(0) as u32, h.max(0) as u32, body);
-    frame.fill_rect(x, y, w.max(0) as u32, 1, border);
-    frame.fill_rect(x, y + h - 1, w.max(0) as u32, 1, border);
-    frame.fill_rect(x, y, 1, h.max(0) as u32, border);
-    frame.fill_rect(x + w - 1, y, 1, h.max(0) as u32, border);
+/// Hand-drawn widget kit for the custom font UI.
+///
+/// The font rows, the font list and the dialogue-style panel are new controls
+/// the original artwork has no plates for, so they are drawn by hand - but in
+/// one deliberate flat style rather than by sampling patches of the page art:
+/// a chamfered rectangle, a one-pixel cyan edge and three clearly separated
+/// states (rest / hover / selected). Flat colours and crisp edges keep the
+/// custom UI readable next to the vector text and avoid the dirty look copied
+/// button textures got once they were stretched.
+const UI_PANEL_FILL: [u8; 4] = [9, 14, 20, 248];
+const UI_PANEL_EDGE: [u8; 4] = [92, 186, 204, 255];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiState {
+    Idle,
+    Hover,
+    Selected,
 }
 
-/// 9-slice one of the artwork's own plates into an arbitrary rectangle:
-/// corners keep their native pixels, edges and centre stretch, so the glowing
-/// border and the rounded corners stay crisp instead of being smeared by a
-/// plain scale.
-fn blit_nine_slice(
+fn ui_fill(state: UiState) -> [u8; 4] {
+    match state {
+        UiState::Idle => [20, 29, 38, 255],
+        UiState::Hover => [30, 68, 84, 255],
+        UiState::Selected => [36, 112, 132, 255],
+    }
+}
+
+fn ui_edge(state: UiState) -> [u8; 4] {
+    match state {
+        UiState::Idle => [80, 132, 148, 255],
+        UiState::Hover => [122, 214, 230, 255],
+        UiState::Selected => [168, 236, 246, 255],
+    }
+}
+
+/// Brighten (`pct` > 0) or darken (`pct` < 0) a colour by whole percent.
+fn ui_shade(c: [u8; 4], pct: i32) -> [u8; 4] {
+    let f = |v: u8| {
+        let scaled = v as i32 + (v as i32 * pct) / 100;
+        scaled.clamp(0, 255) as u8
+    };
+    [f(c[0]), f(c[1]), f(c[2]), c[3]]
+}
+
+/// One chamfered hand-drawn rectangle: a subtle top-to-bottom gradient body
+/// plus a 1 px edge. The edge is drawn per row so the four corners are real
+/// diagonal steps, not a blurred rounded rectangle. An edge with alpha 0 draws
+/// the body alone (shadows).
+fn ui_frame(
     frame: &mut Surface,
-    img: &TgaImage,
-    ww: i32,
-    wh: i32,
-    src: (i32, i32, i32, i32),
-    ins: (i32, i32, i32, i32),
-    dest: (i32, i32, i32, i32),
-    alpha: u8,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    fill: [u8; 4],
+    edge: [u8; 4],
+    cut: i32,
 ) {
-    let (sx, sy, sw, sh) = src;
-    let (dx, dy, dw, dh) = dest;
-    if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
+    if w <= 1 || h <= 1 {
         return;
     }
-    let mut il = ins.0.clamp(0, sw / 3).clamp(0, dw / 3);
-    let mut it = ins.1.clamp(0, sh / 3).clamp(0, dh / 3);
-    let mut ir = ins.2.clamp(0, sw / 3).clamp(0, dw / 3);
-    let mut ib = ins.3.clamp(0, sh / 3).clamp(0, dh / 3);
-    // Keep at least one pixel in every stretched middle slice.
-    if sw - il - ir < 1 || sh - it - ib < 1 {
-        il = 0;
-        it = 0;
-        ir = 0;
-        ib = 0;
-    }
-    let px = |v: i32| (v * ww) / 1280;
-    let py = |v: i32| (v * wh) / 720;
-    let (sx2, sy2) = (sx + sw, sy + sh);
-    let (dx2, dy2) = (dx + dw, dy + dh);
-    let pieces: [((i32, i32, i32, i32), (i32, i32, i32, i32)); 9] = [
-        ((sx, sy, il, it), (dx, dy, il, it)),
-        ((sx + il, sy, sw - il - ir, it), (dx + il, dy, dw - il - ir, it)),
-        ((sx2 - ir, sy, ir, it), (dx2 - ir, dy, ir, it)),
-        ((sx, sy + it, il, sh - it - ib), (dx, dy + it, il, dh - it - ib)),
-        ((sx + il, sy + it, sw - il - ir, sh - it - ib), (dx + il, dy + it, dw - il - ir, dh - it - ib)),
-        ((sx2 - ir, sy + it, ir, sh - it - ib), (dx2 - ir, dy + it, ir, dh - it - ib)),
-        ((sx, sy2 - ib, il, ib), (dx, dy2 - ib, il, ib)),
-        ((sx + il, sy2 - ib, sw - il - ir, ib), (dx + il, dy2 - ib, dw - il - ir, ib)),
-        ((sx2 - ir, sy2 - ib, ir, ib), (dx2 - ir, dy2 - ib, ir, ib)),
-    ];
-    for ((psx, psy, psw, psh), (pdx, pdy, pdw, pdh)) in pieces {
-        if psw <= 0 || psh <= 0 || pdw <= 0 || pdh <= 0 {
+    let cut = cut.clamp(0, (w - 1) / 2).clamp(0, (h - 1) / 2);
+    let has_edge = edge[3] > 0;
+    for row in 0..h {
+        let inset = if cut <= 0 {
+            0
+        } else if row < cut {
+            cut - row
+        } else if row >= h - cut {
+            row - h + cut + 1
+        } else {
+            0
+        };
+        let iw = w - inset * 2;
+        if iw <= 0 {
             continue;
         }
-        frame.blit_region_scaled(
-            img,
-            psx,
-            psy,
-            psw as u32,
-            psh as u32,
-            px(pdx),
-            py(pdy),
-            px(pdw).max(1) as u32,
-            py(pdh).max(1) as u32,
-            alpha,
-        );
+        let ry = y + row;
+        // A gentle vertical gradient: light on top, darker at the bottom. It
+        // is drawn per row so it stays smooth at any window scale.
+        let t = if h > 2 { (row * 255) / (h - 2) } else { 0 };
+        let body = ui_shade(fill, 14 - (26 * t) / 255);
+        if row == 0 || row == h - 1 {
+            frame.fill_rect(x + inset, ry, iw as u32, 1, if has_edge { edge } else { body });
+        } else {
+            frame.fill_rect(x + inset, ry, iw as u32, 1, body);
+            if has_edge {
+                frame.fill_rect(x + inset, ry, 1, 1, edge);
+                frame.fill_rect(x + w - 1 - inset, ry, 1, 1, edge);
+            }
+        }
+    }
+    if has_edge && h > 4 && w > 10 {
+        // A single faint inner highlight along the top edge: enough to read as
+        // a drawn bevel, not a texture.
+        frame.fill_rect(x + cut + 2, y + 1, (w - (cut + 2) * 2).max(1) as u32, 1, [176, 236, 246, 48]);
     }
 }
 
-/// Skin a custom modal with the game's own plate: the glowing snowflake frame
-/// plus a dark interior so the vector text stays readable. Returns false when
-/// the artwork is missing, in which case the caller keeps its flat fallback.
-fn paint_native_panel(
-    frame: &mut Surface,
-    assets: Option<&Assets>,
-    ww: i32,
-    wh: i32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-) -> bool {
-    let Some(img) = assets.and_then(|a| a.panel_plate.as_ref()) else { return false };
-    let px = |v: i32| (v * ww) / 1280;
-    let py = |v: i32| (v * wh) / 720;
-    // The plate is drawn *around* the content rectangle: its artwork carries a
-    // transparent margin plus the glowing rim, so the caller's x/y/w/h is where
-    // the content may go and the frame sits just outside it. The source rect is
-    // the visible plate bounds (8,3 in the source image) so the transparent
-    // border is not scaled into a second margin.
-    const PAD_X: i32 = 15;
-    const PAD_Y: i32 = 15;
-    let (fx, fy, fw, fh) = (x - PAD_X, y - PAD_Y, w + PAD_X * 2, h + PAD_Y * 2);
-    // Body first, then the plate's own rim so its glow stays on top.
-    frame.fill_rect(
-        px(fx),
-        py(fy),
-        px(fw).max(1) as u32,
-        py(fh).max(1) as u32,
-        [4, 9, 14, 242],
-    );
-    blit_nine_slice(
-        frame,
-        img,
-        ww,
-        wh,
-        (8, 3, (img.width as i32 - 8 - 8).max(1), (img.height as i32 - 3 - 3).max(1)),
-        (24, 22, 24, 22),
-        (fx, fy, fw, fh),
-        255,
-    );
-    // Wash the middle down: the plate's interior is bright teal, and white
-    // text needs the darker field the game's dialogs sit on.
-    frame.fill_rect(
-        px(x + 2),
-        py(y + 2),
-        px(w - 4).max(1) as u32,
-        py(h - 4).max(1) as u32,
-        [4, 10, 16, 160],
-    );
-    true
+/// A hand-drawn panel: a soft drop shadow plus the chamfered plate.
+fn ui_panel(frame: &mut Surface, x: i32, y: i32, w: i32, h: i32) {
+    ui_frame(frame, x + 2, y + 3, w, h, [0, 0, 0, 120], [0, 0, 0, 0], 8);
+    ui_frame(frame, x, y, w, h, UI_PANEL_FILL, UI_PANEL_EDGE, 8);
 }
 
-/// Paint a 252x36 page button plate (or its cyan hover state) at an arbitrary
-/// size, using the same 9-slice as the page artwork so the custom controls read
-/// as native buttons. Returns false when the clean page is unavailable.
-fn paint_page_button(
-    frame: &mut Surface,
-    assets: Option<&Assets>,
-    ww: i32,
-    wh: i32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    hovered: bool,
-) -> bool {
-    let Some(a) = assets else { return false };
-    let Some(clean) = a.clean[0].as_ref() else { return false };
-    let img = if hovered { a.hover[0].as_ref().unwrap_or(clean) } else { clean };
-    blit_nine_slice(
-        frame,
-        img,
-        ww,
-        wh,
-        (PLATE_SRC.0, PLATE_SRC.1, PLATE_SRC.2 as i32, PLATE_SRC.3 as i32),
-        (20, 10, 20, 10),
-        (x, y, w, h),
-        255,
-    );
-    true
+/// A hand-drawn button / value box in one of the three states.
+fn ui_button(frame: &mut Surface, x: i32, y: i32, w: i32, h: i32, state: UiState) {
+    ui_frame(frame, x, y, w, h, ui_fill(state), ui_edge(state), 5);
 }
+
+
+
+
 
 /// The row itself is hover index i; the style button lives past the rows in the
 /// same field.
@@ -2783,68 +2721,16 @@ fn pick_role_font(st: &mut Settings, row: usize, id: i32) -> bool {
     *slot = next;
     true
 }
-/// Blit one of the page's own button plates (and optionally its cyan hover
-/// state) into the font band. Both sheets are page-sized, caption-free copies
-/// of the artwork, so the source rectangle is the artwork coordinate of a
-/// 252x36 two-column button.
-fn blit_font_plate(
-    frame: &mut Surface,
-    img: &TgaImage,
-    ww: i32,
-    wh: i32,
-    dx: i32,
-    dy: i32,
-    w: i32,
-    h: i32,
-) {
-    // The page plate is 36 px tall and the band gives each row 34. Rather than
-    // squash all 36 rows through the nearest-neighbour scaler - which doubles
-    // some border rows and drops others and is what made the rows look dirty -
-    // copy the top and bottom halves 1:1 and skip the two middle rows.
-    let px = |v: i32| (v * ww) / 1280;
-    let py = |v: i32| (v * wh) / 720;
-    let half = (h / 2).max(1);
-    let src_h = PLATE_SRC.3 as i32;
-    let top_h = half.min(src_h);
-    let bottom_h = (h - half).min(src_h - top_h).max(1);
-    frame.blit_region_scaled(
-        img,
-        PLATE_SRC.0,
-        PLATE_SRC.1,
-        PLATE_SRC.2,
-        top_h as u32,
-        px(dx),
-        py(dy),
-        px(w).max(1) as u32,
-        py(half).max(1) as u32,
-        255,
-    );
-    frame.blit_region_scaled(
-        img,
-        PLATE_SRC.0,
-        PLATE_SRC.1 + (src_h - bottom_h),
-        PLATE_SRC.2,
-        bottom_h as u32,
-        px(dx),
-        py(dy + half),
-        px(w).max(1) as u32,
-        py(h - half).max(1) as u32,
-        255,
-    );
-}
-
-/// Draw the three font rows into the band above the artwork's own rows.
+/// Draw the three hand-drawn font rows into the band above the artwork's own
+/// rows.
 ///
 /// `open` is the row whose list is currently on screen (F-19 m1): it was taken
 /// out of `Screen` because the request to open a list lives for exactly one
-/// frame, while the open state lives in the [`FontList`] itself. `assets` is
-/// used for the page's own button plates; without a clean page (no baked
-/// cache) the rows fall back to the flat plates.
+/// frame, while the open state lives in the [`FontList`] itself.
 fn paint_font_rows(
     frame: &mut Surface,
     ww: i32,
     wh: i32,
-    assets: Option<&Assets>,
     scr: &Screen,
     open: Option<usize>,
     rows: Option<&FontRows>,
@@ -2855,69 +2741,41 @@ fn paint_font_rows(
     let oy = py(PAGE_Y);
     // The band starts at the split; the rows inside it keep their own grid.
     let band = oy + py(FONT_SPLIT);
-    let dim = [64, 96, 108, 255];
-    let lit = [96, 196, 212, 255];
-    let plate_base = assets.and_then(|a| a.clean[0].as_ref());
-    let plate_hover = assets.and_then(|a| a.hover[0].as_ref());
-    let mut plate = |frame: &mut Surface, hovered: bool, dx: i32, y: i32, w: i32| {
-        if let Some(img) = plate_base {
-            blit_font_plate(frame, img, ww, wh, PAGE_X + dx, PAGE_Y + y, w, FROW_H);
-            if hovered {
-                if let Some(state) = plate_hover {
-                    blit_font_plate(frame, state, ww, wh, PAGE_X + dx, PAGE_Y + y, w, FROW_H);
-                }
-            }
-            true
-        } else {
-            false
-        }
-    };
     for i in 0..3 {
         let y = font_row_y(i);
         let is_open = open == Some(i);
-        let on = is_open || scr.font_sel == i || scr.font_hover == Some(i);
-        // The box is the trigger: the marker on its right edge is drawn as a
-        // chevron by the text layer, since a triangle would need its own plate.
-        let drawn = plate(
+        let state = if is_open || scr.font_hover == Some(i) {
+            UiState::Hover
+        } else if scr.font_sel == i {
+            UiState::Selected
+        } else {
+            UiState::Idle
+        };
+        ui_button(
             frame,
-            scr.font_hover == Some(i) || is_open,
-            FROW_BOX_X,
-            FONT_SPLIT + y,
-            FROW_BOX_W,
+            ox + px(FROW_BOX_X),
+            band + py(y),
+            px(FROW_BOX_W).max(2),
+            py(FROW_H).max(2),
+            state,
         );
-        if !drawn {
-            flat_plate(
-                frame,
-                ox + px(FROW_BOX_X),
-                band + py(y),
-                px(FROW_BOX_W),
-                py(FROW_H),
-                scr.font_hover == Some(i) || is_open,
-                on,
-                if is_open { lit } else if on { [72, 150, 172, 255] } else { dim },
-            );
-        }
         if i == 0 {
-            let sh = scr.font_hover == Some(FONT_STYLE_ROW);
-            let drawn = plate(frame, sh, FROW_STYLE_X, FONT_SPLIT + y, FROW_STYLE_W);
-            if !drawn {
-                flat_plate(
-                    frame,
-                    ox + px(FROW_STYLE_X),
-                    band + py(y),
-                    px(FROW_STYLE_W),
-                    py(FROW_H),
-                    sh,
-                    false,
-                    if sh { lit } else { dim },
-                );
-            }
+            let style_hot = scr.font_hover == Some(FONT_STYLE_ROW);
+            ui_button(
+                frame,
+                ox + px(FROW_STYLE_X),
+                band + py(y),
+                px(FROW_STYLE_W).max(2),
+                py(FROW_H).max(2),
+                if style_hot { UiState::Hover } else { UiState::Idle },
+            );
         }
     }
     if let Some(r) = rows {
         blit_ink(frame, &r.buf, r.w, r.h, ox, band);
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // font list
@@ -3318,106 +3176,93 @@ fn build_list_text(
     Some(ListText { key: l.key(), w, h, buf })
 }
 
-/// Draw the list over the page.
-fn paint_font_list(
-    frame: &mut Surface,
-    ww: i32,
-    wh: i32,
-    assets: Option<&Assets>,
-    l: &FontList,
-    text: Option<&ListText>,
-) {
+/// Draw the hand-drawn font list over the page.
+fn paint_font_list(frame: &mut Surface, ww: i32, wh: i32, l: &FontList, text: Option<&ListText>) {
     let px = |v: i32| (v * ww) / 1280;
     let py = |v: i32| (v * wh) / 720;
     let ox = px(PAGE_X);
     let oy = py(PAGE_Y);
     let (x, y, w, h) = (px(LST_X) + ox, py(lst_y(l.row)) + oy, px(LST_W), py(lst_h()));
-    // Row plates are page-relative too; without this base they land `lst_y`
-    // pixels too high and the hover highlight tracks the previous row (the
-    // text canvas, blitted at `y`, was already correct).
-    let ly = y;
-    // The list is a modal like the dialogue-style panel: dim the page, then
-    // draw the game's own snowflake plate instead of a hand-drawn rectangle.
-    frame.fill_rect(0, 0, ww.max(1) as u32, wh.max(1) as u32, [0, 0, 0, 120]);
-    let native = paint_native_panel(
-        frame,
-        assets,
-        ww,
-        wh,
-        PAGE_X + LST_X,
-        PAGE_Y + lst_y(l.row),
-        LST_W,
-        lst_h(),
+    // The list is a modal like the dialogue-style panel: dim the page behind it.
+    frame.fill_rect(0, 0, ww.max(1) as u32, wh.max(1) as u32, [0, 0, 0, 130]);
+    ui_panel(frame, x, y, w, h);
+    // A faintly lit header band, so the title line reads as part of the plate.
+    frame.fill_rect(
+        x + px(14),
+        y + py(8),
+        (w - px(28)).max(1) as u32,
+        py(LST_HEAD).max(2) as u32,
+        [140, 214, 228, 22],
     );
-    if !native {
-        frame.fill_rect(x, y, w as u32, h as u32, [14, 18, 26, 250]);
-        let rim = [96, 196, 212, 255];
-        frame.fill_rect(x, y, w as u32, 1, rim);
-        frame.fill_rect(x, y + h - 1, w as u32, 1, rim);
-        frame.fill_rect(x, y, 1, h as u32, rim);
-        frame.fill_rect(x + w - 1, y, 1, h as u32, rim);
-    }
+    // Rule between the count line and the first row.
+    let head_y = y + py(LST_HEAD);
+    frame.fill_rect(x + px(10), head_y - 1, (w - px(20)).max(1) as u32, 1, [70, 120, 134, 255]);
     let n = crate::render::text::font_catalog().len();
+    let row_x = x + px(3);
+    let row_w = (w - px(LST_BAR_W) - px(6)).max(2);
+    let row_h = py(LST_ROW_H).max(2);
     for k in 0..LST_ROWS {
         let i = l.top + k;
         if i >= n {
             break;
         }
-        let ry = LST_HEAD + k as i32 * LST_ROW_H;
-        // The role's current font gets the page's selected (cyan) plate; the
-        // row under the pointer gets the plain button plate. Both are the
-        // artwork's own 252x36 buttons, 9-sliced to the row.
-        if i == l.current || l.hover == Some(i) {
-            let row = (PAGE_X + LST_X + 2, PAGE_Y + lst_y(l.row) + ry + 1, LST_W - LST_BAR_W - 4, LST_ROW_H - 2);
-            if !paint_page_button(frame, assets, ww, wh, row.0, row.1, row.2, row.3, i == l.current) && !native {
-                let tint = if i == l.current { [38, 128, 150, 255] } else { [30, 74, 88, 255] };
-                frame.fill_rect(px(row.0), ly + py(ry + 1), px(row.2).max(1) as u32, py(row.3).max(1) as u32, tint);
-            }
-        }
-        if k > 0 && !native {
+        let ry = head_y + py(k as i32 * LST_ROW_H);
+        let state = if i == l.current {
+            UiState::Selected
+        } else if l.hover == Some(i) {
+            UiState::Hover
+        } else {
+            UiState::Idle
+        };
+        if state != UiState::Idle {
+            ui_button(frame, row_x, ry + py(1), row_w, py(LST_ROW_H - 2).max(2), state);
+        } else if k > 0 {
             frame.fill_rect(
-                px(LST_X + 4) + ox,
-                ly + py(ry),
-                px(LST_W - LST_BAR_W - 8).max(1) as u32,
+                x + px(8),
+                ry,
+                (w - px(LST_BAR_W + 16)).max(1) as u32,
                 1,
-                [46, 66, 76, 255],
+                [38, 56, 66, 255],
             );
         }
     }
-    // Footer: a native button plate so it reads as an action rather than a row.
-    let fy = LST_HEAD + LST_ROWS as i32 * LST_ROW_H;
-    let foot = (PAGE_X + LST_X + 4, PAGE_Y + lst_y(l.row) + fy, LST_W - LST_BAR_W - 8, LST_FOOT);
-    if !paint_page_button(frame, assets, ww, wh, foot.0, foot.1, foot.2, foot.3, l.reset_hover) && !native {
-        frame.fill_rect(
-            px(foot.0),
-            ly + py(fy + 1),
-            px(foot.2).max(1) as u32,
-            py(foot.3).max(1) as u32,
-            if l.reset_hover { [30, 74, 88, 255] } else { [18, 24, 32, 255] },
-        );
-    }
-    // The scrollbar: a track with a thumb that shows where the window sits.
-    let bx = px(LST_X + LST_W - LST_BAR_W) + ox;
-    let by = py(lst_y(l.row) + LST_HEAD) + oy;
-    let bh = py(LST_ROWS as i32 * LST_ROW_H);
-    frame.fill_rect(bx, by, px(LST_BAR_W).max(1) as u32, bh.max(1) as u32, [10, 14, 20, 255]);
+    // Footer: a hand-drawn button so it reads as an action rather than a row.
+    let fy = head_y + py(LST_ROWS as i32 * LST_ROW_H);
+    ui_button(
+        frame,
+        row_x,
+        fy,
+        row_w,
+        py(LST_FOOT).max(2),
+        if l.reset_hover { UiState::Hover } else { UiState::Idle },
+    );
+    // Scrollbar: a dark track and a thumb that shows where the window sits.
+    let bx = x + w - px(LST_BAR_W).max(1);
+    let by = y + py(LST_HEAD);
+    let bh = py(LST_ROWS as i32 * LST_ROW_H).max(1);
+    let bw = px(LST_BAR_W).max(2);
+    frame.fill_rect(bx, by, bw as u32, bh as u32, [8, 12, 18, 255]);
     if n > LST_ROWS {
         let last = n - LST_ROWS;
         let track = (bh as f32) - 14.0;
         let thumb = (track * LST_ROWS as f32 / n as f32).max(14.0);
         let ty = by as f32 + (track - thumb) * l.top as f32 / last as f32;
-        frame.fill_rect(
-            bx,
+        ui_frame(
+            frame,
+            bx + 1,
             ty as i32,
-            px(LST_BAR_W).max(1) as u32,
-            thumb.max(1.0) as u32,
-            if l.drag { [120, 210, 224, 255] } else { [86, 158, 178, 255] },
+            (bw - 2).max(2),
+            thumb.max(2.0) as i32,
+            if l.drag { [72, 156, 176, 255] } else { [52, 112, 130, 255] },
+            if l.drag { [150, 226, 238, 255] } else { [86, 158, 176, 255] },
+            2,
         );
     }
     if let Some(t) = text {
         blit_ink(frame, &t.buf, t.w, t.h, x, y);
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // dialogue style panel
@@ -3730,51 +3575,70 @@ fn build_style_text(p: &StylePanel, ww: i32, wh: i32) -> Option<StyleText> {
     Some(StyleText { sig: p.sig(), w, h, buf })
 }
 
-fn paint_style_panel(
-    frame: &mut Surface,
-    ww: i32,
-    wh: i32,
-    assets: Option<&Assets>,
-    p: &StylePanel,
-    text: Option<&StyleText>,
-) {
+fn paint_style_panel(frame: &mut Surface, ww: i32, wh: i32, p: &StylePanel, text: Option<&StyleText>) {
     use crate::render::text::DIALOG_COLORS;
     let px = |v: i32| (v * ww) / 1280;
     let py = |v: i32| (v * wh) / 720;
     frame.fill_rect(0, 0, ww.max(1) as u32, wh.max(1) as u32, [0, 0, 0, 170]);
     let (x, y, w, h) = (px(SP_X), py(SP_Y), px(SP_W), py(SP_H));
-    let native = paint_native_panel(frame, assets, ww, wh, SP_X, SP_Y, SP_W, SP_H);
-    if !native {
-        frame.fill_rect(x, y, w as u32, h as u32, [14, 18, 26, 246]);
-        let rim = [96, 196, 212, 255];
-        frame.fill_rect(x, y, w as u32, 1, rim);
-        frame.fill_rect(x, y + h - 1, w as u32, 1, rim);
-        frame.fill_rect(x, y, 1, h as u32, rim);
-        frame.fill_rect(x + w - 1, y, 1, h as u32, rim);
-    }
-    // Every control is one of the page's own button plates, 9-sliced to size:
-    // the same glowing border and interior the rest of the option screen uses.
+    ui_panel(frame, x, y, w, h);
+    // A faintly lit title band, then the rule under the hint.
+    frame.fill_rect(
+        x + px(22),
+        y + py(10),
+        (w - px(44)).max(1) as u32,
+        py(54).max(2) as u32,
+        [140, 214, 228, 22],
+    );
+    // Rule under the title and the auto-save hint.
+    frame.fill_rect(x + px(24), y + py(64), (w - px(48)).max(1) as u32, 1, [70, 120, 134, 255]);
+    let box_w = px(SP_BOX_W).max(2);
+    let box_h = py(SP_ROW_H).max(2);
     for i in 0..SP_ROWS {
-        let ry = SP_ROW_Y + i as i32 * SP_ROW_PITCH;
-        let on = p.sel == i;
-        if !paint_page_button(frame, assets, ww, wh, SP_BOX_X, ry, SP_BOX_W, SP_ROW_H, on || p.hover == Some(i)) && !native {
-            flat_plate(frame, px(SP_BOX_X), py(ry), px(SP_BOX_W), py(SP_ROW_H), p.hover == Some(i), on, [96, 196, 212, 255]);
-        }
+        let ry = py(SP_ROW_Y + i as i32 * SP_ROW_PITCH);
+        let state = if p.sel == i {
+            UiState::Selected
+        } else if p.hover == Some(i) {
+            UiState::Hover
+        } else {
+            UiState::Idle
+        };
+        ui_button(frame, px(SP_BOX_X), ry, box_w, box_h, state);
         let left_hot = p.hover == Some(SP_PREV0 + i);
-        if !paint_page_button(frame, assets, ww, wh, SP_ARROW_L, ry, SP_ARROW_W, SP_ROW_H, left_hot) && !native {
-            flat_plate(frame, px(SP_ARROW_L), py(ry), px(SP_ARROW_W), py(SP_ROW_H), left_hot, false, [64, 96, 108, 255]);
-        }
+        ui_button(
+            frame,
+            px(SP_ARROW_L),
+            ry,
+            px(SP_ARROW_W).max(2),
+            box_h,
+            if left_hot { UiState::Hover } else { UiState::Idle },
+        );
         let right_hot = p.hover == Some(SP_NEXT0 + i);
-        if !paint_page_button(frame, assets, ww, wh, SP_ARROW_R, ry, SP_ARROW_W, SP_ROW_H, right_hot) && !native {
-            flat_plate(frame, px(SP_ARROW_R), py(ry), px(SP_ARROW_W), py(SP_ROW_H), right_hot, false, [64, 96, 108, 255]);
-        }
+        ui_button(
+            frame,
+            px(SP_ARROW_R),
+            ry,
+            px(SP_ARROW_W).max(2),
+            box_h,
+            if right_hot { UiState::Hover } else { UiState::Idle },
+        );
     }
-    if !paint_page_button(frame, assets, ww, wh, SP_RESET_X, SP_BTN_Y, 130, SP_BTN_H, p.hover == Some(SP_RESET)) && !native {
-        flat_plate(frame, px(SP_RESET_X), py(SP_BTN_Y), px(130), py(SP_BTN_H), p.hover == Some(SP_RESET), false, [64, 96, 108, 255]);
-    }
-    if !paint_page_button(frame, assets, ww, wh, SP_CLOSE_X, SP_BTN_Y, 110, SP_BTN_H, p.hover == Some(SP_CLOSE)) && !native {
-        flat_plate(frame, px(SP_CLOSE_X), py(SP_BTN_Y), px(110), py(SP_BTN_H), p.hover == Some(SP_CLOSE), false, [64, 96, 108, 255]);
-    }
+    ui_button(
+        frame,
+        px(SP_RESET_X),
+        py(SP_BTN_Y),
+        px(130).max(2),
+        py(SP_BTN_H).max(2),
+        if p.hover == Some(SP_RESET) { UiState::Hover } else { UiState::Idle },
+    );
+    ui_button(
+        frame,
+        px(SP_CLOSE_X),
+        py(SP_BTN_Y),
+        px(110).max(2),
+        py(SP_BTN_H).max(2),
+        if p.hover == Some(SP_CLOSE) { UiState::Hover } else { UiState::Idle },
+    );
     // A swatch of the colour next to its name, so the rows read as one thing
     // being edited rather than eight numbers.
     let sw = DIALOG_COLORS[(p.style.color as usize).min(DIALOG_COLORS.len() - 1)];
@@ -3790,6 +3654,7 @@ fn paint_style_panel(
         blit_ink(frame, &t.buf, t.w, t.h, x, y);
     }
 }
+
 
 /// What the page is allowed to see this frame.
 ///
@@ -4200,7 +4065,7 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                 if stale {
                     font_rows = build_font_rows(st, &scr, ww, wh);
                 }
-                paint_font_rows(&mut frame, ww, wh, Some(&assets), &scr, open_row, font_rows.as_ref());
+                paint_font_rows(&mut frame, ww, wh, &scr, open_row, font_rows.as_ref());
             }
             if let Some(l) = font_list.as_ref() {
                 let pw = (LST_W * ww) / 1280;
@@ -4212,7 +4077,7 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                 if stale {
                     list_text = build_list_text(l, ww, wh, &mut previews);
                 }
-                paint_font_list(&mut frame, ww, wh, Some(&assets), l, list_text.as_ref());
+                paint_font_list(&mut frame, ww, wh, l, list_text.as_ref());
             }
             if let Some(p) = style_panel.as_ref() {
                 let pw = (SP_W * ww) / 1280;
@@ -4224,7 +4089,7 @@ pub fn run(win: &mut Sdl, dirs: &[&Path], st: &mut Settings, mx: Option<&crate::
                 if stale {
                     style_text = build_style_text(p, ww, wh);
                 }
-                paint_style_panel(&mut frame, ww, wh, Some(&assets), p, style_text.as_ref());
+                paint_style_panel(&mut frame, ww, wh, p, style_text.as_ref());
             }
             // `WA2_MENU_DUMP` writes the frame the player sees, labels included.
             // The write goes to a temporary file and is renamed, so a reader
@@ -5075,7 +4940,7 @@ mod tests {
         assert_ne!(before, after, "a fallback has to invalidate the font band");
         if let Some(rows) = rows {
             let mut frame = Surface::new(W, H, [0, 0, 0, 255]);
-            paint_font_rows(&mut frame, 1280, 720, None, &scr, None, Some(&rows));
+            paint_font_rows(&mut frame, 1280, 720, &scr, None, Some(&rows));
         }
     }
 
@@ -5095,26 +4960,26 @@ mod tests {
         };
         let mut frame = Surface::new(W, H, [0, 0, 0, 255]);
         let rows = build_font_rows(&st, &scr, 1280, 720);
-        paint_font_rows(&mut frame, 1280, 720, None, &scr, Some(0), rows.as_ref());
+        paint_font_rows(&mut frame, 1280, 720, &scr, Some(0), rows.as_ref());
         let l = FontList::new(0, 0);
         let mut previews = PreviewCache::new();
         let text = build_list_text(&l, 1280, 720, &mut previews);
-        paint_font_list(&mut frame, 1280, 720, None, &l, text.as_ref());
+        paint_font_list(&mut frame, 1280, 720, &l, text.as_ref());
         let panel = StylePanel::new(&st);
         let style = build_style_text(&panel, 1280, 720);
-        paint_style_panel(&mut frame, 1280, 720, None, &panel, style.as_ref());
+        paint_style_panel(&mut frame, 1280, 720, &panel, style.as_ref());
         // A smaller window has to scale the canvases with it.
         let small = build_list_text(&l, 960, 540, &mut previews);
         if let Some(t) = small {
             assert_eq!(t.w as i32, (LST_W * 960) / 1280);
             assert_eq!(t.h as i32, (lst_h() * 540) / 720);
             let mut small_frame = Surface::new(960, 540, [0, 0, 0, 255]);
-            paint_font_list(&mut small_frame, 960, 540, None, &l, Some(&t));
+            paint_font_list(&mut small_frame, 960, 540, &l, Some(&t));
         }
         if let Some(rows) = build_font_rows(&st, &scr, 960, 540) {
             assert_eq!(rows.w as i32, (PAGE_W * 960) / 1280);
             let mut small_frame = Surface::new(960, 540, [0, 0, 0, 255]);
-            paint_font_rows(&mut small_frame, 960, 540, None, &scr, None, Some(&rows));
+            paint_font_rows(&mut small_frame, 960, 540, &scr, None, Some(&rows));
         }
     }
 
