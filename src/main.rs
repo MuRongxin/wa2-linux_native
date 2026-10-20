@@ -255,23 +255,39 @@ fn main() {
                 return;
             }
             let mut movie = match video::Movie::open(&args[2]) { Some(m) => m, None => { eprintln!("ffmpeg/ffprobe failed or no video"); return; } };
-            eprintln!("movie {}x{} @ {:.3}fps", movie.width, movie.height, movie.fps);
+            eprintln!("movie {}x{} @ {:.3}fps has_audio={}", movie.width, movie.height, movie.fps, movie.has_audio);
             let mut win = match sdl2::Sdl::new("wa2-movie", movie.width as i32 as u32, movie.height) { Some(w) => w, None => { eprintln!("no SDL/display"); return; } };
-            let mixer = if args.len() >= 4 { audio::Mixer::new(&win) } else { None };
-            if let Some(ref m) = mixer { let _ = m; if let Some(ref mx) = mixer { mx.play(&args[3], 1.0, false); } }
+            // args[3] is an optional external track (old debug usage); with no
+            // argument the movie's own audio stream is mixed instead.
+            let mixer = if args.len() >= 4 || movie.has_audio { audio::Mixer::new(&win) } else { None };
+            let slot = match mixer.as_ref() {
+                Some(mx) if args.len() >= 4 => Some(mx.play(&args[3], 1.0, false)).filter(|s| *s != usize::MAX),
+                Some(mx) => movie.play_audio(mx, audio::mixer::CAT_BGM),
+                None => None,
+            };
+            eprintln!("movie audio: {}", if slot.is_some() { "playing" } else { "silent" });
             let mut frame = vec![0u8; (movie.width * movie.height * 4) as usize];
-            let frame_delay = std::time::Duration::from_secs_f64(1.0 / movie.fps.max(1.0));
+            let fps = movie.fps.max(1.0);
+            let mut t0 = std::time::Instant::now();
             let mut count = 0u64;
-            loop {
+            'play: loop {
                 if !movie.read_frame(&mut frame) { eprintln!("EOF"); break; }
                 win.present_raw(&frame, movie.width, movie.height);
                 count += 1;
-                std::thread::sleep(frame_delay);
-                match win.poll_input() {
-                    sdl2::Input::Quit => { eprintln!("quit"); break; }
-                    _ => {}
+                let deadline = t0 + std::time::Duration::from_secs_f64(count as f64 / fps);
+                loop {
+                    match win.poll_input() {
+                        sdl2::Input::Quit => { eprintln!("quit"); break 'play; }
+                        _ => {}
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= deadline { break; }
+                    let rest = (deadline - now).as_millis() as u32;
+                    if rest > 500 { t0 = now - std::time::Duration::from_secs_f64(count as f64 / fps); break; }
+                    win.delay(rest.clamp(1, 8));
                 }
             }
+            if let (Some(mx), Some(s)) = (mixer.as_ref(), slot) { mx.stop(s); }
             eprintln!("played {} frames", count);
         }
         "movie-frame" => {
@@ -2535,7 +2551,7 @@ fn run_game_at(
                 }
                 vm::lscr::Event::Movie { name } => {
                     eprintln!("  movie: {}", name);
-                    let _ = play_movie(win, &s.movie_dir, &name);
+                    let _ = play_movie(win, &s.movie_dir, &name, mixer.as_ref());
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::Choice { options } => {
@@ -5276,12 +5292,169 @@ fn browse_cg(win: &mut sdl2::Sdl, font: &render::Font, dirs: &[&std::path::Path]
     }
 }
 
+/// Pick one of the two electronic-novel chains.  They are real script roots
+/// (5000 and 5100), so entering one through the normal game runner preserves
+/// its backgrounds, text, voice and save/rewind behaviour.
+fn browse_novels(win: &mut sdl2::Sdl, dirs: &[&std::path::Path], cn: bool) -> Option<String> {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let ids = ["5000", "5100"];
+    let labels = if cn { ["序章电子小说", "终章电子小说"] } else { ["序章電子小説", "終章電子小説"] };
+    let backdrop = load_background(dirs, "T0000.tga")
+        .map(|img| surface_from_tga(&img).scaled_to(W, H));
+    let mut sel = 0usize;
+    loop {
+        let mut frame = backdrop.as_ref().map(clone_surf)
+            .unwrap_or_else(|| render::Surface::new(W, H, [1, 29, 89, 255]));
+        frame.fill_rect(270, 170, 740, 350, [0, 16, 38, 220]);
+        frame.fill_rect(270, 170, 740, 2, [150, 220, 235, 230]);
+        if let Some((w, h, rgba)) = render::text::with_ui_font(28, |f| {
+            f.line_rgba(if cn { "电子小说" } else { "電子小説" }, 28)
+        }).flatten() {
+            frame.blit_rgba(&rgba, w, h, (W as i32 - w as i32) / 2, 210);
+        }
+        for (i, label) in labels.iter().enumerate() {
+            let y = 300 + i as i32 * 76;
+            let color = if i == sel { [50, 130, 150, 255] } else { [20, 55, 78, 230] };
+            frame.fill_rect(390, y, 500, 54, color);
+            frame.fill_rect(390, y, 500, 1, [170, 225, 235, 220]);
+            if let Some((w, h, rgba)) = render::text::with_ui_font(24, |f| f.line_rgba(label, 24)).flatten() {
+                frame.blit_rgba(&rgba, w, h, 640 - w as i32 / 2, y + (54 - h as i32) / 2);
+            }
+        }
+        if let Some((w, h, rgba)) = render::text::with_ui_font(16, |f| {
+            f.line_rgba(if cn { "↑↓选择　回车进入　Esc返回" } else { "↑↓選択　Enter決定　Esc戻る" }, 16)
+        }).flatten() {
+            frame.blit_rgba(&rgba, w, h, (W as i32 - w as i32) / 2, 470);
+        }
+        win.present(&frame);
+        match win.poll_input() {
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => return None,
+            sdl2::Input::Up => sel = (sel + 1) % 2,
+            sdl2::Input::Down => sel = (sel + 1) % 2,
+            sdl2::Input::Advance | sdl2::Input::Right | sdl2::Input::Choice(_) => return Some(ids[sel].to_string()),
+            sdl2::Input::Pointer { x, y, pressed: true } => {
+                let (sx, sy) = win.surface_pos(x, y, W, H);
+                if (300..376).contains(&sy) { return Some(ids[0].to_string()); }
+                if (376..460).contains(&sy) { return Some(ids[1].to_string()); }
+                let _ = sx;
+            }
+            _ => win.delay(16),
+        }
+    }
+}
+
+/// The original 「ボイスメッセージ」 page is a small character-card player.
+/// The shipped 9001..9005 banks contain the five heroine message groups and
+/// sys_07200..07204 are their corresponding profile cards.
+fn browse_voice_messages(
+    win: &mut sdl2::Sdl,
+    dirs: &[&std::path::Path],
+    cn: bool,
+    mixer: Option<&audio::Mixer>,
+    cursor: Option<&std::path::Path>,
+) {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let names = if cn { ["冬马和纱", "小木曾雪菜", "小春", "千晶", "麻理"] }
+        else { ["冬馬かずさ", "小木曾雪菜", "小春", "千晶", "麻理"] };
+    let voice_dir = dirs.iter().find_map(|d| d.parent()).map(|p| p.join("voice"));
+    let mut clips: Vec<Vec<std::path::PathBuf>> = Vec::new();
+    for bank in 1..=5 {
+        let mut rows = Vec::new();
+        if let Some(dir) = voice_dir.as_ref() {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if stem.starts_with(&format!("900{}_", bank)) {
+                        rows.push(p);
+                    }
+                }
+            }
+        }
+        rows.sort();
+        clips.push(rows);
+    }
+    if clips.iter().all(|v| v.is_empty()) {
+        return;
+    }
+    eprintln!(
+        "voice messages: {} banks, clips={:?}",
+        clips.iter().filter(|v| !v.is_empty()).count(),
+        clips.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    let cards: Vec<Option<codec::tga::TgaImage>> = (0..5)
+        .map(|i| load_background(dirs, &format!("sys_0720{}.tga", i)))
+        .collect();
+    let mut character = 0usize;
+    let mut line = 0usize;
+    let mut playing: Option<usize> = None;
+    loop {
+        let mut frame = cards[character].as_ref().map(surface_from_tga)
+            .unwrap_or_else(|| render::Surface::new(W, H, [8, 24, 38, 255]));
+        if let Some((w, h, rgba)) = render::text::with_ui_font(22, |f| f.line_rgba(names[character], 22)).flatten() {
+            frame.fill_rect(34, 600, w + 24, h + 16, [0, 12, 30, 190]);
+            frame.blit_rgba(&rgba, w, h, 46, 608);
+        }
+        let count = clips[character].len();
+        let status = if count == 0 {
+            if cn { "暂无语音消息" } else { "ボイスメッセージなし" }
+        } else {
+            // The resource has no text transcript; identify the playable clip
+            // without inventing dialogue text.
+            if cn { "按回车试听　左右切换语音" } else { "Enterで再生　左右で音声選択" }
+        };
+        if let Some((w, h, rgba)) = render::text::with_ui_font(18, |f| f.line_rgba(status, 18)).flatten() {
+            frame.fill_rect(760, 620, w + 24, h + 16, [0, 12, 30, 190]);
+            frame.blit_rgba(&rgba, w, h, 772, 628);
+        }
+        if count > 0 {
+            let text = format!("{}/{}", line + 1, count);
+            if let Some((w, h, rgba)) = render::text::with_ui_font(20, |f| f.line_rgba(&text, 20)).flatten() {
+                frame.blit_rgba(&rgba, w, h, 1160, 628);
+            }
+        }
+        win.present(&frame);
+        match win.poll_input() {
+            sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
+                if let (Some(mx), Some(slot)) = (mixer, playing.take()) { mx.stop(slot); }
+                return;
+            }
+            sdl2::Input::Up => { character = (character + 4) % 5; line = 0; }
+            sdl2::Input::Down => { character = (character + 1) % 5; line = 0; }
+            sdl2::Input::Left => if count > 0 { line = (line + count - 1) % count; },
+            sdl2::Input::Right => if count > 0 { line = (line + 1) % count; },
+            sdl2::Input::Advance | sdl2::Input::Choice(_) => {
+                if let (Some(mx), Some(path)) = (mixer, clips[character].get(line)) {
+                    if let Some(slot) = playing.take() { mx.stop(slot); }
+                    let slot = mx.play_cat(&path.to_string_lossy(), 1.0, false, audio::mixer::CAT_VOICE);
+                    if slot != usize::MAX {
+                        playing = Some(slot);
+                        eprintln!("voice message: {} -> {}", names[character], path.display());
+                    }
+                }
+            }
+            sdl2::Input::Pointer { x, y, pressed: true } => {
+                let (sx, sy) = win.surface_pos(x, y, W, H);
+                if sy < 360 && sx < 640 { character = (character + 4) % 5; line = 0; }
+                else if sy < 360 { character = (character + 1) % 5; line = 0; }
+                else if count > 0 { line = (line + 1) % count; }
+            }
+            _ => win.delay(16),
+        }
+        let _ = cursor;
+    }
+}
+
 /// 「特别模式」. Labels are the system font. The highlight bar and the logo
 /// stay the original art. 「时间线」 replaces the atlas row 场景回放.
 enum SpecialPick {
+    Novel,
     Replay,
     Cg,
     Music,
+    Voice,
     /// An entry the original lists but this build does not open yet.
     Notice,
     Back,
@@ -5620,9 +5793,11 @@ fn run_special(
     let mut fitted: Option<FittedMenu> = None;
 
     let pick = |sel: usize| match ROWS[sel] {
+        9 => SpecialPick::Novel,
         10 => SpecialPick::Cg,
         11 => SpecialPick::Replay,
         12 => SpecialPick::Music,
+        13 => SpecialPick::Voice,
         8 => SpecialPick::Back,
         _ => SpecialPick::Notice,
     };
@@ -6373,6 +6548,12 @@ fn run_title(
                     mixer.as_ref(),
                     cursor.as_deref(),
                 ) {
+                    SpecialPick::Novel => {
+                        if let Some(id) = browse_novels(win, bg_dirs, cn) {
+                            return TitleAction::Jump(id);
+                        }
+                        notice = None;
+                    }
                     SpecialPick::Replay => {
                         if let Some(id) = timeline::run(win, font, bg_dirs, script_dir, cn) {
                             return TitleAction::Jump(id);
@@ -6399,6 +6580,10 @@ fn run_title(
                         bgm_slot = start_title_bgm(mixer.as_ref(), bg_dirs);
                         notice = None;
                     }
+                    SpecialPick::Voice => {
+                        browse_voice_messages(win, bg_dirs, cn, mixer.as_ref(), cursor.as_deref());
+                        notice = None;
+                    }
                     SpecialPick::Back => notice = None,
                     SpecialPick::Notice => notice = Some(notice_text),
                 },
@@ -6416,7 +6601,12 @@ fn run_title(
 /// its first bytes are the ASF GUID), so the data tree stores them as plain
 /// `*.wmv`. Scripts name them "mv01".."mv24" while the files ship as version
 /// pairs (`mv010`, `mv011`), so we try the plain name first, then 0 and 1.
-fn play_movie(win: &mut sdl2::Sdl, movie_dir: &std::path::Path, name: &str) -> Option<()> {
+fn play_movie(
+    win: &mut sdl2::Sdl,
+    movie_dir: &std::path::Path,
+    name: &str,
+    mixer: Option<&audio::Mixer>,
+) -> Option<()> {
     let cands = [
         name.to_ascii_lowercase(),
         format!("{}0", name.to_ascii_lowercase()),
@@ -6440,17 +6630,39 @@ fn play_movie(win: &mut sdl2::Sdl, movie_dir: &std::path::Path, name: &str) -> O
         }
     };
     let mut movie = video::Movie::open(path.to_str()?)?;
-    eprintln!("  playing movie {} ({}x{} @ {:.2}fps)", name, movie.width, movie.height, movie.fps);
+    // Movie audio is a normal mixer stream (WMA decoded by ffmpeg), scaled by
+    // the BGM slider like the original's movie playback. Silent movies simply
+    // have no slot here and stay video-only.
+    let audio_slot = mixer.and_then(|m| movie.play_audio(m, audio::mixer::CAT_BGM));
+    eprintln!("  playing movie {} ({}x{} @ {:.2}fps, audio={})", name,
+        movie.width, movie.height, movie.fps,
+        if audio_slot.is_some() { "on" } else if movie.has_audio { "unavailable" } else { "none" });
     let mut frame = vec![0u8; (movie.width * movie.height * 4) as usize];
-    let delay = std::time::Duration::from_secs_f64(1.0 / movie.fps.max(1.0));
-    while movie.read_frame(&mut frame) {
+    // Wall-clock pacing anchored on frame N's ideal presentation time instead of
+    // a fixed `sleep(1/fps)` per frame: the old loop accumulated the cost of
+    // decode + present into every frame and drifted behind the audio track.
+    let fps = movie.fps.max(1.0);
+    let mut t0 = std::time::Instant::now();
+    let mut n = 0u64;
+    'play: while movie.read_frame(&mut frame) {
         win.present_raw(&frame, movie.width, movie.height);
-        std::thread::sleep(delay);
-        match win.poll_input() {
-            sdl2::Input::None | sdl2::Input::Pointer { pressed: false, .. } => {}
-            _ => break,
+        n += 1;
+        let deadline = t0 + std::time::Duration::from_secs_f64(n as f64 / fps);
+        loop {
+            match win.poll_input() {
+                sdl2::Input::None | sdl2::Input::Pointer { pressed: false, .. } => {}
+                _ => break 'play,
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline { break; }
+            let rest = (deadline - now).as_millis() as u32;
+            // More than half a second behind means the decoder cannot keep up;
+            // re-anchor instead of fast-forwarding through the rest of the movie.
+            if rest > 500 { t0 = now - std::time::Duration::from_secs_f64(n as f64 / fps); break; }
+            win.delay(rest.clamp(1, 8));
         }
     }
+    if let (Some(m), Some(slot)) = (mixer, audio_slot) { m.stop(slot); }
     Some(())
 }
 

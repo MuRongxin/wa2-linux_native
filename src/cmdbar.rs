@@ -76,6 +76,13 @@ const BTNS: [Btn; 10] = [
 pub struct CmdBar {
     icons: Option<TgaImage>,
     labels: Option<TgaImage>,
+    /// Source cell sizes.  The command bar is a window-sized overlay, so its
+    /// sheets stay at the highest available art scale instead of being
+    /// reduced to the 40px/16px logical cache first.
+    icon_cell_w: u32,
+    icon_cell_h: u32,
+    label_w: u32,
+    label_h: u32,
     /// Skip column flipped left-to-right, three rows of 40×40.
     rewind: Option<TgaImage>,
     /// Hover caption. The label sheet has no 快退 row, so the vector font
@@ -84,13 +91,29 @@ pub struct CmdBar {
     /// the UI font in the option screen, so a one-shot bitmap would keep the
     /// old face until a restart. The u64 is the role generation it came from.
     rewind_label: std::cell::RefCell<(u64, Option<(u32, u32, Vec<u8>)>)>,
+    rewind_label_size: std::cell::Cell<u32>,
 }
 
+/// Load a command-bar sheet at the highest available source resolution.  The
+/// normal UI loader intentionally returns a logical-size image for pixel
+/// aligned menus; doing that here would make a 40px icon blurry when the
+/// already available 4x/8x sheet is stretched over a fullscreen frame.
 fn load_img(dirs: &[&Path], name: &str) -> Option<TgaImage> {
-    for dir in dirs {
+    let mut scaled: Vec<(&Path, u32)> = dirs
+        .iter()
+        .map(|dir| (*dir, crate::codec::image::dir_art_scale(dir)))
+        .filter(|(_, scale)| *scale > 1)
+        .collect();
+    scaled.sort_by(|a, b| b.1.cmp(&a.1));
+    for (dir, _) in scaled.into_iter().chain(dirs.iter().map(|dir| (*dir, 1))) {
         for cand in crate::codec::image::candidate_names(name) {
             let p = dir.join(cand);
-            if let Ok(img) = crate::codec::image::decode_ui_file(&p) {
+            let decoded = if crate::codec::image::dir_art_scale(dir) > 1 {
+                crate::codec::image::decode_file(&p)
+            } else {
+                crate::codec::image::decode_ui_file(&p)
+            };
+            if let Ok(img) = decoded {
                 return Some(img);
             }
         }
@@ -104,14 +127,28 @@ impl CmdBar {
         if icons.is_none() {
             eprintln!("cmdbar: sys_00010.tga not found");
         }
-        let rewind = icons.as_ref().map(|img| flip_column(img, 7));
+        let icon_cell_w = icons.as_ref().map(|img| (img.width / 9).max(1)).unwrap_or(CELL as u32);
+        let icon_cell_h = icons.as_ref().map(|img| (img.height / 3).max(1)).unwrap_or(CELL as u32);
+        let labels = load_img(dirs, "sys_00012.tga");
+        let label_scale = labels
+            .as_ref()
+            .map(|img| (img.width / LABEL_W as u32).max(1))
+            .unwrap_or(1);
+        let label_w = LABEL_W as u32 * label_scale;
+        let label_h = LABEL_H as u32 * label_scale;
+        let rewind = icons.as_ref().map(|img| flip_column(img, 7, icon_cell_w, icon_cell_h));
         CmdBar {
             icons,
-            labels: load_img(dirs, "sys_00012.tga"),
+            labels,
+            icon_cell_w,
+            icon_cell_h,
+            label_w,
+            label_h,
             rewind,
             // Rasterized on demand: a game can run for hours without the
             // player ever hovering 快退.
             rewind_label: std::cell::RefCell::new((0, None)),
+            rewind_label_size: std::cell::Cell::new(0),
         }
     }
 
@@ -164,9 +201,9 @@ impl CmdBar {
                     surf.blit_region_scaled(
                         rew,
                         0,
-                        row * CELL,
-                        CELL as u32,
-                        CELL as u32,
+                        row * self.icon_cell_h as i32,
+                        self.icon_cell_w,
+                        self.icon_cell_h,
                         cx(b.x),
                         cy(ROW_Y),
                         cw(CELL) as u32,
@@ -177,10 +214,10 @@ impl CmdBar {
             } else if let Some(col) = b.sheet {
                 surf.blit_region_scaled(
                     icons,
-                    col * CELL,
-                    row * CELL,
-                    CELL as u32,
-                    CELL as u32,
+                    col * self.icon_cell_w as i32,
+                    row * self.icon_cell_h as i32,
+                    self.icon_cell_w,
+                    self.icon_cell_h,
                     cx(b.x),
                     cy(ROW_Y),
                     cw(CELL) as u32,
@@ -193,16 +230,18 @@ impl CmdBar {
             if cmd == Cmd::Rewind {
                 let mut cache = self.rewind_label.borrow_mut();
                 let generation = crate::render::text::role_generation();
-                if cache.0 != generation {
+                let label_size = ((16 * wh.max(1) + 360) / 720).max(8) as u32;
+                if cache.0 != generation || self.rewind_label_size.get() != label_size {
                     cache.1 =
-                        crate::render::text::with_ui_font(16, |f| f.line_rgba("快退", 16)).flatten();
+                        crate::render::text::with_ui_font(label_size, |f| f.line_rgba("快退", label_size)).flatten();
                     cache.0 = generation;
+                    self.rewind_label_size.set(label_size);
                 }
                 if let Some((w, h, rgba)) = cache.1.as_ref() {
                     let b = BTNS.iter().find(|b| b.cmd == Cmd::Rewind).unwrap();
-                    let x = cx(b.x + CELL - *w as i32);
-                    let y = cy(ROW_Y - *h as i32 + 6);
-                    surf.blit_rgba_scaled(rgba, *w, *h, x, y, cw(*w as i32) as u32, ch(*h as i32) as u32);
+                    let x = cx(b.x + CELL) - *w as i32;
+                    let y = cy(ROW_Y - 16 + 6) - *h as i32 / 2;
+                    surf.blit_rgba_scaled(rgba, *w, *h, x, y, *w, *h);
                 }
             } else if let Some(labels) = self.labels.as_ref() {
                 if let Some(b) = BTNS.iter().find(|b| b.cmd == cmd) {
@@ -214,9 +253,9 @@ impl CmdBar {
                     surf.blit_region_scaled(
                         labels,
                         0,
-                        row * LABEL_H,
-                        LABEL_W as u32,
-                        LABEL_H as u32,
+                        row * self.label_h as i32,
+                        self.label_w,
+                        self.label_h,
                         cx(x),
                         cy(y),
                         cw(LABEL_W) as u32,
@@ -230,25 +269,25 @@ impl CmdBar {
 }
 
 /// Skip's column, mirrored, so the double arrow points backward.
-fn flip_column(icons: &TgaImage, col: i32) -> TgaImage {
-    let mut rgba = vec![0u8; (CELL * CELL * 3 * 4) as usize];
+fn flip_column(icons: &TgaImage, col: i32, cell_w: u32, cell_h: u32) -> TgaImage {
+    let mut rgba = vec![0u8; (cell_w * cell_h * 3 * 4) as usize];
     for row in 0..3 {
-        for y in 0..CELL {
-            for x in 0..CELL {
-                let sx = col * CELL + x;
-                let sy = row * CELL + y;
+        for y in 0..cell_h as i32 {
+            for x in 0..cell_w as i32 {
+                let sx = col * cell_w as i32 + x;
+                let sy = row * cell_h as i32 + y;
                 if sx < 0 || sy < 0 || sx >= icons.width as i32 || sy >= icons.height as i32 {
                     continue;
                 }
                 let si = ((sy as u32 * icons.width + sx as u32) * 4) as usize;
-                let di = (((row * CELL + y) * CELL + (CELL - 1 - x)) * 4) as usize;
+                let di = (((row * cell_h as i32 + y) * cell_w as i32 + (cell_w as i32 - 1 - x)) * 4) as usize;
                 if si + 3 < icons.rgba.len() && di + 3 < rgba.len() {
                     rgba[di..di + 4].copy_from_slice(&icons.rgba[si..si + 4]);
                 }
             }
         }
     }
-    TgaImage { width: CELL as u32, height: (CELL * 3) as u32, rgba }
+    TgaImage { width: cell_w, height: cell_h * 3, rgba }
 }
 
 fn blit_gold(surf: &mut Surface, rgba: &[u8], w: u32, h: u32, x: i32, y: i32) {
