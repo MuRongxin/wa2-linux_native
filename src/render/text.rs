@@ -51,7 +51,7 @@ pub const DEFAULT_EDGE_ALPHA: u8 = 160;
 /// Version of the font pack the shipped `fonts/` directory is cut from. The
 /// settings file records it so a replaced pack can tell the old ids apart from
 /// ones that no longer exist; bump it whenever the bundled font files change.
-pub const FONT_PACK_VERSION: i32 = 1;
+pub const FONT_PACK_VERSION: i32 = 2;
 
 /// Every character any font in this process had no glyph for, with how often
 /// it was asked for. Reported once on exit (design §1.3 wants the data to
@@ -1452,6 +1452,10 @@ struct BundledFont {
     file_name: String,
     family: String,
     style: String,
+    /// Localised name from the manifest's optional display column: the
+    /// settings list shows 得意黑 for Smiley Sans instead of the Latin
+    /// "Smiley Sans Oblique". Empty when the pack does not name one.
+    display: String,
     face: i64,
     /// Share of the script corpus the pack generator measured. Informational:
     /// the runtime only requires the probe characters.
@@ -1461,9 +1465,13 @@ struct BundledFont {
 }
 
 impl BundledFont {
-    /// Name in the settings list: the family, plus the style when it is not the
+    /// Name in the settings list: the pack's own localised display name when it
+    /// has one (得意黑), otherwise the family plus the style when it is not the
     /// plain one (the pack ships Medium and Regular of one family).
     fn display_name(&self) -> String {
+        if !self.display.is_empty() {
+            return self.display.clone();
+        }
         if self.style.is_empty() || self.style == "Regular" {
             self.family.clone()
         } else {
@@ -1563,6 +1571,8 @@ fn load_font_pack(dirs: &[String]) -> Option<(String, i32, Vec<BundledFont>)> {
                 continue;
             }
             let (rel, family, sha) = (f[0].trim(), f[1].trim(), f[5].trim());
+            // Optional seventh column: the localised name for the settings list.
+            let display = f.get(6).map(|d| d.trim().to_string()).unwrap_or_default();
             let Ok(face) = f[2].trim().parse::<i64>() else {
                 eprintln!("font: WARN manifest face is not a number: {}", line);
                 continue;
@@ -1575,15 +1585,17 @@ fn load_font_pack(dirs: &[String]) -> Option<(String, i32, Vec<BundledFont>)> {
             let path = std::path::Path::new(dir).join(rel).to_string_lossy().into_owned();
             match verify_bundled_font(&path, family, face, size, sha) {
                 Ok((family, style)) => {
+                    let shown = if display.is_empty() { family.clone() } else { display.clone() };
                     eprintln!(
-                        "font: bundled {} face {} '{}' coverage {:.1}%",
-                        rel, face, family, coverage
+                        "font: bundled {} face {} '{}'({}) coverage {:.1}%",
+                        rel, face, shown, family, coverage
                     );
                     entries.push(BundledFont {
                         path,
                         file_name: rel.to_string(),
                         family,
                         style,
+                        display,
                         face,
                         coverage,
                         verified: true,
@@ -1661,12 +1673,17 @@ fn verify_bundled_font(
 
 /// A fonts/ dir without a manifest still works, with only the file's presence
 /// checked: the pack is a local file next to the program, not a download. The
-/// two weights the design names (Medium, then Regular) are the ones enumerated.
+/// known file names are enumerated (Medium, Regular, then the Smiley Sans
+/// display face).
 fn enumerate_bundled_fonts(dirs: &[String]) -> Vec<BundledFont> {
     let mut out: Vec<BundledFont> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for dir in dirs {
-        for (file, face) in [("NotoSansCJK-Medium.ttc", SC_FACE), ("NotoSansCJK-Regular.ttc", SC_FACE)] {
+        for (file, face) in [
+            ("NotoSansCJK-Medium.ttc", SC_FACE),
+            ("NotoSansCJK-Regular.ttc", SC_FACE),
+            ("SmileySans-Oblique.ttf", 0),
+        ] {
             if !seen.insert(file.to_string()) {
                 continue;
             }
@@ -1680,6 +1697,7 @@ fn enumerate_bundled_fonts(dirs: &[String]) -> Vec<BundledFont> {
                 file_name: file.to_string(),
                 family: ft.family().unwrap_or_default(),
                 style: ft.style().unwrap_or_default(),
+                display: String::new(),
                 face,
                 coverage: 0.0,
                 verified: false,
@@ -3230,10 +3248,23 @@ mod tests {
         for e in &entries {
             assert!(e.verified, "{} listed as verified without the manifest", e.file_name);
             assert!(std::path::Path::new(&e.path).is_file(), "{} is not on disk", e.path);
-            assert_eq!(e.family, "Noto Sans CJK SC", "{}", e.path);
-            assert_eq!(e.face, super::SC_FACE, "{}", e.path);
-            assert!(e.coverage > 99.0, "{} coverage {}", e.path, e.coverage);
+            assert!(!e.family.is_empty(), "{} has no family", e.path);
+            if e.file_name.ends_with(".ttc") {
+                assert_eq!(e.family, "Noto Sans CJK SC", "{}", e.path);
+                assert_eq!(e.face, super::SC_FACE, "{}", e.path);
+                assert!(e.coverage > 99.0, "{} coverage {}", e.path, e.coverage);
+            } else {
+                // The third-party display face is a single-face .ttf.
+                assert_eq!(e.face, 0, "{}", e.path);
+                assert!(e.coverage > 60.0, "{} coverage {}", e.path, e.coverage);
+            }
         }
+        let smiley = entries
+            .iter()
+            .find(|e| e.file_name.starts_with("SmileySans"))
+            .expect("the bundled display face is missing from the pack");
+        assert_eq!(smiley.display, "得意黑", "manifest display column not used");
+        assert_eq!(smiley.display_name(), "得意黑", "the list should show the Chinese name");
         let cat = font_catalog();
         assert!(cat[0].bundled, "the default should be the bundled font");
         for e in &entries {

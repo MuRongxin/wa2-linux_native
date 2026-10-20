@@ -26,12 +26,25 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FONT_DIR = os.path.join(ROOT, "fonts")
 LICENSE_DIR = os.path.join(FONT_DIR, "LICENSES")
 MANIFEST = os.path.join(FONT_DIR, "manifest.tsv")
-PACK_VERSION = 1
+PACK_VERSION = 2
 
 # (file name, face index, expected family) -- the family FreeType reports.
+# The Noto weights come from the system package; the third entry is the
+# third-party display face 得意黑 (Smiley Sans Oblique, OFL-1.1), fetched from
+# https://github.com/atelier-anchor/smiley-sans/releases/tag/v2.0.1 and kept in
+# fonts/ verbatim. Keeping it unmodified is required by its Reserved Font Name.
 PACK = [
     ("NotoSansCJK-Medium.ttc", 2, "Noto Sans CJK SC"),
     ("NotoSansCJK-Regular.ttc", 2, "Noto Sans CJK SC"),
+    ("SmileySans-Oblique.ttf", 0, "Smiley Sans"),
+]
+
+# The licence files that have to sit next to the fonts. Noto's is copied from
+# the system package; the third-party one is fetched with its release and kept
+# in the pack, so the tool only reports whether it is there.
+LICENSES = [
+    "NotoSansCJK-OFL.txt",
+    "SmileySans-OFL.txt",
 ]
 
 SYSTEM_FONT_DIRS = [
@@ -128,8 +141,37 @@ def family_of(path, face):
     return names.get(16) or re.sub(r"\s+(Medium|Regular|Light|Bold)$", "", names.get(1, ""))
 
 
+def display_of(path, face):
+    """Chinese family name from the name table, for the settings list.
+
+    The list shows what the user calls the font, so prefer the zh-CN
+    localisation of the typographic family (name ID 16): 得意黑 for Smiley
+    Sans, empty for Noto (the runtime then falls back to family + style).
+    """
+    try:
+        from fontTools.ttLib import TTFont
+    except ImportError:
+        return ""
+    f = TTFont(path, fontNumber=face, lazy=True)
+    zh = en = ""
+    for nr in f["name"].names:
+        if nr.nameID != 16 or nr.platformID != 3:
+            continue
+        if nr.langID == 0x804:
+            zh = nr.toUnicode()
+        elif nr.langID == 0x409:
+            en = nr.toUnicode()
+    # Only a name that actually differs from the Latin family is worth writing:
+    # Noto's localised names match its English ones, and the list builds its
+    # "family + style" label from those.
+    return zh if zh and zh != en else ""
+
+
 def find_source(name, from_dir=None):
     dirs = [from_dir] if from_dir else []
+    # A file already shipped in fonts/ is the source too: the third-party face
+    # is downloaded once by hand instead of living in a system font package.
+    dirs += [FONT_DIR]
     dirs += SYSTEM_FONT_DIRS
     for d in dirs:
         if d and os.path.isfile(os.path.join(d, name)):
@@ -162,8 +204,12 @@ def cmd_build(from_dir):
         if fam != expected:
             print(f"warning: {name} face {face} family is {fam!r}, expected {expected!r}")
         cov = coverage(dst, face, corpus)
-        rows.append((name, fam, face, cov, os.path.getsize(dst), sha256_file(dst)))
-        print(f"copied {name} ({rows[-1][4]} bytes, family={fam}, coverage={cov if cov is None else round(cov, 1)}%)")
+        disp = display_of(dst, face)
+        rows.append((name, fam, face, cov, os.path.getsize(dst), sha256_file(dst), disp))
+        print(
+            f"copied {name} ({rows[-1][4]} bytes, family={fam}, "
+            f"display={disp or '-'}, coverage={cov if cov is None else round(cov, 1)}%)"
+        )
     lic = find_license()
     if lic:
         dst = os.path.join(LICENSE_DIR, "NotoSansCJK-OFL.txt")
@@ -171,12 +217,19 @@ def cmd_build(from_dir):
         print(f"copied licence {lic} -> {dst}")
     else:
         print("warning: no Noto CJK licence found; put it in fonts/LICENSES/ manually")
+    for name in LICENSES:
+        path = os.path.join(LICENSE_DIR, name)
+        if os.path.isfile(path):
+            print(f"licence ok {path}")
+        else:
+            print(f"warning: missing {path}; the packaged font must ship with its licence")
     with open(MANIFEST, "w", encoding="utf-8") as f:
         f.write(f"# wa2 font pack version {PACK_VERSION}\n")
-        f.write("# path\tfamily\tface\tcoverage\tsize\tsha256\n")
-        for name, fam, face, cov, size, digest in rows:
+        f.write("# SmileySans-Oblique.ttf: 得意黑 (Smiley Sans) OFL-1.1, Reserved Font Name, unmodified\n")
+        f.write("# path\tfamily\tface\tcoverage\tsize\tsha256\tdisplay\n")
+        for name, fam, face, cov, size, digest, disp in rows:
             cov_s = "n/a" if cov is None else f"{cov:.1f}"
-            f.write(f"{name}\t{fam}\t{face}\t{cov_s}\t{size}\t{digest}\n")
+            f.write(f"{name}\t{fam}\t{face}\t{cov_s}\t{size}\t{digest}\t{disp}\n")
     print(f"wrote {MANIFEST}")
     return 0
 
