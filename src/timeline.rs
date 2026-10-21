@@ -153,6 +153,7 @@ pub fn run(
     cn: bool,
     mixer: Option<&crate::audio::mixer::Mixer>,
     ui: Option<&crate::UiSound>,
+    current_scene: Option<&str>,
 ) -> Option<String> {
     let _ = font;
     let mut cover = Surface::new(W as u32, H as u32, BG);
@@ -183,7 +184,16 @@ pub fn run(
 
     // Verification hooks (same spirit as WA2_TITLE_AUTO): open the chart on a
     // given scene / zoom so a headless screenshot can pin one visual state.
-    let mut sel = chart.here.unwrap_or(0);
+    // Gameplay passes its active script here so opening the chart lands on the
+    // chapter the player is actually reading. The save marker remains the
+    // fallback for title/special-mode entry points.
+    let mut sel = current_scene
+        .and_then(|id| {
+            let entry = entry_of(id);
+            chart.nodes.iter().position(|node| node.id == entry)
+        })
+        .or(chart.here)
+        .unwrap_or(0);
     if let Some(want) = std::env::var_os("WA2_TIMELINE_SEL") {
         let want = want.to_string_lossy().into_owned();
         if let Some(i) = chart.nodes.iter().position(|node| node.id == want) {

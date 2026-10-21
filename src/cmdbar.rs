@@ -33,6 +33,8 @@ pub enum Cmd {
     /// uses the skip icon mirrored, so it reads as the opposite of 快进.
     Rewind,
     Hide,
+    /// Open the story timeline, centred on the scene currently being played.
+    Timeline,
 }
 
 impl Cmd {
@@ -60,7 +62,7 @@ struct Btn {
 
 /// Same order as the executable's position table. Rewind occupies the empty
 /// cell the original left between quick-load and config.
-const BTNS: [Btn; 10] = [
+const BTNS: [Btn; 11] = [
     Btn { cmd: Cmd::QuickSave, x: 808, sheet: Some(0), label_off: 0, label_on: 0 },
     Btn { cmd: Cmd::QuickLoad, x: 848, sheet: Some(1), label_off: 1, label_on: 1 },
     Btn { cmd: Cmd::Rewind, x: 888, sheet: None, label_off: 0, label_on: 0 },
@@ -71,6 +73,9 @@ const BTNS: [Btn; 10] = [
     Btn { cmd: Cmd::Auto, x: 1088, sheet: Some(6), label_off: 7, label_on: 6 },
     Btn { cmd: Cmd::Skip, x: 1128, sheet: Some(7), label_off: 9, label_on: 8 },
     Btn { cmd: Cmd::Hide, x: 1168, sheet: Some(8), label_off: 10, label_on: 10 },
+    // There is no original atlas cell for this command. It is drawn as a
+    // small custom graph icon in the last free cell of the 1280px bar.
+    Btn { cmd: Cmd::Timeline, x: 1208, sheet: None, label_off: 0, label_on: 0 },
 ];
 
 pub struct CmdBar {
@@ -92,6 +97,8 @@ pub struct CmdBar {
     /// old face until a restart. The u64 is the role generation it came from.
     rewind_label: std::cell::RefCell<(u64, Option<(u32, u32, Vec<u8>)>)>,
     rewind_label_size: std::cell::Cell<u32>,
+    timeline_label: std::cell::RefCell<(u64, Option<(u32, u32, Vec<u8>)>)>,
+    timeline_label_size: std::cell::Cell<u32>,
 }
 
 /// Load a command-bar sheet at the highest available source resolution.  The
@@ -149,6 +156,8 @@ impl CmdBar {
             // player ever hovering 快退.
             rewind_label: std::cell::RefCell::new((0, None)),
             rewind_label_size: std::cell::Cell::new(0),
+            timeline_label: std::cell::RefCell::new((0, None)),
+            timeline_label_size: std::cell::Cell::new(0),
         }
     }
 
@@ -177,9 +186,6 @@ impl CmdBar {
         ww: i32,
         wh: i32,
     ) {
-        let Some(icons) = self.icons.as_ref() else {
-            return;
-        };
         let cx = |v: i32| v * ww.max(1) / 1280;
         let cy = |v: i32| v * wh.max(1) / 720;
         let cw = |v: i32| (v * ww.max(1) / 1280).max(1);
@@ -211,7 +217,9 @@ impl CmdBar {
                         alpha,
                     );
                 }
-            } else if let Some(col) = b.sheet {
+            } else if b.cmd == Cmd::Timeline {
+                draw_timeline_icon(surf, cx(b.x), cy(ROW_Y), cw(CELL), ch(CELL), alpha, row);
+            } else if let (Some(icons), Some(col)) = (self.icons.as_ref(), b.sheet) {
                 surf.blit_region_scaled(
                     icons,
                     col * self.icon_cell_w as i32,
@@ -232,13 +240,30 @@ impl CmdBar {
                 let generation = crate::render::text::role_generation();
                 let label_size = ((16 * wh.max(1) + 360) / 720).max(8) as u32;
                 if cache.0 != generation || self.rewind_label_size.get() != label_size {
-                    cache.1 =
-                        crate::render::text::with_ui_font(label_size, |f| f.line_rgba("快退", label_size)).flatten();
+                    cache.1 = crate::render::text::with_ui_font(label_size, |f| f.line_rgba("快退", label_size)).flatten();
                     cache.0 = generation;
                     self.rewind_label_size.set(label_size);
                 }
                 if let Some((w, h, rgba)) = cache.1.as_ref() {
                     let b = BTNS.iter().find(|b| b.cmd == Cmd::Rewind).unwrap();
+                    let x = cx(b.x + CELL) - *w as i32;
+                    let y = cy(ROW_Y - 16 + 6) - *h as i32 / 2;
+                    surf.blit_rgba_scaled(rgba, *w, *h, x, y, *w, *h);
+                }
+            } else if cmd == Cmd::Timeline {
+                // Keep a separate cache for the timeline caption so a
+                // font-role change cannot leave one command with stale
+                // dimensions from the other.
+                let mut cache = self.timeline_label.borrow_mut();
+                let generation = crate::render::text::role_generation();
+                let label_size = ((16 * wh.max(1) + 360) / 720).max(8) as u32;
+                if cache.0 != generation || self.timeline_label_size.get() != label_size {
+                    cache.1 = crate::render::text::with_ui_font(label_size, |f| f.line_rgba("时间线", label_size)).flatten();
+                    cache.0 = generation;
+                    self.timeline_label_size.set(label_size);
+                }
+                if let Some((w, h, rgba)) = cache.1.as_ref() {
+                    let b = BTNS.iter().find(|b| b.cmd == cmd).unwrap();
                     let x = cx(b.x + CELL) - *w as i32;
                     let y = cy(ROW_Y - 16 + 6) - *h as i32 / 2;
                     surf.blit_rgba_scaled(rgba, *w, *h, x, y, *w, *h);
@@ -266,6 +291,34 @@ impl CmdBar {
             }
         }
     }
+}
+
+/// Draw the timeline glyph in the one remaining 40px command-bar cell. The
+/// original game has no corresponding atlas entry, so a compact three-node
+/// graph makes the action legible at both 720p and fullscreen scales.
+fn draw_timeline_icon(surf: &mut Surface, x: i32, y: i32, w: i32, h: i32, alpha: u8, row: i32) {
+    let sx = w.max(1) as f32 / CELL as f32;
+    let sy = h.max(1) as f32 / CELL as f32;
+    let px = |v: i32| x + (v as f32 * sx).round() as i32;
+    let py = |v: i32| y + (v as f32 * sy).round() as i32;
+    let c = if row == 2 { [255, 255, 255, alpha] } else if row == 1 { [255, 214, 90, alpha] } else { [90, 220, 232, alpha] };
+    let node = |surf: &mut Surface, nx: i32, ny: i32| {
+        for yy in -2..=2 {
+            for xx in -2..=2 {
+                if xx * xx + yy * yy <= 6 {
+                    surf.blend_pixel(px(nx + xx), py(ny + yy), c);
+                }
+            }
+        }
+    };
+    for i in 0..16 {
+        let t = i as f32 / 15.0;
+        surf.blend_pixel(px(10 + (18.0 * t) as i32), py(20 - (8.0 * t) as i32), c);
+        surf.blend_pixel(px(28 + (0.0 * t) as i32), py(12 + (8.0 * t) as i32), c);
+    }
+    node(surf, 10, 20);
+    node(surf, 28, 12);
+    node(surf, 28, 28);
 }
 
 /// Skip's column, mirrored, so the double arrow points backward.
@@ -335,7 +388,7 @@ mod integration {
         assert_eq!(bar.hit(927, 700), Some(Cmd::Rewind));
         assert_eq!(bar.hit(928, 680), Some(Cmd::Config));
         assert_eq!(bar.hit(1168, 700), Some(Cmd::Hide));
-        assert_eq!(bar.hit(1208, 700), None);
+        assert_eq!(bar.hit(1208, 700), Some(Cmd::Timeline));
         assert_eq!(bar.hit(1000, 679), None);
 
         let mut surf = Surface::new(1280, 720, [8, 12, 24, 255]);

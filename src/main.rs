@@ -2784,12 +2784,39 @@ fn run_game_at(
                             win.present(&frame);
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
+                                sdl2::Input::RightClick => {
+                                    user_hide = !user_hide;
+                                    window = dialog_open(user_hide, script_open, cmd_skip);
+                                    base = draw_scene(
+                                        &bg,
+                                        &last_text,
+                                        last_speaker.as_deref(),
+                                        font,
+                                        &slots,
+                                        focus,
+                                        win_size.0 as u32,
+                                        win_size.1 as u32,
+                                        tint.as_deref(),
+                                        window,
+                                        msg_plate.as_ref(),
+                                        msg_frame.as_ref(),
+                                        &plates,
+                                        scene_look(&settings, bg_cg),
+                                        vfont.as_mut(),
+                                    );
+                                    cur_surf = clone_surf(&base);
+                                }
                                 sdl2::Input::Choice(n) if (n as usize) <= opts.len() => {
                                     play_ui_se(mixer.as_ref(), ui_se.as_deref());
                                     break n as u32
                                 }
                                 sdl2::Input::Pointer { x, y, pressed } => {
                                     let (sx, sy) = win.surface_pos(x, y, W, H);
+                                    if cmd_skip && pressed {
+                                        cmd_skip = false;
+                                        window = dialog_open(user_hide, script_open, false);
+                                        continue;
+                                    }
                                     // Command bar takes priority over the choices.
                                     if let Some(cmd) = bar.hit(sx, sy) {
                                         // The cursor left the rows for the command bar.
@@ -2872,6 +2899,18 @@ fn run_game_at(
                                                         &backlog,
                                                     ) {
                                                         CmdOutcome::Loaded(st) => return Ok(Some(st)),
+                                                        CmdOutcome::Jump(id) => {
+                                                            if let Some(mx) = mixer.as_ref() {
+                                                                stop_voice(mx, &mut voice_stream);
+                                                            }
+                                                            current_id = id;
+                                                            slots = Default::default();
+                                                            plates.clear();
+                                                            line_base = None;
+                                                            line_done = true;
+                                                            focus = None;
+                                                            break 'events;
+                                                        }
                                                         CmdOutcome::Quit => return Ok(None),
                                                         CmdOutcome::Stay => {
                                                             // F-17: the line under
@@ -3205,54 +3244,50 @@ fn run_game_at(
                                     );
                                 }
                                 sdl2::Input::RightClick => {
-                                    match settings.r_click {
-                                        1 => {
-                                            let dirs = s.bg_dirs();
-                                            let mut st = menu::Settings::load();
-                                            let ui = UiSound::resolve(&dirs);
-                                            menu::run(win, &dirs, &mut st, mixer.as_ref(), Some(&ui));
-                                            settings = menu::Settings::load();
-                                            menu::apply(&settings, mixer.as_ref());
-                                            // The font may have changed too, and
-                                            // it must not wait for a trip back
-                                            // to the title screen.
-                                            refresh_dialog_font(s.cn, vfont.as_mut());
-                                            // 「画面模式」 must take effect without a
-                                            // trip back to the title screen.
-                                            win.set_fullscreen(settings.win_disp == 1);
-                                            set_render_art_scale(win);
-                                            // F-17: repaint the current line with
-                                            // the font/style that is now in force.
-                                            line_redraw = true;
-                                        }
-                                        2 => {
-                                            let st = make_save(
-                                                &it,
-                                                &current_id,
-                                                bg_id,
-                                                tint_name.clone(),
-                                                &slots,
-                                                focus,
-                                                &last_text,
-                                                bgm_track.map(|(id, _)| id),
-                                            );
-                                            let dirs = s.bg_dirs();
-                                            let ui = UiSound::resolve(&dirs);
-                                            saveload::run(
-                                                win,
-                                                &dirs,
-                                                saveload::Mode::Save,
-                                                Some(st),
-                                                Some(&cur_surf),
-                                                mixer.as_ref(),
-                                                Some(&ui),
-                                            );
-                                        }
-                                        _ => {}
-                                    }
+                                    // Right-click is the direct hide-dialog
+                                    // gesture in gameplay. The old configurable
+                                    // menu/save actions made the same gesture
+                                    // unpredictable and differed from the
+                                    // command-bar Hide button.
+                                    user_hide = !user_hide;
+                                    window = dialog_open(user_hide, script_open, cmd_skip);
+                                    line_base = None;
+                                    line_done = true;
+                                    cur_surf = draw_scene(
+                                        &bg,
+                                        &last_text,
+                                        last_speaker.as_deref(),
+                                        font,
+                                        &slots,
+                                        focus,
+                                        win_size.0 as u32,
+                                        win_size.1 as u32,
+                                        tint.as_deref(),
+                                        window,
+                                        msg_plate.as_ref(),
+                                        msg_frame.as_ref(),
+                                        &plates,
+                                        scene_look(&settings, bg_cg),
+                                        vfont.as_mut(),
+                                    );
                                 }
                                 sdl2::Input::Pointer { x, y, pressed } => {
                                     let (sx, sy) = win.surface_pos(x, y, W, H);
+                                    // In fast-forward mode every left click is
+                                    // an exit gesture, regardless of where it
+                                    // lands. Do this before command-bar hit
+                                    // testing so the player cannot need a
+                                    // second click to leave skip.
+                                    if cmd_skip && pressed {
+                                        cmd_skip = false;
+                                        window = dialog_open(user_hide, script_open, false);
+                                        if let Some(mx) = mixer.as_ref() {
+                                            if let (Some(cue), Some(vi)) = (skipped_voice.take(), voices.as_ref()) {
+                                                play_voice(mx, vi, &settings, &mut voice_stream, cue, &current_id);
+                                            }
+                                        }
+                                        continue 'wait;
+                                    }
                                     match bar.hit(sx, sy) {
                                         Some(cmd) if pressed => match cmd {
                                             cmdbar::Cmd::Auto => {
@@ -3332,6 +3367,18 @@ fn run_game_at(
                                                     &backlog,
                                                 ) {
                                                     CmdOutcome::Loaded(st) => return Ok(Some(st)),
+                                                    CmdOutcome::Jump(id) => {
+                                                        if let Some(mx) = mixer.as_ref() {
+                                                            stop_voice(mx, &mut voice_stream);
+                                                        }
+                                                        current_id = id;
+                                                        slots = Default::default();
+                                                        plates.clear();
+                                                        line_base = None;
+                                                        line_done = true;
+                                                        focus = None;
+                                                        break 'events;
+                                                    }
                                                     CmdOutcome::Quit => return Ok(None),
                                                     CmdOutcome::Stay => {
                                                         // F-17: the option screen
@@ -3763,6 +3810,8 @@ enum CmdOutcome {
     Stay,
     /// A save slot was loaded: restart the run with it.
     Loaded(save::SaveState),
+    /// The timeline selected a scene to play from its entry point.
+    Jump(String),
     /// Player chose to quit.
     Quit,
 }
@@ -4078,6 +4127,25 @@ fn handle_cmd(
             };
             show_backlog(win, font, hf, backlog, frame, &s.bg_dirs());
             CmdOutcome::Stay
+        }
+        cmdbar::Cmd::Timeline => {
+            let dirs = s.bg_dirs();
+            let ui = UiSound::resolve(&dirs);
+            if let Some(id) = crate::timeline::run(
+                win,
+                font,
+                &dirs,
+                s.script_dir.as_path(),
+                s.cn,
+                mixer,
+                Some(&ui),
+                Some(current_id),
+            ) {
+                eprintln!("timeline: selected {} from scene {}", id, current_id);
+                CmdOutcome::Jump(id)
+            } else {
+                CmdOutcome::Stay
+            }
         }
         // toggles are handled by the caller
         _ => CmdOutcome::Stay,
@@ -7358,6 +7426,7 @@ fn run_title(
                                 cn,
                                 mixer,
                                 Some(&ui),
+                                None,
                             ) {
                                 picked = TitleAction::Jump(id);
                                 break;
