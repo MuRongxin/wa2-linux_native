@@ -7486,7 +7486,8 @@ fn run_title(
         // The original selection bar remains for keyboard navigation. Mouse
         // hover keeps the label highlight but omits the heavy background bar,
         // which avoids a laggy full-screen hover plate over the animated snow.
-        if !pointer_hover {
+        let hide_hover_bar = pointer_hover && (win.is_fullscreen() || win.is_maximized());
+        if !hide_hover_bar {
             paint_bar(&mut frame, fitted, if flashing { 1 } else { 0 }, bar_y, X0);
         }
         draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
