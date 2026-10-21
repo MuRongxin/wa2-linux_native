@@ -68,9 +68,21 @@ struct Assets {
 }
 
 fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
-    for dir in dirs {
+    let mut scaled: Vec<(&Path, u32)> = dirs
+        .iter()
+        .map(|dir| (*dir, crate::codec::image::dir_art_scale(dir)))
+        .filter(|(_, scale)| *scale > 1)
+        .collect();
+    scaled.sort_by(|a, b| b.1.cmp(&a.1));
+    for (dir, _) in scaled.into_iter().chain(dirs.iter().map(|dir| (*dir, 1))) {
         for cand in crate::codec::image::candidate_names(name) {
-            if let Ok(img) = crate::codec::image::decode_ui_file(&dir.join(cand)) {
+            let path = dir.join(cand);
+            let decoded = if crate::codec::image::dir_art_scale(dir) > 1 {
+                crate::codec::image::decode_file(&path)
+            } else {
+                crate::codec::image::decode_ui_file(&path)
+            };
+            if let Ok(img) = decoded {
                 return Some(img);
             }
         }
@@ -311,27 +323,33 @@ fn compose(
     caps: Option<&(u32, u32, Vec<u8>)>,
     hint: Option<&(u32, u32, Vec<u8>)>,
 ) {
-    s.fill_rect(0, 0, W, H, [0, 0, 0, 190]);
+    let sx = s.width as f32 / W as f32;
+    let sy = s.height as f32 / H as f32;
+    let px = |v: i32| (v as f32 * sx).round() as i32;
+    let py = |v: i32| (v as f32 * sy).round() as i32;
+    let pw = |v: i32| (v as f32 * sx).round().max(1.0) as u32;
+    let ph = |v: i32| (v as f32 * sy).round().max(1.0) as u32;
+    s.fill_rect(0, 0, s.width, s.height, [0, 0, 0, 190]);
     if let Some(h) = a.header.as_ref() {
-        s.blit(h, 0, 0);
+        s.blit_region_scaled(h, 0, 0, h.width, h.height, 0, 0, s.width, ph(36), 255);
     }
     for i in 0..slots.len() {
         let (cx, cy) = cell_pos(i);
         if let Some(sh) = a.shadow.as_ref() {
-            s.blit(sh, cx, cy);
+            s.blit_region_scaled(sh, 0, 0, sh.width, sh.height, px(cx), py(cy), pw(CELL_W), ph(CELL_H), 255);
         }
         // Every slot keeps its panel even when empty: `sys_05903` is fully
         // transparent, so an empty cell would otherwise be invisible and there
         // would be nothing to aim at.
         let panel = if scr.cursor == i { a.panel_hi.as_ref() } else { a.panel.as_ref() };
         if let Some(p) = panel {
-            s.blit(p, cx, cy);
+            s.blit_region_scaled(p, 0, 0, p.width, p.height, px(cx), py(cy), pw(CELL_W), ph(CELL_H), 255);
         }
         // Thumbnail, letterboxed inside the frame.
         if let Some(t) = thumbs.get(i).and_then(|t| t.as_ref()) {
-            let x = cx + FRAME_X + (FRAME_W - t.width as i32) / 2;
-            let y = cy + FRAME_Y + (FRAME_H - t.height as i32) / 2;
-            s.blit(t, x, y);
+            let tx = cx + FRAME_X + (FRAME_W - t.width as i32) / 2;
+            let ty = cy + FRAME_Y + (FRAME_H - t.height as i32) / 2;
+            s.blit_region_scaled(t, 0, 0, t.width, t.height, px(tx), py(ty), pw(t.width as i32), ph(t.height as i32), 255);
         }
         // Caption over the bottom of the thumbnail.
         if let Some((cw, _, rgba)) = caps {
@@ -341,21 +359,21 @@ fn compose(
                 let off = (row * *cw * 4) as usize;
                 strip.extend_from_slice(&rgba[off..off + (*cw as usize) * 4]);
             }
-            s.fill_rect(cx + FRAME_X, cy + FRAME_Y + FRAME_H - CAP_H, FRAME_W as u32, CAP_H as u32, [0, 0, 0, 170]);
-            s.blit_rgba(&strip, *cw, CAP_H as u32, cx + FRAME_X, cy + FRAME_Y + FRAME_H - CAP_H);
+            s.fill_rect(px(cx + FRAME_X), py(cy + FRAME_Y + FRAME_H - CAP_H), pw(FRAME_W), ph(CAP_H), [0, 0, 0, 170]);
+            s.blit_rgba_scaled(&strip, *cw, CAP_H as u32, px(cx + FRAME_X), py(cy + FRAME_Y + FRAME_H - CAP_H), pw(FRAME_W), ph(CAP_H));
         }
         if scr.cursor == i {
             if let Some(f) = a.frame.as_ref() {
-                s.blit(f, cx, cy);
+                s.blit_region_scaled(f, 0, 0, f.width, f.height, px(cx), py(cy), pw(CELL_W), ph(CELL_H), 255);
             }
         }
     }
     if let Some((hw, _, rgba)) = hint {
-        let x = (W as i32 - HINT_W) / 2;
-        s.fill_rect(x - 10, HINT_Y - 2, (HINT_W + 20) as u32, (CAP_H + 4) as u32, [0, 0, 0, 170]);
-        s.blit_rgba(rgba, *hw, CAP_H as u32, x, HINT_Y);
+        let x0 = (W as i32 - HINT_W) / 2;
+        s.fill_rect(px(x0 - 10), py(HINT_Y - 2), pw(HINT_W + 20), ph(CAP_H + 4), [0, 0, 0, 170]);
+        s.blit_rgba_scaled(rgba, *hw, CAP_H as u32, px(x0), py(HINT_Y), pw(HINT_W), ph(CAP_H));
     }
     if let Some(f) = a.footer.as_ref() {
-        s.blit(f, FOOTER_X, FOOTER_Y);
+        s.blit_region_scaled(f, 0, 0, f.width, f.height, px(FOOTER_X), py(FOOTER_Y), pw(288), ph(40), 255);
     }
 }
