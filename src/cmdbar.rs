@@ -33,6 +33,8 @@ pub enum Cmd {
     /// uses the skip icon mirrored, so it reads as the opposite of 快进.
     Rewind,
     Hide,
+    /// Return to the title screen.
+    Home,
     /// Open the story timeline, centred on the scene currently being played.
     Timeline,
 }
@@ -62,7 +64,8 @@ struct Btn {
 
 /// Same order as the executable's position table. Rewind occupies the empty
 /// cell the original left between quick-load and config.
-const BTNS: [Btn; 11] = [
+const BTNS: [Btn; 12] = [
+    Btn { cmd: Cmd::Home, x: 728, sheet: None, label_off: 0, label_on: 0 },
     // Timeline is deliberately the first visible command so it is easy to
     // discover during play.
     Btn { cmd: Cmd::Timeline, x: 768, sheet: None, label_off: 0, label_on: 0 },
@@ -99,6 +102,8 @@ pub struct CmdBar {
     rewind_label_size: std::cell::Cell<u32>,
     timeline_label: std::cell::RefCell<(u64, Option<(u32, u32, Vec<u8>)>)>,
     timeline_label_size: std::cell::Cell<u32>,
+    home_label: std::cell::RefCell<(u64, Option<(u32, u32, Vec<u8>)>)>,
+    home_label_size: std::cell::Cell<u32>,
 }
 
 /// Load a command-bar sheet at the highest available source resolution.  The
@@ -158,6 +163,8 @@ impl CmdBar {
             rewind_label_size: std::cell::Cell::new(0),
             timeline_label: std::cell::RefCell::new((0, None)),
             timeline_label_size: std::cell::Cell::new(0),
+            home_label: std::cell::RefCell::new((0, None)),
+            home_label_size: std::cell::Cell::new(0),
         }
     }
 
@@ -203,14 +210,16 @@ impl CmdBar {
             // them. Hover and the toggled-on state come up to full strength.
             let alpha = if on || hover == Some(b.cmd) {
                 255
-            } else if b.cmd == Cmd::Timeline {
+            } else if b.cmd == Cmd::Timeline || b.cmd == Cmd::Home {
                 // The custom graph has no textured atlas background to carry
                 // it, so keep it readable over bright scenes even at idle.
                 idle_alpha.max(180)
             } else {
                 idle_alpha
             };
-            if b.cmd == Cmd::Rewind {
+            if b.cmd == Cmd::Home {
+                draw_home_icon(surf, cx(b.x), cy(ROW_Y), cw(CELL), ch(CELL), alpha, row);
+            } else if b.cmd == Cmd::Rewind {
                 if let Some(rew) = self.rewind.as_ref() {
                     surf.blit_region_scaled(
                         rew,
@@ -258,17 +267,22 @@ impl CmdBar {
                     let y = cy(ROW_Y - 16 + 6) - *h as i32 / 2;
                     surf.blit_rgba_scaled(rgba, *w, *h, x, y, *w, *h);
                 }
-            } else if cmd == Cmd::Timeline {
+            } else if cmd == Cmd::Timeline || cmd == Cmd::Home {
                 // Keep a separate cache for the timeline caption so a
                 // font-role change cannot leave one command with stale
                 // dimensions from the other.
-                let mut cache = self.timeline_label.borrow_mut();
+                let (cache, size_cell, text) = if cmd == Cmd::Home {
+                    (&self.home_label, &self.home_label_size, "首页")
+                } else {
+                    (&self.timeline_label, &self.timeline_label_size, "时间线")
+                };
+                let mut cache = cache.borrow_mut();
                 let generation = crate::render::text::role_generation();
                 let label_size = ((16 * wh.max(1) + 360) / 720).max(8) as u32;
-                if cache.0 != generation || self.timeline_label_size.get() != label_size {
-                    cache.1 = crate::render::text::with_ui_font(label_size, |f| f.line_rgba("时间线", label_size)).flatten();
+                if cache.0 != generation || size_cell.get() != label_size {
+                    cache.1 = crate::render::text::with_ui_font(label_size, |f| f.line_rgba(text, label_size)).flatten();
                     cache.0 = generation;
-                    self.timeline_label_size.set(label_size);
+                    size_cell.set(label_size);
                 }
                 if let Some((w, h, rgba)) = cache.1.as_ref() {
                     let b = BTNS.iter().find(|b| b.cmd == cmd).unwrap();
@@ -296,6 +310,33 @@ impl CmdBar {
                         255,
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Draw the home glyph in the first custom command-bar cell.
+fn draw_home_icon(surf: &mut Surface, x: i32, y: i32, w: i32, h: i32, alpha: u8, row: i32) {
+    let sx = w.max(1) as f32 / CELL as f32;
+    let sy = h.max(1) as f32 / CELL as f32;
+    let px = |v: i32| x + (v as f32 * sx).round() as i32;
+    let py = |v: i32| y + (v as f32 * sy).round() as i32;
+    let c = if row == 2 { [255, 255, 255, alpha] } else if row == 1 { [255, 214, 90, alpha] } else { [90, 220, 232, alpha] };
+    for i in 0..=20 {
+        let t = i as f32 / 20.0;
+        let lx = px(8 + (12.0 * t) as i32);
+        let ly = py(17 - (10.0 * t) as i32);
+        let rx = px(20 + (12.0 * t) as i32);
+        let ry = py(7 + (10.0 * t) as i32);
+        for off in -1..=1 {
+            surf.blend_pixel(lx + off, ly, c);
+            surf.blend_pixel(rx + off, ry, c);
+        }
+    }
+    for yy in 17..31 {
+        for xx in 8..33 {
+            if yy == 17 || xx == 8 || xx == 32 || yy == 30 || (xx == 19 && yy >= 23) || (xx == 20 && yy >= 23) {
+                surf.blend_pixel(px(xx), py(yy), c);
             }
         }
     }
@@ -401,6 +442,7 @@ mod integration {
         assert_eq!(bar.hit(927, 700), Some(Cmd::Rewind));
         assert_eq!(bar.hit(928, 680), Some(Cmd::Config));
         assert_eq!(bar.hit(1168, 700), Some(Cmd::Hide));
+        assert_eq!(bar.hit(728, 700), Some(Cmd::Home));
         assert_eq!(bar.hit(768, 700), Some(Cmd::Timeline));
         assert_eq!(bar.hit(1208, 700), None);
         assert_eq!(bar.hit(1000, 679), None);

@@ -582,14 +582,15 @@ fn main() {
                 require_chinese_font();
             }
             let mut rt = Runtime::new(&win, &session);
-            match run_title(
-                &mut win,
-                &font,
-                &session.bg_dirs(),
-                &session.script_dir,
-                !session.bg_cn_trees.is_empty(),
-                rt.mixer.as_ref(),
-            ) {
+            'home: loop {
+                match run_title(
+                    &mut win,
+                    &font,
+                    &session.bg_dirs(),
+                    &session.script_dir,
+                    !session.bg_cn_trees.is_empty(),
+                    rt.mixer.as_ref(),
+                ) {
                 TitleAction::Start => {
                     eprintln!("title: starting scene {}", start_id);
                     if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
@@ -608,7 +609,11 @@ fn main() {
                         eprintln!("run error: {}", e);
                     }
                 }
-                TitleAction::Quit => eprintln!("title: quit"),
+                    TitleAction::Quit => {
+                        eprintln!("title: quit");
+                        break 'home;
+                    }
+                }
             }
             // Aggregate of characters no font could draw, if any: one line for
             // the whole session instead of the per-character warning. Only the
@@ -2911,6 +2916,7 @@ fn run_game_at(
                                                             focus = None;
                                                             break 'events;
                                                         }
+                                                        CmdOutcome::Home => return Ok(None),
                                                         CmdOutcome::Quit => return Ok(None),
                                                         CmdOutcome::Stay => {
                                                             // F-17: the line under
@@ -3379,6 +3385,7 @@ fn run_game_at(
                                                         focus = None;
                                                         break 'events;
                                                     }
+                                                    CmdOutcome::Home => return Ok(None),
                                                     CmdOutcome::Quit => return Ok(None),
                                                     CmdOutcome::Stay => {
                                                         // F-17: the option screen
@@ -3812,6 +3819,8 @@ enum CmdOutcome {
     Loaded(save::SaveState),
     /// The timeline selected a scene to play from its entry point.
     Jump(String),
+    /// Return from gameplay to the title screen.
+    Home,
     /// Player chose to quit.
     Quit,
 }
@@ -4147,6 +4156,7 @@ fn handle_cmd(
                 CmdOutcome::Stay
             }
         }
+        cmdbar::Cmd::Home => CmdOutcome::Home,
         // toggles are handled by the caller
         _ => CmdOutcome::Stay,
     }
