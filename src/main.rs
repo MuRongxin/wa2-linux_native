@@ -1106,7 +1106,8 @@ fn h_scene_voice_allowed(settings: &menu::Settings, scene: &str, char_id: u32) -
     }
 }
 
-/// Start one line's voice. `page_voice` stops whatever was still playing.
+/// Start one line's voice. A new playable clip always replaces the previous
+/// clip; the page-voice setting only controls pages that have no new clip.
 fn play_voice(
     mx: &audio::Mixer,
     voices: &VoiceIndex,
@@ -1115,9 +1116,6 @@ fn play_voice(
     cue: vm::lscr::VoiceCue,
     scene: &str,
 ) {
-    if settings.page_voice == 1 {
-        stop_voice(mx, voice_stream);
-    }
     let muted = menu::char_row_of(cue.char_id)
         .map(|row| settings.char_voice[row] == 0)
         .unwrap_or(false);
@@ -1128,17 +1126,21 @@ fn play_voice(
         eprintln!("  voice: H-scene rule filtered {}_{:04}_{:02}", cue.scenario, cue.line, cue.char_id);
         return;
     }
-    if let Some(vf) = voices.find(cue) {
-        eprintln!("  voice: {}", vf.display());
-        let slot = mx.play_cat(&vf.to_string_lossy(), 1.0, false, crate::audio::mixer::CAT_VOICE);
-        if slot != usize::MAX {
-            *voice_stream = Some(slot);
-        }
-    } else {
+    let Some(vf) = voices.find(cue) else {
         eprintln!(
             "  voice: MISSING {}_{:04}_{:02}.OGG",
             cue.scenario, cue.line, cue.char_id
         );
+        return;
+    };
+    // Stop only after all filters and the file lookup succeed. A muted,
+    // filtered, or missing new cue is not a replacement, so an older clip is
+    // allowed to finish when the setting says not to interrupt empty pages.
+    stop_voice(mx, voice_stream);
+    eprintln!("  voice: {}", vf.display());
+    let slot = mx.play_cat(&vf.to_string_lossy(), 1.0, false, crate::audio::mixer::CAT_VOICE);
+    if slot != usize::MAX {
+        *voice_stream = Some(slot);
     }
 }
 
