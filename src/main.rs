@@ -636,6 +636,7 @@ fn main() {
             let max_ev: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(400);
             let mut seq_i = 0usize;
             let mut scenes = 0;
+            let mut global = vm::global::GlobalState::load(dir);
             loop {
                 scenes += 1;
                 if scenes > 40 {
@@ -656,7 +657,7 @@ fn main() {
                     prog.tokens.len(),
                     prog.entry
                 );
-                let mut it = vm::lscr::Interp::new(&prog);
+                let mut it = vm::lscr::Interp::new(&prog, &mut global);
                 let mut n = 0usize;
                 let mut jumped = false;
                 while n < max_ev {
@@ -1640,6 +1641,8 @@ pub struct Runtime {
     voices: Option<VoiceIndex>,
     mixer: Option<audio::Mixer>,
     bank: Option<SpriteBank>,
+    /// Story-wide variables shared by every scene in this play session.
+    pub(crate) global: vm::global::GlobalState,
 }
 
 impl Runtime {
@@ -1704,7 +1707,8 @@ impl Runtime {
         if bank.is_none() {
             eprintln!("note: no sprite directory - character sprites disabled");
         }
-        Runtime { vfont, game_font_id, bar, msg_plate, msg_frame, voices, mixer, bank }
+        let global = vm::global::GlobalState::load(&s.script_dir);
+        Runtime { vfont, game_font_id, bar, msg_plate, msg_frame, voices, mixer, bank, global }
     }
 }
 
@@ -1719,13 +1723,20 @@ pub fn run_game(
     start_id: &str,
     rt: &mut Runtime,
 ) -> Result<(), String> {
+    // Starting a new game means starting a new global story state.  This is
+    // done once outside the reload loop so loading a slot from the command bar
+    // does not accidentally reset the flags again.
+    rt.global.reset();
     // Loop so that loading a save slot from the command bar restarts the run
     // at the loaded position instead of ending the game.
     let mut resume: Option<save::SaveState> = None;
     loop {
         match run_game_at(win, font, s, resume, start_id, rt)? {
             None => return Ok(()),
-            Some(snap) => resume = Some(snap),
+            Some(snap) => {
+                rt.global.restore_values(&snap.globals);
+                resume = Some(snap);
+            }
         }
     }
 }
@@ -1738,12 +1749,16 @@ pub fn run_game_from(
     snap: save::SaveState,
     rt: &mut Runtime,
 ) -> Result<(), String> {
+    rt.global.restore_values(&snap.globals);
     let mut resume = Some(snap);
     let scene = resume.as_ref().unwrap().scene.clone();
     loop {
         match run_game_at(win, font, s, resume, &scene, rt)? {
             None => return Ok(()),
-            Some(st) => resume = Some(st),
+            Some(st) => {
+                rt.global.restore_values(&st.globals);
+                resume = Some(st);
+            }
         }
     }
 }
@@ -2025,7 +2040,7 @@ fn run_game_at(
             prog.tokens.len(),
             prog.entry
         );
-        let mut it = vm::lscr::Interp::new(&prog);
+        let mut it = vm::lscr::Interp::new(&prog, &mut rt.global);
         // Decode what this scene will ask for while the player reads the
         // first lines, so the script never waits on a 59 MP WebP.
         {
@@ -3887,7 +3902,7 @@ fn make_save(
         text: text.to_string(),
         bgm,
         time: save::now(),
-        flags: Vec::new(),
+        globals: it.global_snapshot(),
     }
 }
 

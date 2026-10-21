@@ -19,11 +19,13 @@
 //!                      option 1, jump to its B target (skip option 2's content)
 //!   `0, 1`             return / script end
 //!   `0, 13`            block end (no-op for playback)
-//!   `1, sub` / `2, sub`  variable / runtime references (no-op for playback)
+//!   `1, sub` / `2, sub`  variable / runtime references; indexed globals are
+//!                          persisted and equality conditions feed Branch
 //!
 //! The interpreter executes ops and raises `Event`s for the frontend to render.
 
 use crate::codec::sjis;
+use crate::vm::global::GlobalState;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -313,6 +315,9 @@ pub enum SpriteKind {
 
 pub struct Interp<'a> {
     pub p: &'a Program,
+    /// Story-wide variables live outside a scene and are shared by every
+    /// interpreter created while following CATCH jumps.
+    pub global: &'a mut GlobalState,
     pub pc: usize,
     tok: Option<u32>,
     ints: Vec<i32>,
@@ -339,6 +344,13 @@ pub struct Interp<'a> {
     /// `K30` record that selected a sprite face, waiting for the following
     /// `K16` record (ACT154/155) to say *where* it goes on screen.
     pending_sprite: Option<(u32, u32, u32)>,
+    /// The current record's global reference.  The bytecode form used by the
+    /// port is `Var <index> Int <value>` for assignment and
+    /// `Var <index> Fun 0 Int <value>` for an equality test consumed by the
+    /// following Branch.
+    rec_var: Option<u32>,
+    rec_fun: Option<u32>,
+    condition_result: Option<bool>,
 }
 
 /// Everything about an interpreter that has to survive a save/load round trip.
@@ -371,6 +383,9 @@ pub struct InterpState {
     pub rec_act_hit: bool,
     pub rec_toks: Vec<u32>,
     pub pending_sprite: Option<(u32, u32, u32)>,
+    pub rec_var: Option<u32>,
+    pub rec_fun: Option<u32>,
+    pub condition_result: Option<bool>,
 }
 
 impl<'a> Interp<'a> {
@@ -393,6 +408,9 @@ impl<'a> Interp<'a> {
             rec_act_hit: self.rec_act_hit,
             rec_toks: self.rec_toks.clone(),
             pending_sprite: self.pending_sprite,
+            rec_var: self.rec_var,
+            rec_fun: self.rec_fun,
+            condition_result: self.condition_result,
         }
     }
 
@@ -417,14 +435,18 @@ impl<'a> Interp<'a> {
         self.rec_act_hit = s.rec_act_hit;
         self.rec_toks = s.rec_toks;
         self.pending_sprite = s.pending_sprite;
+        self.rec_var = s.rec_var;
+        self.rec_fun = s.rec_fun;
+        self.condition_result = s.condition_result;
     }
 }
 
 impl<'a> Interp<'a> {
-    pub fn new(p: &'a Program) -> Interp<'a> {
+    pub fn new(p: &'a Program, global: &'a mut GlobalState) -> Interp<'a> {
         let start = p.index.get(&p.entry).copied().unwrap_or(0);
         Interp {
             p,
+            global,
             pc: start,
             tok: None,
             ints: Vec::new(),
@@ -442,7 +464,16 @@ impl<'a> Interp<'a> {
             rec_act_hit: false,
             rec_toks: Vec::new(),
             pending_sprite: None,
+            rec_var: None,
+            rec_fun: None,
+            condition_result: None,
         }
+    }
+
+    /// Values are copied into a save while the interpreter still owns the
+    /// mutable borrow of the shared global table.
+    pub fn global_snapshot(&self) -> Vec<i32> {
+        self.global.snapshot()
     }
 
     fn goto_off(&mut self, target: u32) -> bool {
@@ -512,6 +543,21 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Op::Branch { a, b, .. } => {
+                    if let Some(condition) = self.condition_result.take() {
+                        // Global conditions in the shipped scripts are emitted
+                        // as `Var i; Fun 0; Int value` immediately before this
+                        // branch.  True follows the first block; false jumps
+                        // to the alternate target.  It is separate from a
+                        // player's choice, so loading a save cannot make a
+                        // first-time event take the wrong route.
+                        if !condition && self.goto_off(a) {
+                            // alternate block
+                        } else if !condition {
+                            return Event::End;
+                        }
+                        self.pending_b = None;
+                        continue;
+                    }
                     self.pending_b = Some(b);
                     if self.choice_result >= 2 && self.goto_off(a) {
                         // option 2 continues at A
@@ -551,11 +597,21 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Op::Fun { sub, .. } => {
+                    self.rec_fun = Some(sub);
                     // `2, 0` after the option records = present the choice and wait.
                     if sub == 0 {
                         if let Some(options) = self.take_options() {
                             return Event::Choice { options };
                         }
+                    }
+                }
+                Op::Var { sub, .. } => {
+                    // Only the indexed entries declared by Global.vrb are
+                    // story globals.  Other Var references are local/runtime
+                    // values from the original VM and are intentionally left
+                    // alone by this persistence layer.
+                    if (sub as usize) < self.global.values.len() {
+                        self.rec_var = Some(sub);
                     }
                 }
                 _ => {}
@@ -568,6 +624,48 @@ impl<'a> Interp<'a> {
     /// `K16` record with `ACT154`/`ACT155`. The file resolved by the frontend is
     /// `{prefix}{series:03}{variant:03}.tga` inside `char.pak`.
     fn finish_record(&mut self) -> Option<Event> {
+        // Commit/evaluate global records before the record-local integer
+        // buffer is cleared by `next_event`.
+        if let Some(index) = self.rec_var.take() {
+            if self.rec_fun == Some(0) {
+                if let Some(value) = self.ints.last().copied() {
+                    let current = self.global.get(index);
+                    let matched = current == value;
+                    if std::env::var_os("WA2_DEBUG_GLOBAL").is_some() {
+                        let name = self
+                            .global
+                            .names
+                            .get(index as usize)
+                            .map(String::as_str)
+                            .unwrap_or("<unknown>");
+                        eprintln!(
+                            "global: condition {}[{}] {} == {} -> {}",
+                            name,
+                            index,
+                            current,
+                            value,
+                            if matched { "true" } else { "false" }
+                        );
+                    }
+                    self.condition_result = Some(matched);
+                }
+            } else if self.rec_fun.is_none() {
+                if let Some(value) = self.ints.last().copied() {
+                    let old = self.global.get(index);
+                    self.global.set(index, value);
+                    if std::env::var_os("WA2_DEBUG_GLOBAL").is_some() && old != value {
+                        let name = self
+                            .global
+                            .names
+                            .get(index as usize)
+                            .map(String::as_str)
+                            .unwrap_or("<unknown>");
+                        eprintln!("global: set {}[{}] {} -> {}", name, index, old, value);
+                    }
+                }
+            }
+        }
+        self.rec_fun = None;
         if self.rec_kind != 30 || self.rec_tok_hit || self.rec_act_hit || self.ints.len() != 3 {
             return None;
         }
@@ -839,5 +937,78 @@ impl<'a> Interp<'a> {
 
     pub fn set_choice_result(&mut self, r: u32) {
         self.choice_result = r.max(1);
+    }
+}
+
+#[cfg(test)]
+mod global_vm_tests {
+    use super::*;
+    use crate::vm::global::GlobalState;
+
+    fn globals(n: usize) -> GlobalState {
+        GlobalState {
+            names: (0..n).map(|i| format!("g{i}")).collect(),
+            defaults: vec![0; n],
+            values: vec![0; n],
+        }
+    }
+
+    fn program(ops: Vec<Op>) -> Program {
+        let mut index = HashMap::new();
+        for (i, op) in ops.iter().enumerate() {
+            index.insert(op_off(op), i);
+        }
+        Program { ops, index, labels: Vec::new(), tokens: Vec::new(), entry: 0 }
+    }
+
+    #[test]
+    fn global_assignment_survives_the_record_boundary() {
+        let p = program(vec![
+            Op::Rec { off: 0, kind: 30 },
+            Op::Var { off: 8, sub: 2 },
+            Op::Int { off: 16, v: 17 },
+            Op::Rec { off: 28, kind: 0 },
+            Op::Return { off: 36 },
+        ]);
+        let mut g = globals(3);
+        let mut it = Interp::new(&p, &mut g);
+        assert!(matches!(it.next_event(), Event::End));
+        assert_eq!(it.global.get(2), 17);
+    }
+
+    #[test]
+    fn global_equality_controls_a_non_choice_branch() {
+        let p = program(vec![
+            Op::Rec { off: 0, kind: 30 },
+            Op::Var { off: 8, sub: 1 },
+            Op::Fun { off: 16, sub: 0 },
+            Op::Int { off: 24, v: 7 },
+            Op::Rec { off: 36, kind: 27 },
+            Op::Rec { off: 44, kind: 0 },
+            Op::Branch { off: 52, a: 100, b: 0 },
+            Op::Tok { off: 68, n: 0 },
+            Op::Act { off: 76, id: 131 },
+            Op::Tok { off: 100, n: 1 },
+            Op::Act { off: 108, id: 131 },
+        ]);
+        let mut p = p;
+        p.tokens = vec!["true".into(), "false".into()];
+        let mut g = globals(2);
+        g.set(1, 7);
+        let mut it = Interp::new(&p, &mut g);
+        match it.next_event() {
+            Event::Text { text, .. } => assert_eq!(text, "true"),
+            other => panic!("expected true branch text, got {other:?}"),
+        }
+        // A true condition falls through to the first return. With a false
+        // value the branch target is the second return; both paths terminate,
+        // but this asserts that the condition was actually consumed rather
+        // than the player's default choice being consulted.
+        g.set(1, 6);
+        let mut it = Interp::new(&p, &mut g);
+        match it.next_event() {
+            Event::Text { text, .. } => assert_eq!(text, "false"),
+            other => panic!("expected false branch text, got {other:?}"),
+        }
     }
 }

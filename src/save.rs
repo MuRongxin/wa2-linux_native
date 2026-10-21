@@ -18,16 +18,16 @@
 //!
 //! Layout follows the original (`save_%02d.sav` plus a thumbnail next to it),
 //! because the save screen shows a thumbnail per slot. The format itself is
-//! ours: line oriented `key=value`, versioned, with a reserved global section
-//! for the flag file the original keeps in `script/GFLAG.dat` (the port does
-//! not implement flags yet, so that section is empty).
+//! ours: line oriented `key=value`, versioned, with a global-variable section.
+//! The original keeps these values outside the scene VM; the native port
+//! stores their indexed values and rebuilds the schema from `Global.vrb`.
 
 use crate::vm::lscr::{InterpState, VoiceCue};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Bumped whenever the meaning of a field changes.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// `save_00` .. `save_99`, matching the original's two-digit slot names.
 pub const SLOT_COUNT: usize = 100;
 /// Slots shown per page by the save screen.
@@ -69,9 +69,9 @@ pub struct SaveState {
     pub bgm: Option<i32>,
     /// Wall clock time of the save, for the slot caption.
     pub time: String,
-    /// Reserved: the original keeps global flags in `script/GFLAG.dat`. Empty
-    /// until flags are implemented, at which point `VERSION` is bumped.
-    pub flags: Vec<u8>,
+    /// Story-wide values declared by `Global.vrb`. The schema is loaded from
+    /// the current data tree, so the save only needs indexed integers.
+    pub globals: Vec<i32>,
 }
 
 /// Where the slots live: `<data root>/save`.
@@ -195,8 +195,27 @@ impl SaveState {
         line("focus", self.focus.map(|f| f.to_string()).unwrap_or_default());
         line("bgm", self.bgm.map(|b| b.to_string()).unwrap_or_default());
         line("text", self.text.clone());
+        line("global_values", join_nums(&self.globals));
+        // Retain the old key for third-party slot browsers; it is ignored by
+        // the native loader and no longer carries story state.
         line("flags", String::new());
-        std::fs::write(path, out)
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("save"),
+            std::process::id(),
+            stamp
+        ));
+        if let Err(e) = std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn load_from(path: &std::path::Path) -> Option<SaveState> {
@@ -211,7 +230,11 @@ impl SaveState {
                 m.insert(k.trim().to_string(), unesc(v));
             }
         }
-        if num::<u32>(&m, "version").unwrap_or(0) != VERSION {
+        let version = num::<u32>(&m, "version").unwrap_or(0);
+        // Version 1 was the pre-global native format. It remains readable and
+        // starts with schema defaults; original-game saves were never
+        // supported and are intentionally outside this migration path.
+        if version != 1 && version != VERSION {
             eprintln!("save: {} has an unsupported version", path.display());
             return None;
         }
@@ -275,6 +298,9 @@ impl SaveState {
                 rec_act_hit: num::<u32>(&m, "rec_act_hit").unwrap_or(0) != 0,
                 rec_toks: nums(&m, "rec_toks"),
                 pending_sprite: sprite,
+                rec_var: None,
+                rec_fun: None,
+                condition_result: None,
             },
             bg,
             tint: m.get("tint").filter(|v| !v.is_empty()).cloned(),
@@ -283,7 +309,7 @@ impl SaveState {
             text: m.get("text").cloned().unwrap_or_default(),
             bgm: num(&m, "bgm"),
             time: m.get("time").cloned().unwrap_or_default(),
-            flags: Vec::new(),
+            globals: if version >= 2 { nums(&m, "global_values") } else { Vec::new() },
         })
     }
 
@@ -359,6 +385,8 @@ pub fn list() -> Vec<Option<SaveState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::lscr::InterpState;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn last_four_slots_live_on_a_ninth_page() {
@@ -373,5 +401,55 @@ mod tests {
         // Truncating 100/12 would hide save_96..save_99.
         assert_ne!(SLOT_COUNT / PER_PAGE, page_count());
         assert!(slot_index(SLOT_COUNT / PER_PAGE, 0).is_some());
+    }
+
+    #[test]
+    fn version_two_round_trip_preserves_global_values_atomically() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wa2-save-{}-{}", std::process::id(), stamp));
+        let path = dir.join("save_00.sav");
+        let st = SaveState {
+            scene: "2003".into(),
+            vm: InterpState {
+                pc: 4,
+                tok: None,
+                ints: vec![],
+                flts: vec![],
+                speaker: None,
+                pending_voice: None,
+                voice_scenario: 0,
+                options: vec![],
+                choice_result: 1,
+                pending_b: None,
+                last_kind: String::new(),
+                steps: 0,
+                rec_kind: 0,
+                rec_tok_hit: false,
+                rec_act_hit: false,
+                rec_toks: vec![],
+                pending_sprite: None,
+                rec_var: Some(14),
+                rec_fun: None,
+                condition_result: None,
+            },
+            bg: None,
+            tint: None,
+            slots: vec![None; crate::SPRITE_SLOTS],
+            focus: None,
+            text: "line".into(),
+            bgm: None,
+            time: "2026-10-21 00:00".into(),
+            globals: vec![1, 2, 3, 4, 5],
+        };
+        st.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with("; WHITE ALBUM 2 native port - save slot\n"));
+        assert!(raw.contains("version=2\n"));
+        assert_eq!(SaveState::load_from(&path).unwrap().globals, st.globals);
+        assert!(!dir.join(".save_00.sav.tmp").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

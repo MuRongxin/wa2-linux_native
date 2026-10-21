@@ -18,6 +18,7 @@
 use crate::codec::sjis;
 
 pub mod lscr;
+pub mod global;
 
 #[derive(Debug, Default, Clone)]
 pub struct ScenarioPage {
