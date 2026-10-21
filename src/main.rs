@@ -7179,7 +7179,16 @@ impl TitleSnow {
     }
 
     fn paint(&self, frame: &mut render::Surface, wh: i32) {
-        for flake in &self.flakes {
+        // At fullscreen sizes the source flakes are scaled with the window;
+        // drawing all 400 every frame can take longer than a mouse-motion
+        // interval and makes title-menu hover feel sticky. Keep the dense
+        // original layer at 720p, and sample it more sparsely as the output
+        // grows. The positions and animation remain unchanged.
+        let stride = if wh >= 1800 { 3 } else if wh >= 1000 { 2 } else { 1 };
+        for (i, flake) in self.flakes.iter().enumerate() {
+            if i % stride != 0 {
+                continue;
+            }
             let Some(sp) = self.sprites.get(flake.kind) else { continue };
             let x = (flake.x * wh as f32 / 720.0).round() as i32 - sp.width as i32 / 2;
             let y = (flake.y * wh as f32 / 720.0).round() as i32 - sp.height as i32 / 2;
