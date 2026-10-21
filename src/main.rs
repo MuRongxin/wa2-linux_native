@@ -5862,35 +5862,55 @@ fn browse_novels(
     const W: u32 = 1280;
     const H: u32 = 720;
     let ids = ["5000", "5100"];
-    let labels = if cn { ["序章电子小说", "终章电子小说"] } else { ["序章電子小説", "終章電子小説"] };
-    let backdrop = load_background(dirs, "T0000.tga")
-        .map(|img| surface_from_tga(&img).scaled_to(W, H));
+    // These are the actual first-page titles in the two shipped script roots,
+    // rather than invented "序章/终章" categories.
+    let labels = if cn {
+        ["特别篇　二年前", "序章　一月后，那女孩"]
+    } else {
+        ["特別編　二年前", "序章　一月後の、あの娘"]
+    };
+    // The original subpage keeps the same street/snow composition and menu
+    // bar as the special-mode page. The previous implementation replaced it
+    // with a dark custom panel, which is why it visibly diverged from WA2.
+    let bar = load_background(dirs, "T0101.tga");
+    let logo = load_background(dirs, "T0011.tga");
+    let street = load_background(dirs, "T0000.tga").map(|img| surface_from_tga(&img));
+    let weather = load_background(dirs, "weather.tga");
+    let mut snow = TitleSnow::new();
+    let mut snow_tick = std::time::Instant::now();
+    const ITEM_W: i32 = 320;
+    const ITEM_H: i32 = 40;
+    const PITCH: i32 = 40;
+    const X0: i32 = (W as i32 - ITEM_W) / 2;
+    const Y0: i32 = 380;
+    let labels_img = menu_labels(&labels, 32);
+    let head = render::text::with_ui_font(16, |f| f.line_rgba(if cn { "电子小说" } else { "電子小説" }, 16)).flatten();
     let mut sel = 0usize;
     loop {
-        let mut frame = backdrop.as_ref().map(clone_surf)
-            .unwrap_or_else(|| render::Surface::new(W, H, [1, 29, 89, 255]));
-        frame.fill_rect(270, 170, 740, 350, [0, 16, 38, 220]);
-        frame.fill_rect(270, 170, 740, 2, [150, 220, 235, 230]);
-        if let Some((w, h, rgba)) = render::text::with_ui_font(28, |f| {
-            f.line_rgba(if cn { "电子小说" } else { "電子小説" }, 28)
-        }).flatten() {
-            frame.blit_rgba(&rgba, w, h, (W as i32 - w as i32) / 2, 210);
+        let mut frame = render::Surface::new(W, H, [1, 29, 89, 255]);
+        if let Some(ref img) = street {
+            frame.copy_rows_from(img, 136);
         }
-        for (i, label) in labels.iter().enumerate() {
-            let y = 300 + i as i32 * 76;
-            let color = if i == sel { [50, 130, 150, 255] } else { [20, 55, 78, 230] };
-            frame.fill_rect(390, y, 500, 54, color);
-            frame.fill_rect(390, y, 500, 1, [170, 225, 235, 220]);
-            if let Some((w, h, rgba)) = render::text::with_ui_font(24, |f| f.line_rgba(label, 24)).flatten() {
-                frame.blit_rgba(&rgba, w, h, 640 - w as i32 / 2, y + (54 - h as i32) / 2);
-            }
+        if let Some(ref img) = logo {
+            frame.blit(img, (W as i32 - img.width as i32) / 2, 24);
         }
-        if let Some((w, h, rgba)) = render::text::with_ui_font(16, |f| {
-            f.line_rgba(if cn { "↑↓选择　回车进入　Esc返回" } else { "↑↓選択　Enter決定　Esc戻る" }, 16)
-        }).flatten() {
-            frame.blit_rgba(&rgba, w, h, (W as i32 - w as i32) / 2, 470);
+        if let Some(ref sheet) = bar {
+            frame.blit_region(sheet, 0, if sel == 0 { 40 } else { 0 }, sheet.width, ITEM_H as u32, X0, Y0 + sel as i32 * PITCH);
         }
-        win.present(&frame);
+        if let Some((w, h, rgba)) = head.as_ref() {
+            blit_tinted_label(&mut frame, rgba, *w, *h, (W as i32 - *w as i32) / 2, Y0 - 44, [255, 255, 255], 2);
+        }
+        draw_menu_labels(&mut frame, &labels_img, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, W as i32, H as i32);
+        if let Some(ref sheet) = weather {
+            snow.ensure(W as i32, H as i32, sheet);
+            let now = std::time::Instant::now();
+            snow.step(now.saturating_duration_since(snow_tick).as_secs_f32().min(0.05));
+            snow_tick = now;
+            snow.paint(&mut frame, H as i32);
+        }
+        let (ww, wh) = win.window_size();
+        let shown = if ww as u32 == W && wh as u32 == H { frame } else { frame.scaled_to(ww.max(1) as u32, wh.max(1) as u32) };
+        win.present(&shown);
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => {
                 crate::play_ui(mixer, ui, UiSe::Cancel);
@@ -5910,21 +5930,17 @@ fn browse_novels(
             }
             sdl2::Input::Pointer { x, y, pressed: true } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
-                if (300..376).contains(&sy) {
-                    if sel != 0 {
-                        crate::play_ui(mixer, ui, UiSe::Move);
+                for i in 0..2 {
+                    let y0 = Y0 + i as i32 * PITCH;
+                    if sx >= X0 && sx < X0 + ITEM_W && sy >= y0 && sy < y0 + ITEM_H {
+                        if sel != i {
+                            sel = i;
+                            crate::play_ui(mixer, ui, UiSe::Move);
+                        }
+                        crate::play_ui(mixer, ui, UiSe::Confirm);
+                        return Some(ids[sel].to_string());
                     }
-                    crate::play_ui(mixer, ui, UiSe::Confirm);
-                    return Some(ids[0].to_string());
                 }
-                if (376..460).contains(&sy) {
-                    if sel != 1 {
-                        crate::play_ui(mixer, ui, UiSe::Move);
-                    }
-                    crate::play_ui(mixer, ui, UiSe::Confirm);
-                    return Some(ids[1].to_string());
-                }
-                let _ = sx;
             }
             _ => win.delay(16),
         }
