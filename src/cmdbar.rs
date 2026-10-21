@@ -201,7 +201,15 @@ impl CmdBar {
             };
             // Idle icons sit faint on the window, the way the original draws
             // them. Hover and the toggled-on state come up to full strength.
-            let alpha = if on || hover == Some(b.cmd) { 255 } else { idle_alpha };
+            let alpha = if on || hover == Some(b.cmd) {
+                255
+            } else if b.cmd == Cmd::Timeline {
+                // The custom graph has no textured atlas background to carry
+                // it, so keep it readable over bright scenes even at idle.
+                idle_alpha.max(180)
+            } else {
+                idle_alpha
+            };
             if b.cmd == Cmd::Rewind {
                 if let Some(rew) = self.rewind.as_ref() {
                     surf.blit_region_scaled(
@@ -303,9 +311,9 @@ fn draw_timeline_icon(surf: &mut Surface, x: i32, y: i32, w: i32, h: i32, alpha:
     let py = |v: i32| y + (v as f32 * sy).round() as i32;
     let c = if row == 2 { [255, 255, 255, alpha] } else if row == 1 { [255, 214, 90, alpha] } else { [90, 220, 232, alpha] };
     let node = |surf: &mut Surface, nx: i32, ny: i32| {
-        for yy in -2..=2 {
-            for xx in -2..=2 {
-                if xx * xx + yy * yy <= 6 {
+        for yy in -3..=3 {
+            for xx in -3..=3 {
+                if xx * xx + yy * yy <= 12 {
                     surf.blend_pixel(px(nx + xx), py(ny + yy), c);
                 }
             }
@@ -313,8 +321,13 @@ fn draw_timeline_icon(surf: &mut Surface, x: i32, y: i32, w: i32, h: i32, alpha:
     };
     for i in 0..16 {
         let t = i as f32 / 15.0;
-        surf.blend_pixel(px(10 + (18.0 * t) as i32), py(20 - (8.0 * t) as i32), c);
-        surf.blend_pixel(px(28 + (0.0 * t) as i32), py(12 + (8.0 * t) as i32), c);
+        let lx = px(10 + (18.0 * t) as i32);
+        let rx = px(28);
+        let ry = py(12 + (8.0 * t) as i32);
+        for off in -1..=1 {
+            surf.blend_pixel(lx, py(20 - (8.0 * t) as i32 + off), c);
+            surf.blend_pixel(rx + off, ry, c);
+        }
     }
     node(surf, 10, 20);
     node(surf, 28, 12);
