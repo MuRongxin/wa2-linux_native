@@ -5878,39 +5878,70 @@ fn browse_novels(
     let weather = load_background(dirs, "weather.tga");
     let mut snow = TitleSnow::new();
     let mut snow_tick = std::time::Instant::now();
+    let mut street_scaled: Option<(i32, i32, render::Surface)> = None;
     const ITEM_W: i32 = 320;
     const ITEM_H: i32 = 40;
     const PITCH: i32 = 40;
     const X0: i32 = (W as i32 - ITEM_W) / 2;
     const Y0: i32 = 380;
-    let labels_img = menu_labels(&labels, 32);
-    let head = render::text::with_ui_font(16, |f| f.line_rgba(if cn { "电子小说" } else { "電子小説" }, 16)).flatten();
+    let mut labels_img = Vec::new();
+    let mut labels_px = 0u32;
+    let mut head: Option<(u32, u32, Vec<u8>)> = None;
+    let mut head_px = 0u32;
     let mut sel = 0usize;
     loop {
-        let mut frame = render::Surface::new(W, H, [1, 29, 89, 255]);
+        let (ww, wh) = win.window_size();
+        let ww = ww.max(1);
+        let wh = wh.max(1);
         if let Some(ref img) = street {
-            frame.copy_rows_from(img, 136);
+            let rebuild = street_scaled.as_ref().map(|(sw, sh, _)| *sw != ww || *sh != wh).unwrap_or(true);
+            if rebuild {
+                let dh = ((img.height as i64 * wh as i64) / H as i64).max(wh as i64) as u32;
+                street_scaled = Some((ww, wh, img.scaled_to(ww as u32, dh)));
+            }
+        }
+        let mut frame = render::Surface::new(ww as u32, wh as u32, [1, 29, 89, 255]);
+        if let Some((_, _, ref img)) = street_scaled {
+            let sy = (136 * wh / H as i32).clamp(0, (img.height as i32 - wh).max(0));
+            frame.copy_rows_from(img, sy);
         }
         if let Some(ref img) = logo {
-            frame.blit(img, (W as i32 - img.width as i32) / 2, 24);
+            frame.blit_region_scaled(img, 0, 0, img.width, img.height,
+                (W as i32 - img.width as i32) * ww / (2 * W as i32),
+                24 * wh / H as i32,
+                (img.width as i64 * ww as i64 / W as i64) as u32,
+                (img.height as i64 * wh as i64 / H as i64) as u32,
+                255);
         }
         if let Some(ref sheet) = bar {
-            frame.blit_region(sheet, 0, if sel == 0 { 40 } else { 0 }, sheet.width, ITEM_H as u32, X0, Y0 + sel as i32 * PITCH);
+            frame.blit_region_scaled(sheet, 0, if sel == 0 { 40 } else { 0 }, sheet.width, ITEM_H as u32,
+                X0 * ww / W as i32, (Y0 + sel as i32 * PITCH) * wh / H as i32,
+                (ITEM_W * ww / W as i32) as u32, (ITEM_H * wh / H as i32) as u32, 255);
         }
+        let generation = render::text::role_generation();
+        let want_px = layout_font_px(32, wh);
+        if labels_px != want_px {
+            labels_px = want_px;
+            labels_img = menu_labels(&labels, want_px);
+        }
+        let want_head_px = layout_font_px(16, wh);
+        if head_px != want_head_px {
+            head_px = want_head_px;
+            head = render::text::with_ui_font(want_head_px, |f| f.line_rgba(if cn { "电子小说" } else { "電子小説" }, want_head_px)).flatten();
+        }
+        let _ = generation;
         if let Some((w, h, rgba)) = head.as_ref() {
-            blit_tinted_label(&mut frame, rgba, *w, *h, (W as i32 - *w as i32) / 2, Y0 - 44, [255, 255, 255], 2);
+            blit_tinted_label(&mut frame, rgba, *w, *h, (ww - *w as i32) / 2, (Y0 - 44) * wh / H as i32, [255, 255, 255], (2 * wh / H as i32).max(1));
         }
-        draw_menu_labels(&mut frame, &labels_img, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, W as i32, H as i32);
+        draw_menu_labels(&mut frame, &labels_img, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
         if let Some(ref sheet) = weather {
-            snow.ensure(W as i32, H as i32, sheet);
+            snow.ensure(ww, wh, sheet);
             let now = std::time::Instant::now();
             snow.step(now.saturating_duration_since(snow_tick).as_secs_f32().min(0.05));
             snow_tick = now;
-            snow.paint(&mut frame, H as i32);
+            snow.paint(&mut frame, wh);
         }
-        let (ww, wh) = win.window_size();
-        let shown = if ww as u32 == W && wh as u32 == H { frame } else { frame.scaled_to(ww.max(1) as u32, wh.max(1) as u32) };
-        win.present(&shown);
+        win.present(&frame);
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back | sdl2::Input::Left => {
                 crate::play_ui(mixer, ui, UiSe::Cancel);
