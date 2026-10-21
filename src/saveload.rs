@@ -177,16 +177,9 @@ pub fn run(
     // page instead of once per frame.
     let mut caps: Option<(u32, u32, Vec<u8>)> = None;
     let mut hint: Option<(u32, u32, Vec<u8>)> = None;
-    let mut caps_key = (usize::MAX, Mode::Save);
+    let mut caps_key = (usize::MAX, Mode::Save, 0i32, 0i32);
 
     loop {
-        let key = (scr.page, mode);
-        if key != caps_key {
-            let (c, h) = render_captions(&scr, &slots, mode, pages);
-            caps = c;
-            hint = h;
-            caps_key = key;
-        }
         let n = save::cells_on_page(scr.page);
         let page_slots: Vec<Option<&SaveState>> = (0..n)
             .map(|i| slots[scr.page * PER_PAGE + i].as_ref())
@@ -195,6 +188,13 @@ pub fn run(
             Some(f) => Surface { width: f.width, height: f.height, pixels: f.pixels.clone() },
             None => Surface::new(W, H, [0, 0, 0, 255]),
         };
+        let key = (scr.page, mode, s.width as i32, s.height as i32);
+        if key != caps_key {
+            let (c, h) = render_captions(&scr, &slots, mode, pages, s.width, s.height);
+            caps = c;
+            hint = h;
+            caps_key = key;
+        }
         compose(&mut s, &assets, &scr, &page_slots, &thumbs[scr.page * PER_PAGE..], caps.as_ref(), hint.as_ref());
         win.present(&s);
 
@@ -267,7 +267,7 @@ pub fn run(
                                 thumbs[idx] = std::fs::read(save::thumb_path(idx))
                                     .ok()
                                     .and_then(|d| crate::codec::tga::decode(&d).ok());
-                                caps_key = (usize::MAX, Mode::Save);
+                                caps_key = (usize::MAX, Mode::Save, 0, 0);
                             }
                             Err(e) => eprintln!("save: slot {}: {}", idx, e),
                         }
@@ -290,6 +290,8 @@ fn render_captions(
     slots: &[Option<SaveState>],
     mode: Mode,
     pages: usize,
+    out_w: u32,
+    out_h: u32,
 ) -> (
     Option<(u32, u32, Vec<u8>)>,
     Option<(u32, u32, Vec<u8>)>,
@@ -298,8 +300,13 @@ fn render_captions(
     let lines: Vec<String> = (0..n)
         .map(|i| caption_of(scr.page * PER_PAGE + i, slots[scr.page * PER_PAGE + i].as_ref()))
         .collect();
-    let caps = crate::render::text::with_ui_font(14, |f| {
-        f.block_rgba(&lines, FRAME_W as u32, (n as u32) * CAP_H as u32, 14)
+    let scale_x = out_w as f32 / W as f32;
+    let scale_y = out_h as f32 / H as f32;
+    let font_px = (14.0 * scale_y).round().max(8.0) as u32;
+    let cap_w = (FRAME_W as f32 * scale_x).round().max(1.0) as u32;
+    let cap_h = (CAP_H as f32 * scale_y).round().max(1.0) as u32;
+    let caps = crate::render::text::with_ui_font(font_px, |f| {
+        f.block_rgba(&lines, cap_w, (n as u32) * cap_h, font_px)
     })
     .flatten();
     let hint_text = format!(
@@ -308,8 +315,9 @@ fn render_captions(
         scr.page + 1,
         pages
     );
-    let hint = crate::render::text::with_ui_font(14, |f| {
-        f.block_rgba(&[hint_text], HINT_W as u32, CAP_H as u32, 14)
+    let hint_w = (HINT_W as f32 * scale_x).round().max(1.0) as u32;
+    let hint = crate::render::text::with_ui_font(font_px, |f| {
+        f.block_rgba(&[hint_text], hint_w, cap_h, font_px)
     })
     .flatten();
     (caps, hint)
@@ -353,14 +361,15 @@ fn compose(
         }
         // Caption over the bottom of the thumbnail.
         if let Some((cw, _, rgba)) = caps {
-            let sy = (i as u32) * CAP_H as u32;
-            let mut strip = Vec::with_capacity((*cw as usize) * CAP_H as usize * 4);
-            for row in sy..sy + CAP_H as u32 {
+            let slot_h = (*rgba).len() as u32 / (*cw * 4).max(1) / slots.len().max(1) as u32;
+            let sy = (i as u32) * slot_h;
+            let mut strip = Vec::with_capacity((*cw as usize) * slot_h as usize * 4);
+            for row in sy..sy + slot_h {
                 let off = (row * *cw * 4) as usize;
                 strip.extend_from_slice(&rgba[off..off + (*cw as usize) * 4]);
             }
             s.fill_rect(px(cx + FRAME_X), py(cy + FRAME_Y + FRAME_H - CAP_H), pw(FRAME_W), ph(CAP_H), [0, 0, 0, 170]);
-            s.blit_rgba_scaled(&strip, *cw, CAP_H as u32, px(cx + FRAME_X), py(cy + FRAME_Y + FRAME_H - CAP_H), pw(FRAME_W), ph(CAP_H));
+            s.blit_rgba(&strip, *cw, slot_h, px(cx + FRAME_X), py(cy + FRAME_Y + FRAME_H - CAP_H));
         }
         if scr.cursor == i {
             if let Some(f) = a.frame.as_ref() {
@@ -371,7 +380,8 @@ fn compose(
     if let Some((hw, _, rgba)) = hint {
         let x0 = (W as i32 - HINT_W) / 2;
         s.fill_rect(px(x0 - 10), py(HINT_Y - 2), pw(HINT_W + 20), ph(CAP_H + 4), [0, 0, 0, 170]);
-        s.blit_rgba_scaled(rgba, *hw, CAP_H as u32, px(x0), py(HINT_Y), pw(HINT_W), ph(CAP_H));
+        let hh = rgba.len() as u32 / (*hw * 4).max(1);
+        s.blit_rgba(rgba, *hw, hh, px(x0), py(HINT_Y));
     }
     if let Some(f) = a.footer.as_ref() {
         s.blit_region_scaled(f, 0, 0, f.width, f.height, px(FOOTER_X), py(FOOTER_Y), pw(288), ph(40), 255);
