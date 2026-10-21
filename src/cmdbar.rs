@@ -63,6 +63,9 @@ struct Btn {
 /// Same order as the executable's position table. Rewind occupies the empty
 /// cell the original left between quick-load and config.
 const BTNS: [Btn; 11] = [
+    // Timeline is deliberately the first visible command so it is easy to
+    // discover during play.
+    Btn { cmd: Cmd::Timeline, x: 768, sheet: None, label_off: 0, label_on: 0 },
     Btn { cmd: Cmd::QuickSave, x: 808, sheet: Some(0), label_off: 0, label_on: 0 },
     Btn { cmd: Cmd::QuickLoad, x: 848, sheet: Some(1), label_off: 1, label_on: 1 },
     Btn { cmd: Cmd::Rewind, x: 888, sheet: None, label_off: 0, label_on: 0 },
@@ -73,9 +76,6 @@ const BTNS: [Btn; 11] = [
     Btn { cmd: Cmd::Auto, x: 1088, sheet: Some(6), label_off: 7, label_on: 6 },
     Btn { cmd: Cmd::Skip, x: 1128, sheet: Some(7), label_off: 9, label_on: 8 },
     Btn { cmd: Cmd::Hide, x: 1168, sheet: Some(8), label_off: 10, label_on: 10 },
-    // There is no original atlas cell for this command. It is drawn as a
-    // small custom graph icon in the last free cell of the 1280px bar.
-    Btn { cmd: Cmd::Timeline, x: 1208, sheet: None, label_off: 0, label_on: 0 },
 ];
 
 pub struct CmdBar {
@@ -388,7 +388,8 @@ mod integration {
         assert_eq!(bar.hit(927, 700), Some(Cmd::Rewind));
         assert_eq!(bar.hit(928, 680), Some(Cmd::Config));
         assert_eq!(bar.hit(1168, 700), Some(Cmd::Hide));
-        assert_eq!(bar.hit(1208, 700), Some(Cmd::Timeline));
+        assert_eq!(bar.hit(768, 700), Some(Cmd::Timeline));
+        assert_eq!(bar.hit(1208, 700), None);
         assert_eq!(bar.hit(1000, 679), None);
 
         let mut surf = Surface::new(1280, 720, [8, 12, 24, 255]);
