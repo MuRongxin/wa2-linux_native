@@ -210,10 +210,6 @@ impl CmdBar {
             // them. Hover and the toggled-on state come up to full strength.
             let alpha = if on || hover == Some(b.cmd) {
                 255
-            } else if b.cmd == Cmd::Timeline || b.cmd == Cmd::Home {
-                // The custom graph has no textured atlas background to carry
-                // it, so keep it readable over bright scenes even at idle.
-                idle_alpha.max(180)
             } else {
                 idle_alpha
             };
