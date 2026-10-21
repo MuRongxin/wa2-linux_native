@@ -2907,8 +2907,44 @@ fn run_game_at(
                                                         CmdOutcome::Jump(id) => {
                                                             if let Some(mx) = mixer.as_ref() {
                                                                 stop_voice(mx, &mut voice_stream);
+                                                                for slot in se_channels.drain().map(|(_, slot)| slot) {
+                                                                    mx.stop(slot);
+                                                                }
+                                                                for slot in fading_se.drain().map(|(_, slot)| slot) {
+                                                                    mx.stop(slot);
+                                                                }
+                                                                if let Some(slot) = fading_bgm.take() {
+                                                                    mx.stop(slot);
+                                                                }
                                                             }
                                                             current_id = id;
+                                                            cmd_auto = false;
+                                                            cmd_skip = false;
+                                                            cmd_rewind = false;
+                                                            rewind_left = 0;
+                                                            rewind_vm = None;
+                                                            park_wait = false;
+                                                            skipped_voice = None;
+                                                            line_voice = None;
+                                                            line_no = 0;
+                                                            history.clear();
+                                                            user_hide = false;
+                                                            script_open = true;
+                                                            window = true;
+                                                            tint = None;
+                                                            tint_name = None;
+                                                            bg = solid_bg(W, H, [0, 0, 0]);
+                                                            bg_scale = None;
+                                                            bg_src_scale = None;
+                                                            bg_id = None;
+                                                            bg_label = String::from("BLACK");
+                                                            bg_cg = false;
+                                                            last_text.clear();
+                                                            last_speaker = None;
+                                                            cur_surf = render::render_scene(&bg, "", font, W, H);
+                                                            line_redraw = false;
+                                                            reveal = 0;
+                                                            type_tick = 0;
                                                             slots = Default::default();
                                                             plates.clear();
                                                             line_base = None;
@@ -3376,8 +3412,44 @@ fn run_game_at(
                                                     CmdOutcome::Jump(id) => {
                                                         if let Some(mx) = mixer.as_ref() {
                                                             stop_voice(mx, &mut voice_stream);
+                                                            for slot in se_channels.drain().map(|(_, slot)| slot) {
+                                                                mx.stop(slot);
+                                                            }
+                                                            for slot in fading_se.drain().map(|(_, slot)| slot) {
+                                                                mx.stop(slot);
+                                                            }
+                                                            if let Some(slot) = fading_bgm.take() {
+                                                                mx.stop(slot);
+                                                            }
                                                         }
                                                         current_id = id;
+                                                        cmd_auto = false;
+                                                        cmd_skip = false;
+                                                        cmd_rewind = false;
+                                                        rewind_left = 0;
+                                                        rewind_vm = None;
+                                                        park_wait = false;
+                                                        skipped_voice = None;
+                                                        line_voice = None;
+                                                        line_no = 0;
+                                                        history.clear();
+                                                        user_hide = false;
+                                                        script_open = true;
+                                                        window = true;
+                                                        tint = None;
+                                                        tint_name = None;
+                                                        bg = solid_bg(W, H, [0, 0, 0]);
+                                                        bg_scale = None;
+                                                        bg_src_scale = None;
+                                                        bg_id = None;
+                                                        bg_label = String::from("BLACK");
+                                                        bg_cg = false;
+                                                        last_text.clear();
+                                                        last_speaker = None;
+                                                        cur_surf = render::render_scene(&bg, "", font, W, H);
+                                                        line_redraw = false;
+                                                        reveal = 0;
+                                                        type_tick = 0;
                                                         slots = Default::default();
                                                         plates.clear();
                                                         line_base = None;
