@@ -2907,6 +2907,9 @@ fn run_game_at(
                                                         CmdOutcome::Jump(id) => {
                                                             if let Some(mx) = mixer.as_ref() {
                                                                 stop_voice(mx, &mut voice_stream);
+                                                                if let Some((_, slot)) = bgm_track.take() {
+                                                                    mx.stop(slot);
+                                                                }
                                                                 for slot in se_channels.drain().map(|(_, slot)| slot) {
                                                                     mx.stop(slot);
                                                                 }
@@ -3412,6 +3415,9 @@ fn run_game_at(
                                                     CmdOutcome::Jump(id) => {
                                                         if let Some(mx) = mixer.as_ref() {
                                                             stop_voice(mx, &mut voice_stream);
+                                                            if let Some((_, slot)) = bgm_track.take() {
+                                                                mx.stop(slot);
+                                                            }
                                                             for slot in se_channels.drain().map(|(_, slot)| slot) {
                                                                 mx.stop(slot);
                                                             }
