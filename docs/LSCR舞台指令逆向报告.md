@@ -243,8 +243,11 @@ Rec K16: vals=(slot, 0, [0, 15,] 256, 128) ACT154/155  ← 怎么上屏
 | `tools/cg_dedup_cluster.py` | 上面那套两遍图像聚类；`--cluster-threshold` / `--mad` 可调 |
 | `tools/tables/h_scene_cg.tsv` | 机器可读的场景 → CG 对照表 |
 
-缩略图缓存在 `data/cache/cg_thumbs`（约 441 MB，`.gitignore` 的 `/data/cache` 已覆盖），
-删掉不影响功能，只是下次要重新解码。
+运行时 CG 概览缩略图缓存在 `data/cache/cg_thumbs_v2`（960×540、按图源倍率分桶，
+约 600 MB，`.gitignore` 的 `/data/cache` 已覆盖）。运行时优先读取 8x/4x 事件 CG，
+在 WebP 解码阶段直接缩到预览尺寸，不再使用原版 256×144 的 `tv*` 小图；旧的
+`data/cache/cg_thumbs` 可安全删除，只是下次要重新解码。`tools/cg_dedup_cluster.py`
+使用的灰度 `.npy` 缓存仍独立放在旧目录，不参与运行时显示。
 
 ### 12.5 顺带可做
 

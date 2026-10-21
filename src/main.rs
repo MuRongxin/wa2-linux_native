@@ -5508,9 +5508,9 @@ fn play_ui_se(mixer: Option<&audio::Mixer>, path: Option<&Path>) {
 /// screen) page through them; Esc or the right button returns to the title.
 /// CG mode: a grid of thumbnails, then a zoomable full view of one picture.
 ///
-/// The grid reads the small copies the original ships (`tv*`, see
-/// `cg::load_thumb`), so a page of twenty cells costs a few file reads
-/// instead of twenty high-resolution decodes.
+/// The grid uses the highest-quality event CG source available. `cg::load_thumb`
+/// resizes WebP masters during decode and caches a 960x540 preview, so the
+/// fullscreen grid never enlarges the original 256x144 `tv*` copies.
 fn browse_cg(
     win: &mut sdl2::Sdl,
     dirs: &[&std::path::Path],
@@ -5566,7 +5566,7 @@ fn browse_cg(
                     .or_insert_with(|| cg::load_thumb(dirs, stem));
                 match entry {
                     Some(img) => {
-                        // A 256x144 picture keeps its 16:9 shape inside a 5:3 cell.
+                        // The 16:9 preview keeps its shape inside the 5:3 cell.
                         let dh = (cw * img.height / img.width.max(1)).min(ch);
                         let inset = ((ch - dh) / 2) as i32;
                         frame.blit_region_scaled(img, 0, 0, img.width, img.height,

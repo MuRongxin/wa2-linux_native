@@ -182,6 +182,41 @@ pub fn decode_file(path: &Path) -> Result<TgaImage, String> {
     }
 }
 
+/// Decode an image for a preview without materialising a much larger source
+/// than the preview needs. This is used by the CG browser, where a 10,240 x
+/// 5,760 lossless WebP is only going to be shown at a few hundred pixels.
+/// `dwebp`/ffmpeg do the resize while decoding WebP; TGA files are returned at
+/// their source size so callers can use their own high quality downsampler.
+pub fn decode_file_preview(path: &Path, max_w: u32, max_h: u32) -> Result<TgaImage, String> {
+    let max_w = max_w.max(1);
+    let max_h = max_h.max(1);
+    let Some((width, height)) = image_dimensions(path) else {
+        return decode_file(path);
+    };
+    if width <= max_w && height <= max_h {
+        return decode_file(path);
+    }
+
+    let (out_w, out_h) = if width as u64 * max_h as u64 <= height as u64 * max_w as u64 {
+        (((width as u64 * max_h as u64) / height as u64).max(1) as u32, max_h)
+    } else {
+        (max_w, ((height as u64 * max_w as u64) / width as u64).max(1) as u32)
+    };
+    let is_webp = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("webp"))
+        .unwrap_or(false);
+    if is_webp {
+        return match decode_webp_dwebp(path, Some((out_w, out_h))) {
+            Ok(img) => Ok(img),
+            Err(dwebp_error) => decode_webp_filter(path, Some(format!("scale={out_w}:{out_h}")))
+                .map_err(|ffmpeg_error| format!("{ffmpeg_error} (dwebp: {dwebp_error})")),
+        };
+    }
+    decode_file(path)
+}
+
 /// The scale a file is stored at, and the scale decode_art_file will decode it
 /// to for the current window. artcache keys every cache entry by the second
 /// value, so a window resize can never mix pixel scales.
