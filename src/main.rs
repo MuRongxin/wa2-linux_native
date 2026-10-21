@@ -6394,17 +6394,39 @@ fn crop_image(
     Some(codec::tga::TgaImage { width: w, height: h, rgba })
 }
 
-fn load_ui_asset(
+/// UI sheet retained at its source resolution. The scene compositor uses
+/// logical-size UI sheets; standalone pages such as Music need the 4x/8x
+/// pixels so their baked labels stay sharp at fullscreen size.
+struct HiUiAsset {
+    img: codec::tga::TgaImage,
+    scale: u32,
+}
+
+fn load_ui_asset_hi(
     dirs: &[&std::path::Path],
     name: &str,
     expected_w: u32,
     expected_h: u32,
-) -> Option<codec::tga::TgaImage> {
-    for dir in dirs {
-        let path = dir.join(name);
-        if let Ok(img) = codec::image::decode_ui_file(&path) {
-            if img.width == expected_w && img.height == expected_h {
-                return Some(img);
+) -> Option<HiUiAsset> {
+    let mut order: Vec<(&std::path::Path, u32)> = dirs.iter()
+        .map(|d| (*d, codec::image::dir_art_scale(d)))
+        .collect();
+    order.sort_by(|a, b| b.1.cmp(&a.1));
+    for (dir, dir_scale) in order {
+        for cand in codec::image::candidate_names(name) {
+            let path = dir.join(cand);
+            let decoded = if dir_scale > 1 {
+                codec::image::decode_file(&path)
+            } else {
+                codec::image::decode_ui_file(&path)
+            };
+            let Ok(img) = decoded else { continue };
+            let scale = if expected_w > 0 && expected_h > 0 {
+                (img.width / expected_w).min(img.height / expected_h).max(1)
+            } else { 1 };
+            if img.width >= expected_w.saturating_mul(scale)
+                && img.height >= expected_h.saturating_mul(scale) {
+                return Some(HiUiAsset { img, scale });
             }
         }
     }
@@ -6943,19 +6965,23 @@ fn run_music(
         }
     }
     let tracks: Vec<(i32, std::path::PathBuf)> = choices.into_iter().map(|(id, (_, p))| (id, p)).collect();
-    let header = load_ui_asset(bg_dirs, "sys_04000.tga", 1280, 40);
-    let logo = load_ui_asset(bg_dirs, "sys_04010.tga", 304, 168);
-    let footer = load_ui_asset(bg_dirs, "sys_04021.tga", 288, 40);
-    let info_bar = load_ui_asset(bg_dirs, "sys_04030.tga", 1024, 56);
-    let select_sheet = load_ui_asset(bg_dirs, "sys_04100.tga", 400, 128);
-    let name_sheet = load_ui_asset(bg_dirs, "sys_04101.tga", 344, 1512);
-    let backdrop = load_background(bg_dirs, "T0000.tga")
-        .map(|img| surface_from_tga(&img).scaled_to(W, H));
+    let header = load_ui_asset_hi(bg_dirs, "sys_04000.tga", 1280, 40);
+    let logo = load_ui_asset_hi(bg_dirs, "sys_04010.tga", 304, 168);
+    let footer = load_ui_asset_hi(bg_dirs, "sys_04021.tga", 288, 40);
+    let info_bar = load_ui_asset_hi(bg_dirs, "sys_04030.tga", 1024, 56);
+    let select_sheet = load_ui_asset_hi(bg_dirs, "sys_04100.tga", 400, 128);
+    let name_sheet = load_ui_asset_hi(bg_dirs, "sys_04101.tga", 344, 1512);
+    let backdrop = load_background(bg_dirs, "T0000.tga").map(|img| surface_from_tga(&img));
     let mut selected = 0usize;
     let mut playing: Option<(i32, usize)> = None;
     let mut notice = String::new();
+    let mut backdrop_fit: Option<(u32, u32, render::Surface)> = None;
     let labels: Vec<Option<codec::tga::TgaImage>> = tracks.iter().enumerate().map(|(i, _)| {
-        name_sheet.as_ref().and_then(|sheet| crop_image(sheet, 0, (i as u32 * 24).min(sheet.height.saturating_sub(24)), 344, 24))
+        name_sheet.as_ref().and_then(|sheet| {
+            let sc = sheet.scale;
+            let y = (i as u32 * 24 * sc).min(sheet.img.height.saturating_sub(24 * sc));
+            crop_image(&sheet.img, 0, y, 344 * sc, 24 * sc)
+        })
     }).collect();
     eprintln!("music: indexed {} tracks from {}", tracks.len(), bgm_dir.display());
 
@@ -7028,27 +7054,45 @@ fn run_music(
         }
         let page_size = 39usize;
         let top = (selected / page_size) * page_size;
-        let mut frame = backdrop.as_ref().map(clone_surf)
-            .unwrap_or_else(|| render::Surface::new(W, H, [9, 31, 43, 255]));
-        if let Some(h) = header.as_ref() { frame.blit(h, 0, 0); }
-        if let Some(l) = logo.as_ref() { frame.blit(l, 42, 48); }
+        let (ww, wh) = win.window_size();
+        let ww = ww.max(1) as u32;
+        let wh = wh.max(1) as u32;
+        let sx = |x: i32| (x as u32 * ww / W).max(0);
+        let sy = |y: i32| (y as u32 * wh / H).max(0);
+        let sw = |w: u32| (w * ww / W).max(1);
+        let sh = |h: u32| (h * wh / H).max(1);
+        if let Some(b) = backdrop.as_ref() {
+            let rebuild = backdrop_fit.as_ref().map(|(bw, bh, _)| *bw != ww || *bh != wh).unwrap_or(true);
+            if rebuild {
+                backdrop_fit = Some((ww, wh, b.scaled_to(ww, wh)));
+            }
+        }
+        let mut frame = backdrop_fit.as_ref().map(|(_, _, b)| clone_surf(b))
+            .unwrap_or_else(|| render::Surface::new(ww, wh, [9, 31, 43, 255]));
+        let draw = |dst: &mut render::Surface, a: &HiUiAsset, x: i32, y: i32, w: u32, h: u32| {
+            dst.blit_region_scaled(&a.img, 0, 0, a.img.width, a.img.height,
+                sx(x) as i32, sy(y) as i32, sw(w), sh(h), 255);
+        };
+        if let Some(h) = header.as_ref() { draw(&mut frame, h, 0, 0, 1280, 40); }
+        if let Some(l) = logo.as_ref() { draw(&mut frame, l, 42, 48, 304, 168); }
         for (row, i) in (top..(top + page_size).min(tracks.len())).enumerate() {
             let col = row / 13;
             let line = row % 13;
             let x = 42 + col as i32 * 400;
             let y = 94 + line as i32 * 32;
             if let Some(sheet) = select_sheet.as_ref() {
-                let sy = if i == selected { 64 } else { 32 };
-                if let Some(mark) = crop_image(sheet, 0, sy, 400, 32) {
-                    frame.blit(&mark, x, y);
-                }
+                let mark_y = if i == selected { 64 } else { 32 };
+                frame.blit_region_scaled(&sheet.img, 0, (mark_y * sheet.scale) as i32, 400 * sheet.scale, 32 * sheet.scale,
+                    sx(x) as i32, sy(y) as i32, sw(400), sh(32), 255);
             }
             if let Some(name) = labels[i].as_ref() {
-                frame.blit(name, x + 46, y + 4);
+                frame.blit_region_scaled(name, 0, 0, name.width, name.height,
+                    sx(x + 46) as i32, sy(y + 4) as i32, sw(344), sh(24), 255);
             } else {
                 let fallback = format!("BGM_{:03}", tracks[i].0);
-                if let Some((w, h, rgba)) = render::text::with_ui_font(22, |f| f.line_rgba(&fallback, 22)).flatten() {
-                    frame.blit_rgba(&rgba, w, h, x + 46, y + 4);
+                let px = ((22 * wh) / H).max(8);
+                if let Some((tw, th, rgba)) = render::text::with_ui_font(px, |f| f.line_rgba(&fallback, px)).flatten() {
+                    frame.blit_rgba(&rgba, tw, th, sx(x + 46) as i32, sy(y + 4) as i32);
                 }
             }
         }
@@ -7056,15 +7100,17 @@ fn run_music(
             notice = if cn { "未找到 BGM 文件".into() } else { "No BGM files".into() };
         }
         if !notice.is_empty() {
-            if let Some((w, h, rgba)) = render::text::with_ui_font(20, |f| f.line_rgba(&notice, 20)).flatten() {
-                frame.blit_rgba(&rgba, w, h, 440, 610);
+            let px = ((20 * wh) / H).max(8);
+            if let Some((w, h, rgba)) = render::text::with_ui_font(px, |f| f.line_rgba(&notice, px)).flatten() {
+                frame.blit_rgba(&rgba, w, h, sx(440) as i32, sy(610) as i32);
             }
         }
-        if let Some(bar) = info_bar.as_ref() { frame.blit(bar, 128, 532); }
+        if let Some(bar) = info_bar.as_ref() { draw(&mut frame, bar, 128, 532, 1024, 56); }
         if let Some(name) = labels.get(selected).and_then(|x| x.as_ref()) {
-            frame.blit(name, 165, 560);
+            frame.blit_region_scaled(name, 0, 0, name.width, name.height,
+                sx(165) as i32, sy(560) as i32, sw(344), sh(24), 255);
         }
-        if let Some(f) = footer.as_ref() { frame.blit(f, 496, 620); }
+        if let Some(f) = footer.as_ref() { draw(&mut frame, f, 496, 620, 288, 40); }
         win.present(&frame);
         win.delay(16);
     }

@@ -156,11 +156,12 @@ pub fn run(
     current_scene: Option<&str>,
 ) -> Option<String> {
     let _ = font;
+    let (ww0, wh0) = win.window_size();
     let mut cover = Surface::new(W as u32, H as u32, BG);
     if let Some(banner) = load_tga(bg_dirs, "sys_06000.tga") {
         cover.blit(&banner, 0, 0);
     }
-    win.present(&cover);
+    win.present(&cover.scaled_to(ww0.max(1) as u32, wh0.max(1) as u32));
 
     let chart = Chart::load(script_dir);
     if chart.nodes.is_empty() {
@@ -174,6 +175,8 @@ pub fn run(
     let thumbs = shots::load_thumbs(bg_dirs, &chart, &cache_dir);
     let banner = load_tga(bg_dirs, "sys_06000.tga");
     let pager = load_tga(bg_dirs, "sys_06021.tga");
+    let banner_hi = load_hi_tga(bg_dirs, "sys_06000.tga", 1280, 36);
+    let pager_hi = load_hi_tga(bg_dirs, "sys_06021.tga", 288, 40);
     // Chapter headers are fixed screen text: rasterize once, not per frame.
     let headers: Vec<Option<Label>> = chart
         .bands
@@ -241,9 +244,28 @@ pub fn run(
                 preview: &preview,
                 headers: &headers,
                 filter,
+                cn,
             },
         );
-        win.present(&frame);
+        let (ww, wh) = win.window_size();
+        let mut shown = frame.scaled_to(ww.max(1) as u32, wh.max(1) as u32);
+        paint::paint_hires_text(&mut shown, &paint::PaintState {
+            chart: &chart, thumbs: &thumbs, banner: banner.as_ref(), pager: pager.as_ref(),
+            sel, hover, view: &view, preview: &preview, headers: &headers, filter, cn,
+        });
+        let ww = ww.max(1) as u32;
+        let wh = wh.max(1) as u32;
+        if let Some(img) = banner_hi.as_ref() {
+            shown.blit_region_scaled(&img.img, 0, 0, img.img.width, img.img.height,
+                0, 0, ww, (36 * wh / H as u32).max(1), 255);
+        }
+        if let Some(img) = pager_hi.as_ref() {
+            let x = ((W - 288) as u32 * ww / W as u32).saturating_sub(16 * ww / W as u32);
+            let y = ((H - 40) as u32 * wh / H as u32).saturating_sub(16 * wh / H as u32);
+            shown.blit_region_scaled(&img.img, 0, 0, img.img.width, img.img.height,
+                x as i32, y as i32, (288 * ww / W as u32).max(1), (40 * wh / H as u32).max(1), 255);
+        }
+        win.present(&shown);
 
         match win.poll_input() {
             sdl2::Input::Quit | sdl2::Input::RightClick | sdl2::Input::Back => {
@@ -447,6 +469,32 @@ fn load_tga(dirs: &[&Path], name: &str) -> Option<TgaImage> {
             // screens rather than decoded at the window's art scale.
             if let Ok(img) = crate::codec::image::decode_ui_file(&dir.join(cand)) {
                 return Some(img);
+            }
+        }
+    }
+    None
+}
+
+struct HiTimelineAsset { img: TgaImage }
+
+fn load_hi_tga(dirs: &[&Path], name: &str, expected_w: u32, expected_h: u32) -> Option<HiTimelineAsset> {
+    let mut order: Vec<(&Path, u32)> = dirs.iter()
+        .map(|d| (*d, crate::codec::image::dir_art_scale(d)))
+        .collect();
+    order.sort_by(|a, b| b.1.cmp(&a.1));
+    for (dir, dir_scale) in order {
+        for cand in crate::codec::image::candidate_names(name) {
+            let path = dir.join(cand);
+            let decoded = if dir_scale > 1 {
+                crate::codec::image::decode_file(&path)
+            } else {
+                crate::codec::image::decode_ui_file(&path)
+            };
+            let Ok(img) = decoded else { continue };
+            let scale = (img.width / expected_w.max(1)).min(img.height / expected_h.max(1)).max(1);
+            if img.width >= expected_w.saturating_mul(scale)
+                && img.height >= expected_h.saturating_mul(scale) {
+                return Some(HiTimelineAsset { img });
             }
         }
     }

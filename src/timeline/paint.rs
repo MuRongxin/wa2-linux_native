@@ -31,6 +31,7 @@ pub(super) struct PaintState<'a> {
     /// When set, matching chapter nodes stay bright and other nodes remain
     /// visible but subdued. Filtering is a view operation, never a graph edit.
     pub filter: Option<&'a Chapter>,
+    pub cn: bool,
 }
 
 // Layout owned by paint. The banner is 0..36, the chapter header bar is the
@@ -66,6 +67,82 @@ pub(super) fn paint(s: &mut Surface, st: &PaintState) {
     draw_edge_tags(s, &tags);
     draw_top(s, st);
     draw_preview_bar(s, st);
+}
+
+/// Re-rasterize fixed text after the logical chart has been fitted to the
+/// window. The graph remains 1280x720 for stable navigation, while headers
+/// and the preview strip use the real display pixel size.
+pub(super) fn paint_hires_text(s: &mut Surface, st: &PaintState) {
+    let sx = s.width as f32 / W as f32;
+    let sy = s.height as f32 / H as f32;
+    if sx <= 1.01 && sy <= 1.01 { return; }
+    let px = |v: i32| (v as f32 * sx).round() as i32;
+    let py = |v: i32| (v as f32 * sy).round() as i32;
+    let pw = |v: i32| (v as f32 * sx).round().max(1.0) as u32;
+    let ph = |v: i32| (v as f32 * sy).round().max(1.0) as u32;
+
+    s.fill_rect(0, py(HEADER_TOP), s.width, ph(HEADER_H), HEADER_BG);
+    s.fill_rect(0, py(HEADER_BOTTOM - 1), s.width, ph(1), HEADER_LINE);
+    let size = ((15.0 * sy).round() as u32).clamp(8, 160);
+    let labels: Vec<Option<Label>> = st.chart.bands.iter().map(|b| preview::label(b.chapter.title, size)).collect();
+    let shorts: Vec<Option<Label>> = st.chart.bands.iter().map(|b| preview::label(b.chapter.short, size)).collect();
+    let mut order = Vec::new();
+    for (i, b) in st.chart.bands.iter().enumerate() {
+        let x0 = (nav::world_x(b.first_col) * st.view.zoom - st.view.scroll_x).round() as i32;
+        let x1 = (nav::world_x(b.last_col + 1) * st.view.zoom - st.view.scroll_x).round() as i32;
+        if x1 > 0 && x0 < W { order.push((x0, i)); }
+    }
+    order.sort_unstable();
+    let mut right = -10000;
+    for (band_x, i) in order {
+        let b = &st.chart.bands[i];
+        let Some(title) = labels[i].as_ref() else { continue };
+        let x1 = (nav::world_x(b.last_col + 1) * st.view.zoom - st.view.scroll_x).round() as i32;
+        let mut x = (band_x + 6).max(2);
+        if x < right + 8 { x = right + 8; }
+        if x >= x1.min(W - 2) { continue; }
+        let avail = x1.min(W - 2) - x - 4;
+        let chosen = if avail as f32 >= title.w as f32 / sx + 14.0 { Some(title) } else { shorts[i].as_ref() };
+        let Some(label) = chosen else { continue };
+        let chip_w = (label.w as f32 / sx).round() as i32 + 12;
+        if x + chip_w > W - 2 { continue; }
+        let color = route_bright(b.chapter);
+        s.fill_rect(px(x), py(HEADER_TOP + 3), pw(chip_w), ph(HEADER_H - 6), mix(HEADER_BG, b.chapter.color, 24));
+        s.fill_rect(px(x), py(HEADER_TOP + 3), pw(3), ph(HEADER_H - 6), color);
+        blit_hi(s, label, px(x + 7), py(HEADER_TOP + 1), route_ink(b.chapter));
+        right = x + chip_w;
+    }
+
+    s.fill_rect(px(TEXT_X), py(PREVIEW_TOP + 8), pw(TEXT_RIGHT - TEXT_X), ph(94), PREVIEW_BG);
+    let node = &st.chart.nodes[st.sel];
+    let head = ((20.0 * sy).round() as u32).clamp(8, 180);
+    let ink = route_ink(node.chapter);
+    s.fill_rect(px(TEXT_X), py(PREVIEW_TOP + 14), pw(4), ph(20), route_bright(node.chapter));
+    let mut right_px = px(TEXT_X);
+    if let Some(label) = preview::label(node.chapter.title, head) {
+        blit_hi(s, &label, px(TEXT_X + 10), py(PREVIEW_TOP + 12), ink);
+        right_px = px(TEXT_X + 10) + label.w as i32;
+    }
+    if let Some(label) = preview::label(&node.id, head) {
+        blit_hi(s, &label, right_px + px(18), py(PREVIEW_TOP + 12), [235, 240, 250]);
+    }
+    let hint_size = ((16.0 * sy).round() as u32).clamp(8, 160);
+    if let Some(label) = preview::fit_label(preview::hint_text(st.cn), hint_size, ((14.0 * sy).round() as u32).max(8), pw(TEXT_RIGHT - TEXT_X)) {
+        blit_hi(s, &label, px(TEXT_X), py(PREVIEW_TOP + 42), [148, 184, 214]);
+    }
+    let quote_size = ((20.0 * sy).round() as u32).clamp(8, 180);
+    let lines = preview::quote_labels(&st.preview.line, quote_size, pw(TEXT_RIGHT - TEXT_X));
+    let mut y = py(PREVIEW_TOP + 70);
+    for (i, label) in lines.iter().take(2).enumerate() {
+        blit_hi(s, label, px(TEXT_X), y, if i == 0 { [238, 244, 252] } else { [206, 222, 240] });
+        y += label.h as i32 + ph(4) as i32;
+    }
+}
+
+fn blit_hi(s: &mut Surface, label: &Label, x: i32, y: i32, tint: [u8; 3]) {
+    let mut rgba = label.rgba.clone();
+    for p in rgba.chunks_exact_mut(4) { p[0] = tint[0]; p[1] = tint[1]; p[2] = tint[2]; }
+    s.blit_rgba(&rgba, label.w, label.h, x, y);
 }
 
 // ---------------------------------------------------------------- colours ---
@@ -927,6 +1004,7 @@ mod tests {
             preview,
             headers: &[],
             filter: None,
+            cn: true,
         }
     }
 

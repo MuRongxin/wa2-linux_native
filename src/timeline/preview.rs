@@ -186,7 +186,7 @@ fn strip_tags(s: &str) -> String {
 
 /// Rasterize a single line, stepping down to `min_size` and finally
 /// ellipsizing so it never runs into the minimap.
-fn fit_label(text: &str, size: u32, min_size: u32, max_w: u32) -> Option<Label> {
+pub(super) fn fit_label(text: &str, size: u32, min_size: u32, max_w: u32) -> Option<Label> {
     for s in [size, min_size] {
         if render::text::with_ui_font(s, |f| f.measure(text) + 8 <= max_w as i32).unwrap_or(false) {
             return label(text, s);
@@ -200,7 +200,7 @@ fn fit_label(text: &str, size: u32, min_size: u32, max_w: u32) -> Option<Label> 
 }
 
 /// Operation hint text for the active language mode.
-fn hint_text(cn: bool) -> &'static str {
+pub(super) fn hint_text(cn: bool) -> &'static str {
     if cn {
         HINT_TEXT_CN
     } else {
@@ -211,7 +211,7 @@ fn hint_text(cn: bool) -> &'static str {
 /// Wrap the quote into at most two vector lines that fit `max_w`, rasterizing
 /// each into a coverage label. The second line ends in an ellipsis when the
 /// text does not fit.
-fn quote_labels(text: &str, size: u32, max_w: u32) -> Vec<Label> {
+pub(super) fn quote_labels(text: &str, size: u32, max_w: u32) -> Vec<Label> {
     if text.trim().is_empty() {
         return Vec::new();
     }
