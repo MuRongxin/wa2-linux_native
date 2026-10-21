@@ -5928,7 +5928,7 @@ fn browse_novels(
                 crate::play_ui(mixer, ui, UiSe::Confirm);
                 return Some(ids[sel].to_string());
             }
-            sdl2::Input::Pointer { x, y, pressed: true } => {
+            sdl2::Input::Pointer { x, y, pressed } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 for i in 0..2 {
                     let y0 = Y0 + i as i32 * PITCH;
@@ -5937,8 +5937,11 @@ fn browse_novels(
                             sel = i;
                             crate::play_ui(mixer, ui, UiSe::Move);
                         }
-                        crate::play_ui(mixer, ui, UiSe::Confirm);
-                        return Some(ids[sel].to_string());
+                        if pressed {
+                            crate::play_ui(mixer, ui, UiSe::Confirm);
+                            return Some(ids[sel].to_string());
+                        }
+                        break;
                     }
                 }
             }
