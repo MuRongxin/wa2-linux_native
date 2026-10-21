@@ -542,7 +542,7 @@ impl Sdl {
                         && matches!(
                             out,
                             Input::None
-                                | Input::Pointer { .. }
+                                | Input::Pointer { pressed: false, .. }
                                 | Input::Drag { .. }
                                 | Input::Release { .. }
                         )
