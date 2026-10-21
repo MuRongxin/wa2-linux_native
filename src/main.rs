@@ -7179,16 +7179,7 @@ impl TitleSnow {
     }
 
     fn paint(&self, frame: &mut render::Surface, wh: i32) {
-        // At fullscreen sizes the source flakes are scaled with the window;
-        // drawing all 400 every frame can take longer than a mouse-motion
-        // interval and makes title-menu hover feel sticky. Keep the dense
-        // original layer at 720p, and sample it more sparsely as the output
-        // grows. The positions and animation remain unchanged.
-        let stride = if wh >= 1800 { 3 } else if wh >= 1000 { 2 } else { 1 };
-        for (i, flake) in self.flakes.iter().enumerate() {
-            if i % stride != 0 {
-                continue;
-            }
+        for flake in &self.flakes {
             let Some(sp) = self.sprites.get(flake.kind) else { continue };
             let x = (flake.x * wh as f32 / 720.0).round() as i32 - sp.width as i32 / 2;
             let y = (flake.y * wh as f32 / 720.0).round() as i32 - sp.height as i32 / 2;
@@ -7324,6 +7315,7 @@ fn run_title(
     // can be stopped on the way out of every path.
     let picked: TitleAction;
     let mut sel = 0usize;
+    let mut pointer_hover = false;
     let mut notice: Option<&str> = None;
     let mut bar_y = item_y(0);
     let mut flash_until = std::time::Instant::now();
@@ -7345,17 +7337,20 @@ fn run_title(
         } else {
             match win.poll_input() {
                 sdl2::Input::Up => {
+                    pointer_hover = false;
                     sel = (sel + N - 1) % N;
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
                     play_ui(mixer, Some(&ui), UiSe::Move);
                 }
                 sdl2::Input::Down => {
+                    pointer_hover = false;
                     sel = (sel + 1) % N;
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
                     play_ui(mixer, Some(&ui), UiSe::Move);
                 }
                 sdl2::Input::Advance | sdl2::Input::Right => confirm = true,
                 sdl2::Input::Choice(k) => {
+                    pointer_hover = false;
                     sel = ((k as usize).saturating_sub(1)).min(N - 1);
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
                     confirm = true;
@@ -7373,6 +7368,7 @@ fn run_title(
                         let iy = Y0 + *i as i32 * PITCH;
                         sx >= X0 && sx < X0 + ITEM_W && sy >= iy && sy < iy + ITEM_H
                     }) {
+                        pointer_hover = true;
                         if i != sel {
                             sel = i;
                             flash_until =
@@ -7487,7 +7483,12 @@ fn run_title(
             clone_surf(&fitted.plate)
         };
         // Bar under the labels: the glyphs are drawn on top of the oval.
-        paint_bar(&mut frame, fitted, if flashing { 1 } else { 0 }, bar_y, X0);
+        // The original selection bar remains for keyboard navigation. Mouse
+        // hover keeps the label highlight but omits the heavy background bar,
+        // which avoids a laggy full-screen hover plate over the animated snow.
+        if !pointer_hover {
+            paint_bar(&mut frame, fitted, if flashing { 1 } else { 0 }, bar_y, X0);
+        }
         draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
         if notice.is_some() {
             if let Some((rw, rh, rgba)) = note_img.as_ref() {
