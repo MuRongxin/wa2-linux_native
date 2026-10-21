@@ -744,9 +744,9 @@ const PAGE2: &[Hot] = &[
     // 翻页时中断语音: the left button is 「中断」= 1.
     hot(458, 302, 252, 36, Act::Opt("page_voice", 1), 3),
     hot(714, 302, 252, 36, Act::Opt("page_voice", 0), 3),
-    // H 场景时播放语音: 「全部」= 2, 「仅限女性角色」= 1.
-    hot(458, 342, 252, 36, Act::Opt("ero_voice", 2), 4),
-    hot(714, 342, 252, 36, Act::Opt("ero_voice", 1), 4),
+    // H 场景时播放语音: 「全部」= 1, 「仅限女性角色」= 2.
+    hot(458, 342, 252, 36, Act::Opt("ero_voice", 1), 4),
+    hot(714, 342, 252, 36, Act::Opt("ero_voice", 2), 4),
 ];
 
 /// Page 3 has ten identical rows; built at run time because each one names a
@@ -4176,6 +4176,18 @@ pub fn apply(st: &Settings, mx: Option<&crate::audio::mixer::Mixer>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h_scene_voice_buttons_match_the_engine_rule_values() {
+        let hots: Vec<_> = PAGE2
+            .iter()
+            .filter_map(|h| match h.act {
+                Act::Opt("ero_voice", value) => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hots, vec![1, 2], "全部 must map to all voices and female-only to the filtered mode");
+    }
 
     /// The three font keys have to survive a save/load round trip, and an id
     /// that is not in the catalogue must fall back to the default rather than
