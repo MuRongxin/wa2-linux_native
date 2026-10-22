@@ -22,7 +22,6 @@ const RTLD_NOW: c_int = 2;
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
-const SDL_WINDOW_RESIZABLE: u32 = 0x0000_0020;
 /// Borderless window the size of the desktop. Exclusive fullscreen (flag 1)
 /// asks the display to switch to 1280×720, which the compositor ignores, so
 /// the 「全屏」 setting never changed the window.
@@ -265,7 +264,11 @@ impl Sdl {
             SDL_WINDOWPOS_CENTERED,
             tw as c_int,
             th as c_int,
-            SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE,
+            // Keep a normal title bar for close/minimise, but do not mark the
+            // window resizable. SDL/most window managers derive the maximize
+            // button from this flag; fullscreen is deliberately controlled by
+            // the in-game display-mode setting (or F11) instead.
+            SDL_WINDOW_SHOWN,
         );
         if window.is_null() {
             return None;
