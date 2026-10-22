@@ -5602,11 +5602,13 @@ fn browse_cg(
                 let ch = (CELL_H * wh / H).max(1);
                 match thumbs.get(stem) {
                     Some(Some(img)) => {
-                        // The 16:9 preview keeps its shape inside the 5:3 cell.
-                        let dh = (cw * img.height / img.width.max(1)).min(ch);
-                        let inset = ((ch - dh) / 2) as i32;
+                        // CGs are not all 16:9. Fit the source into the cell
+                        // in both axes so portrait CGs keep their real shape.
+                        let (dw, dh) = cg::fit_size(img.width, img.height, cw, ch);
+                        let dx = cx + ((cw - dw) / 2) as i32;
+                        let dy = cy + ((ch - dh) / 2) as i32;
                         frame.blit_region_scaled(img, 0, 0, img.width, img.height,
-                            cx, cy + inset, cw, dh, 255);
+                            dx, dy, dw, dh, 255);
                     }
                     Some(None) => {
                         frame.fill_rect(cx, cy, cw, ch, [16, 32, 48, 255]);
@@ -5805,15 +5807,42 @@ fn view_cg(
         let wh = wh.max(1) as u32;
         let mut frame = render::Surface::new(ww, wh, [0, 0, 0, 255]);
         if let Some(ref im) = img {
-            let vw = im.width as f32 / z;
-            let vh = im.height as f32 / z;
-            let (cx, cy) = centre.unwrap_or((im.width as f32 / 2.0, im.height as f32 / 2.0));
-            let sx = (cx - vw / 2.0).clamp(0.0, (im.width as f32 - vw).max(0.0));
-            let sy = (cy - vh / 2.0).clamp(0.0, (im.height as f32 - vh).max(0.0));
-            // Area-averaging while shrinking means the window shows the same
-            // crop whatever the source resolution behind it is.
-            frame.blit_region_scaled(im, sx as i32, sy as i32, vw.max(1.0) as u32, vh.max(1.0) as u32,
-                0, 0, ww, wh, 255);
+            if z == 1.0 {
+                // The overview zoom shows the entire picture. Portrait CGs
+                // are letterboxed instead of being squeezed into 16:9.
+                let (dw, dh) = cg::fit_size(im.width, im.height, ww, wh);
+                frame.blit_region_scaled(
+                    im,
+                    0,
+                    0,
+                    im.width,
+                    im.height,
+                    ((ww - dw) / 2) as i32,
+                    ((wh - dh) / 2) as i32,
+                    dw,
+                    dh,
+                    255,
+                );
+            } else {
+                let (vw, vh) = cg_view_crop(im, ww, wh, z);
+                let (cx, cy) = centre.unwrap_or((im.width as f32 / 2.0, im.height as f32 / 2.0));
+                let sx = (cx - vw / 2.0).clamp(0.0, (im.width as f32 - vw).max(0.0));
+                let sy = (cy - vh / 2.0).clamp(0.0, (im.height as f32 - vh).max(0.0));
+                // The crop and the window have the same aspect ratio, so this
+                // scale fills the screen without distorting the source.
+                frame.blit_region_scaled(
+                    im,
+                    sx as i32,
+                    sy as i32,
+                    vw.max(1.0) as u32,
+                    vh.max(1.0) as u32,
+                    0,
+                    0,
+                    ww,
+                    wh,
+                    255,
+                );
+            }
             let scale = if z == 1.0 {
                 String::from(if cn { "全图" } else { "全体" })
             } else {
@@ -5855,15 +5884,15 @@ fn view_cg(
                 zoom = next;
                 play_ui(mixer, ui, UiSe::Move);
             }
-            sdl2::Input::Up => pan_by(&mut centre, img.as_ref(), 0.0, -PAN_STEP, z),
-            sdl2::Input::Down => pan_by(&mut centre, img.as_ref(), 0.0, PAN_STEP, z),
+            sdl2::Input::Up => pan_by(&mut centre, img.as_ref(), 0.0, -PAN_STEP, z, ww, wh),
+            sdl2::Input::Down => pan_by(&mut centre, img.as_ref(), 0.0, PAN_STEP, z, ww, wh),
             // Dragging pulls the picture along with the cursor.
             sdl2::Input::Drag { x, y } => {
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 if let Some((px, py)) = last {
                     pan_by(&mut centre, img.as_ref(),
                         -(sx - px) as f32 / W as f32,
-                        -(sy - py) as f32 / H as f32, z);
+                        -(sy - py) as f32 / H as f32, z, ww, wh);
                 }
                 last = Some((sx, sy));
             }
@@ -5887,6 +5916,24 @@ fn step_zoom(zoom: usize, up: bool) -> usize {
     }
 }
 
+/// Source rectangle shown by a zoomed CG. At zoom 1 the caller fits the whole
+/// image separately; higher zoom levels use a crop matching the window ratio,
+/// which is essential for portrait CGs.
+fn cg_view_crop(im: &codec::tga::TgaImage, ww: u32, wh: u32, zoom: f32) -> (f32, f32) {
+    let aspect = ww.max(1) as f32 / wh.max(1) as f32;
+    let mut vw = (im.width as f32 / zoom.max(1.0)).clamp(1.0, im.width as f32);
+    let mut vh = vw / aspect;
+    if vh > im.height as f32 {
+        vh = im.height as f32;
+        vw = (vh * aspect).min(im.width as f32);
+    }
+    if vw > im.width as f32 {
+        vw = im.width as f32;
+        vh = (vw / aspect).min(im.height as f32);
+    }
+    (vw.max(1.0), vh.max(1.0))
+}
+
 /// Move the view centre by a fraction of the visible area, keeping it inside
 /// the picture so no empty band shows. Fractions keep every caller independent
 /// of how large the decoded source behind the window happens to be.
@@ -5896,10 +5943,11 @@ fn pan_by(
     fx: f32,
     fy: f32,
     zoom: f32,
+    ww: u32,
+    wh: u32,
 ) {
     let Some(im) = img else { return };
-    let vw = im.width as f32 / zoom;
-    let vh = im.height as f32 / zoom;
+    let (vw, vh) = cg_view_crop(im, ww, wh, zoom);
     let (cx, cy) = centre.unwrap_or((im.width as f32 / 2.0, im.height as f32 / 2.0));
     let nx = (cx + fx * vw).clamp(vw / 2.0, (im.width as f32 - vw / 2.0).max(vw / 2.0));
     let ny = (cy + fy * vh).clamp(vh / 2.0, (im.height as f32 - vh / 2.0).max(vh / 2.0));

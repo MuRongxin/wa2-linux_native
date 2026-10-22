@@ -163,7 +163,8 @@ fn shrink(img: &TgaImage, w: u32, h: u32) -> TgaImage {
     s.thumbnail(w, h)
 }
 
-fn fit_size(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+/// Fit an image inside a destination box without changing its aspect ratio.
+pub fn fit_size(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     let max_w = max_w.max(1);
     let max_h = max_h.max(1);
     if width == 0 || height == 0 {
@@ -275,6 +276,7 @@ mod tests {
     fn preview_box_keeps_a_cg_16_9_shape() {
         assert_eq!(fit_size(1280, 720, 480, 288), (480, 270));
         assert_eq!(fit_size(1280, 720, 720, 432), (720, 405));
+        assert_eq!(fit_size(1280, 3362, 240, 144), (54, 144));
     }
 }
 
