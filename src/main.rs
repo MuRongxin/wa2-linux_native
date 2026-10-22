@@ -686,7 +686,7 @@ fn main() {
                         vm::lscr::Event::SpriteExit { char_id, frames } =>
                             println!("  [spr-] char={} frames={}", char_id, frames),
                         vm::lscr::Event::SpriteFocus { char_id } => println!("  [fo-c] {}", char_id),
-                        vm::lscr::Event::Window { mode } => println!("  [win ] mode={}", mode),
+                        vm::lscr::Event::EnvTint { preset } => println!("  [amb ] preset={}", preset),
                         vm::lscr::Event::Choice { options } => {
                             let pick = seq.get(seq_i).copied().unwrap_or(1);
                             seq_i += 1;
@@ -1200,6 +1200,39 @@ fn load_tint(dirs: &[&std::path::Path], name: &str) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// The colour curve actually in force: an explicit ACT172 filter wins over
+/// the per-background `.amp` override, which wins over the ACT170 preset.
+fn effective_tint_name(
+    filter: &Option<String>,
+    ambient_override: &Option<String>,
+    ambient_preset: &Option<String>,
+) -> Option<String> {
+    filter
+        .clone()
+        .or_else(|| ambient_override.clone())
+        .or_else(|| ambient_preset.clone())
+}
+
+/// Decode the effective curve, logging what happened (the old inline logs).
+fn load_tint_logged(dirs: &[&std::path::Path], name: &Option<String>) -> Option<Vec<u8>> {
+    match name.as_deref() {
+        None => {
+            eprintln!("  tint: <none>");
+            None
+        }
+        Some(n) => match load_tint(dirs, n) {
+            Some(lut) => {
+                eprintln!("  tint: {} ({} bytes)", n, lut.len());
+                Some(lut)
+            }
+            None => {
+                eprintln!("  tint: {} NOT FOUND", n);
+                None
+            }
+        },
+    }
 }
 
 /// Build a solid-color fallback background image.
@@ -1935,11 +1968,17 @@ fn run_game_at(
     let mut slots: [Option<ActiveSprite>; SPRITE_SLOTS] = Default::default();
     // Active `.AMP` colour curve (sepia flashbacks, negative, ...).
     let mut tint: Option<Vec<u8>> = None;
+    // Ambient light: the ACT170 preset, plus the per-background `.amp`
+    // override while that background is on screen. An explicit ACT172
+    // filter wins over both.
+    let mut ambient_preset: Option<String> = None;
+    let mut ambient_override: Option<String> = None;
+    let mut filter: Option<String> = None;
     let mut focus: Option<u32> = None;
-    // 「ウィンドウ一時消去」. The button and the script (ACT170) are separate:
-    // fast-forward must not light the button or fold the box the player left open.
+    // 「ウィンドウ一時消去」. Only the player's button folds the box: ACT170
+    // turned out to be an ambient light preset, not a window switch, so
+    // fast-forward no longer has to keep a script-side open flag.
     let mut user_hide = false;
-    let mut script_open = true;
     let mut window = true;
     let mut line_no: u32 = 0;
     // ACT176 plates living on top of the background until the next scene.
@@ -2007,7 +2046,12 @@ fn run_game_at(
                 );
             }
         }
+        // The save stores the effective curve. Until the script says
+        // otherwise it stands in for the ambient preset: the original keeps
+        // one global for the light, and only ACT170, ACT172 or a background
+        // override replaces it.
         tint_name = snap.tint.clone();
+        ambient_preset = snap.tint.clone();
         if let Some(name) = snap.tint.as_deref() {
             tint = load_tint(&s.bg_dirs(), name);
         }
@@ -2068,7 +2112,6 @@ fn run_game_at(
                 &last_text,
                 &last_speaker,
                 bgm_track.map(|(id, _)| id),
-                script_open,
                 &plates,
                 None,
             ),
@@ -2193,12 +2236,9 @@ fn run_game_at(
                     }
                     last_speaker = speaker.clone();
                     last_text = body.clone();
-                    // A spoken line opens the box again. ACT170(0) only hides
-                    // it across the scene change that came before this line.
-                    if !user_hide {
-                        script_open = true;
-                    }
-                    window = dialog_open(user_hide, script_open, cmd_skip);
+                    // The box only follows the player's hide button now;
+                    // ACT170 is an ambient light preset, not a window switch.
+                    window = dialog_open(user_hide);
                     line_no += 1;
                     let cast = slots
                         .iter()
@@ -2388,24 +2428,14 @@ fn run_game_at(
                     focus = Some(char_id);
                 }
                 vm::lscr::Event::Tint { name } => {
-                    // Colour filter only - the background stays as it is.
-                    tint_name = if name.is_empty() { None } else { Some(name.clone()) };
-                    tint = if name.is_empty() {
-                        eprintln!("  tint: <none>");
-                        None
-                    } else {
-                        let dirs = s.bg_dirs();
-                        match load_tint(&dirs, &name) {
-                            Some(lut) => {
-                                eprintln!("  tint: {} ({} bytes)", name, lut.len());
-                                Some(lut)
-                            }
-                            None => {
-                                eprintln!("  tint: {} NOT FOUND", name);
-                                None
-                            }
-                        }
-                    };
+                    // Explicit colour filter (sepia flashbacks, negative) -
+                    // the background stays as it is. It wins over the ambient
+                    // light until the next ACT172.
+                    filter = if name.is_empty() { None } else { Some(name.clone()) };
+                    let dirs = s.bg_dirs();
+                    let effective = effective_tint_name(&filter, &ambient_override, &ambient_preset);
+                    tint_name = effective.clone();
+                    tint = load_tint_logged(&dirs, &effective);
                     cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     win.present(&cur_surf);
                 }
@@ -2447,6 +2477,18 @@ fn run_game_at(
                                 "scene {} | bg {} id={} var={} fade={}f",
                                 current_id, name, id, variant, frames
                             );
+                            // Per-background ambient override: the original
+                            // looks for `b{ID:04}{variant:02}.amp` when the
+                            // background loads and prefers it over the ACT170
+                            // preset while that picture is on screen. Without
+                            // a file the preset stands.
+                            let ov = format!("b{:04}{:02}.amp", id, variant);
+                            if load_tint(&s.bg_dirs(), &ov).is_some() {
+                                eprintln!("  ambient: bg override {}", ov);
+                                ambient_override = Some(ov);
+                            } else {
+                                ambient_override = None;
+                            }
                         } else {
                             eprintln!(
                                 "scene {} | bg id={} var={} file {} FAILED to decode, screen stays {}",
@@ -2461,6 +2503,12 @@ fn run_game_at(
                     }
                     line_base = None;
                     line_done = true;
+                    // The override probe may have changed the effective curve.
+                    let effective = effective_tint_name(&filter, &ambient_override, &ambient_preset);
+                    if tint_name != effective {
+                        tint_name = effective.clone();
+                        tint = load_tint_logged(&s.bg_dirs(), &effective);
+                    }
                     cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                         return Ok(None);
@@ -2524,30 +2572,29 @@ fn run_game_at(
                         eprintln!("  overlay: slot {} {} NOT FOUND", slot, name);
                     }
                 }
-                vm::lscr::Event::Window { mode } => {
-                    // 0 closes the box for a scene change, 1 opens it again.
-                    // Skip is reading the lines, so a scene-change close must
-                    // not fold the box or light the hide button.
-                    if mode == 0 || mode == 1 {
-                        if cmd_skip {
-                            eprintln!(
-                                "scene {} | window mode {} ignored while skipping",
-                                current_id, mode
-                            );
-                        } else {
-                            script_open = mode == 1;
-                            window = dialog_open(user_hide, script_open, false);
-                            eprintln!(
-                                "scene {} | window {}",
-                                current_id,
-                                if script_open { "open" } else { "closed by script" }
-                            );
-                            line_base = None;
-                            line_done = true;
-                            cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
-                            win.present(&cur_surf);
-                        }
-                    }
+                vm::lscr::Event::EnvTint { preset } => {
+                    // Ambient light preset. The original executable's table
+                    // (0x4be328) maps 0..3 to none / evening / night / indoor;
+                    // the message window is not involved.
+                    let name = match preset.clamp(0, 3) {
+                        1 => Some("evening.amp"),
+                        2 => Some("night.amp"),
+                        3 => Some("indoor.amp"),
+                        _ => None,
+                    };
+                    eprintln!("  ambient: preset {} ({})", preset, name.unwrap_or("<none>"));
+                    ambient_preset = name.map(|n| n.to_string());
+                    // The preset takes the screen back even where a background
+                    // override was in force.
+                    ambient_override = None;
+                    let dirs = s.bg_dirs();
+                    let effective = effective_tint_name(&filter, &ambient_override, &ambient_preset);
+                    tint_name = effective.clone();
+                    tint = load_tint_logged(&dirs, &effective);
+                    line_base = None;
+                    line_done = true;
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                    win.present(&cur_surf);
                 }
                 vm::lscr::Event::WaitFrames(n) => {
                     // Scripted pause (camera holds, fades). Skip mode does not
@@ -2563,7 +2610,7 @@ fn run_game_at(
                                     let (sx, sy) = win.surface_pos(x, y, W, H);
                                     if bar.hit(sx, sy) == Some(cmdbar::Cmd::Skip) {
                                         cmd_skip = true;
-                                        window = dialog_open(user_hide, script_open, true);
+                                        window = dialog_open(user_hide);
                                     }
                                 }
                                 _ => {}
@@ -2783,7 +2830,9 @@ fn run_game_at(
                                             &mut plates,
                                             &mut last_text,
                                             &mut last_speaker,
-                                            &mut script_open,
+                                            &mut ambient_preset,
+                                            &mut ambient_override,
+                                            &mut filter,
                                             user_hide,
                                             &mut window,
                                             &settings,
@@ -2882,7 +2931,7 @@ fn run_game_at(
                                 sdl2::Input::Quit => return Ok(None),
                                 sdl2::Input::RightClick => {
                                     user_hide = !user_hide;
-                                    window = dialog_open(user_hide, script_open, cmd_skip);
+                                    window = dialog_open(user_hide);
                                     base = draw_scene(
                                         &bg,
                                         &last_text,
@@ -2910,7 +2959,7 @@ fn run_game_at(
                                     let (sx, sy) = win.surface_pos(x, y, W, H);
                                     if cmd_skip && pressed {
                                         cmd_skip = false;
-                                        window = dialog_open(user_hide, script_open, false);
+                                        window = dialog_open(user_hide);
                                         continue;
                                     }
                                     // Command bar takes priority over the choices.
@@ -2941,7 +2990,7 @@ fn run_game_at(
                                                         cmd_rewind = false;
                                                         rewind_left = 0;
                                                     }
-                                                    window = dialog_open(user_hide, script_open, cmd_skip);
+                                                    window = dialog_open(user_hide);
                                                     if let Some(mx) = mixer.as_ref() {
                                                         if cmd_skip {
                                                             stop_voice(mx, &mut voice_stream);
@@ -2952,7 +3001,7 @@ fn run_game_at(
                                                 },
                                                 cmdbar::Cmd::Hide => {
                                                     user_hide = !user_hide;
-                                                    window = dialog_open(user_hide, script_open, cmd_skip);
+                                                    window = dialog_open(user_hide);
                                                     line_base = None;
                                                     line_done = true;
                                                     cur_surf = draw_scene(
@@ -3023,10 +3072,12 @@ fn run_game_at(
                                                             line_no = 0;
                                                             history.clear();
                                                             user_hide = false;
-                                                            script_open = true;
                                                             window = true;
                                                             tint = None;
                                                             tint_name = None;
+                                                            ambient_preset = None;
+                                                            ambient_override = None;
+                                                            filter = None;
                                                             bg = solid_bg(W, H, [0, 0, 0]);
                                                             bg_scale = None;
                                                             bg_src_scale = None;
@@ -3157,7 +3208,6 @@ fn run_game_at(
                             &last_text,
                             &last_speaker,
                             bgm_track.map(|(id, _)| id),
-                            script_open,
                             &plates,
                             line_voice,
                         ),
@@ -3227,7 +3277,9 @@ fn run_game_at(
                                             &mut plates,
                                             &mut last_text,
                                             &mut last_speaker,
-                                            &mut script_open,
+                                            &mut ambient_preset,
+                                            &mut ambient_override,
+                                            &mut filter,
                                             user_hide,
                                             &mut window,
                                             &settings,
@@ -3395,7 +3447,7 @@ fn run_game_at(
                                     // unpredictable and differed from the
                                     // command-bar Hide button.
                                     user_hide = !user_hide;
-                                    window = dialog_open(user_hide, script_open, cmd_skip);
+                                    window = dialog_open(user_hide);
                                     line_base = None;
                                     line_done = true;
                                     cur_surf = draw_scene(
@@ -3425,7 +3477,7 @@ fn run_game_at(
                                     // second click to leave skip.
                                     if cmd_skip && pressed {
                                         cmd_skip = false;
-                                        window = dialog_open(user_hide, script_open, false);
+                                        window = dialog_open(user_hide);
                                         if let Some(mx) = mixer.as_ref() {
                                             if let (Some(cue), Some(vi)) = (skipped_voice.take(), voices.as_ref()) {
                                                 play_voice(mx, vi, &settings, &mut voice_stream, cue, &current_id);
@@ -3447,7 +3499,7 @@ fn run_game_at(
                                                 if cmd_rewind {
                                                     cmd_skip = false;
                                                     cmd_auto = false;
-                                                    window = dialog_open(user_hide, script_open, false);
+                                                    window = dialog_open(user_hide);
                                                     continue 'wait;
                                                 }
                                                 rewind_left = 0;
@@ -3458,7 +3510,7 @@ fn run_game_at(
                                                     cmd_rewind = false;
                                                     rewind_left = 0;
                                                 }
-                                                window = dialog_open(user_hide, script_open, cmd_skip);
+                                                window = dialog_open(user_hide);
                                                 if let Some(mx) = mixer.as_ref() {
                                                     if cmd_skip {
                                                         stop_voice(mx, &mut voice_stream);
@@ -3469,7 +3521,7 @@ fn run_game_at(
                                             },
                                             cmdbar::Cmd::Hide => {
                                                 user_hide = !user_hide;
-                                                window = dialog_open(user_hide, script_open, cmd_skip);
+                                                window = dialog_open(user_hide);
                                                 line_base = None;
                                                 line_done = true;
                                                 cur_surf = draw_scene(
@@ -3540,10 +3592,12 @@ fn run_game_at(
                                                         line_no = 0;
                                                         history.clear();
                                                         user_hide = false;
-                                                        script_open = true;
                                                         window = true;
                                                         tint = None;
                                                         tint_name = None;
+                                                        ambient_preset = None;
+                                                        ambient_override = None;
+                                                        filter = None;
                                                         bg = solid_bg(W, H, [0, 0, 0]);
                                                         bg_scale = None;
                                                         bg_src_scale = None;
@@ -3721,7 +3775,6 @@ struct LineSnap {
     text: String,
     speaker: Option<String>,
     bgm: Option<i32>,
-    script_open: bool,
     plates: Vec<(u32, String)>,
     voice: Option<vm::lscr::VoiceCue>,
 }
@@ -3748,7 +3801,6 @@ fn capture_line(
     text: &str,
     speaker: &Option<String>,
     bgm: Option<i32>,
-    script_open: bool,
     plates: &[Plate],
     voice: Option<vm::lscr::VoiceCue>,
 ) -> LineSnap {
@@ -3764,7 +3816,6 @@ fn capture_line(
         text: text.to_string(),
         speaker: speaker.clone(),
         bgm,
-        script_open,
         plates: plate_keys(plates),
         voice,
     }
@@ -3828,7 +3879,9 @@ fn rewind_step(
     plates: &mut Vec<Plate>,
     last_text: &mut String,
     last_speaker: &mut Option<String>,
-    script_open: &mut bool,
+    ambient_preset: &mut Option<String>,
+    ambient_override: &mut Option<String>,
+    filter: &mut Option<String>,
     user_hide: bool,
     window: &mut bool,
     settings: &menu::Settings,
@@ -3870,6 +3923,11 @@ fn rewind_step(
         *tint_name = dest.tint_name.clone();
         *tint = dest.tint_name.as_deref().and_then(|n| load_tint(&s.bg_dirs(), n));
     }
+    // The snapshot only keeps the effective name; treat it as the ambient
+    // preset so a later background override or ACT170 replaces it cleanly.
+    *ambient_preset = dest.tint_name.clone();
+    *ambient_override = None;
+    *filter = None;
     if slot_keys(slots) != dest.slots {
         *slots = Default::default();
         for (i, entry) in dest.slots.iter().enumerate() {
@@ -3901,10 +3959,9 @@ fn rewind_step(
     *focus = dest.focus;
     *last_text = dest.text.clone();
     *last_speaker = dest.speaker.clone();
-    *script_open = dest.script_open;
-    // Keep the message box up, the way skip does, so the function buttons
-    // stay on the window instead of vanishing into the picture.
-    *window = dialog_open(user_hide, *script_open, true);
+    // Keep the message box up, so the function buttons stay on the window
+    // instead of vanishing into the picture.
+    *window = dialog_open(user_hide);
     *line_voice = dest.voice;
     *line_base = None;
     *line_done = true;
@@ -4921,11 +4978,10 @@ fn cmd_idle(settings: &menu::Settings) -> u8 {
     (settings.alpha_command.clamp(0, menu::LEVELS) as u32 * 100 / menu::LEVELS as u32) as u8
 }
 
-/// The box is up when the player has not hidden it, and either the script
-/// has it open or skip is running. Skip keeps the lines on screen; the hide
-/// button only follows the player's own toggle.
-fn dialog_open(user_hide: bool, script_open: bool, skipping: bool) -> bool {
-    !user_hide && (script_open || skipping)
+/// The box is up unless the player hid it. The script no longer folds it:
+/// ACT170 turned out to be an ambient light preset, not a window switch.
+fn dialog_open(user_hide: bool) -> bool {
+    !user_hide
 }
 
 fn clone_surf(s: &render::Surface) -> render::Surface {
@@ -8497,5 +8553,61 @@ mod font_sync_tests {
         assert!(game_font_is_stale(true, 1234, 0));
         assert!(!game_font_is_stale(true, 1234, 1234));
         assert!(!game_font_is_stale(false, 0, 1234));
+    }
+}
+
+/// ACT170 (ambient light) and ACT172 (explicit filter) share one curve slot.
+/// The 86 scenes that use both keep their filter behaviour only if the
+/// explicit filter wins; the per-background `.amp` override outranks the
+/// preset but not the filter.
+#[cfg(test)]
+mod ambient_tint_tests {
+    use super::effective_tint_name;
+
+    fn s(name: &str) -> Option<String> {
+        Some(name.to_string())
+    }
+
+    #[test]
+    fn nothing_set_means_no_tint() {
+        assert_eq!(effective_tint_name(&None, &None, &None), None);
+    }
+
+    #[test]
+    fn the_preset_stands_alone() {
+        assert_eq!(
+            effective_tint_name(&None, &None, &s("night.amp")),
+            s("night.amp")
+        );
+    }
+
+    #[test]
+    fn the_background_override_outranks_the_preset() {
+        assert_eq!(
+            effective_tint_name(&None, &s("b205001.amp"), &s("night.amp")),
+            s("b205001.amp")
+        );
+    }
+
+    #[test]
+    fn the_explicit_filter_outranks_everything() {
+        assert_eq!(
+            effective_tint_name(&s("sepia.AMP"), &s("b205001.amp"), &s("night.amp")),
+            s("sepia.AMP")
+        );
+        assert_eq!(
+            effective_tint_name(&s("sepia.AMP"), &None, &s("night.amp")),
+            s("sepia.AMP")
+        );
+    }
+
+    /// ACT172 with an empty token clears the filter, so the ambient light
+    /// shows through again.
+    #[test]
+    fn clearing_the_filter_falls_back_to_the_ambient_light() {
+        assert_eq!(
+            effective_tint_name(&None, &s("b202501.amp"), &None),
+            s("b202501.amp")
+        );
     }
 }

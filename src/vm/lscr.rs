@@ -290,9 +290,13 @@ pub enum Event {
     SpriteExit { char_id: u32, frames: u32 },
     /// A character is now speaking (keep bright, dim the others).
     SpriteFocus { char_id: u32 },
-    /// ACT170. 0 hides the message window (scene change), 1 opens it again.
-    /// 2 and 3 show up around BGM changes and are left alone.
-    Window { mode: i32 },
+    /// ACT170: ambient light tint preset. 0 clears it, 1 evening, 2 night,
+    /// 3 indoor. The original executable's handler (dispatch table 0x4c25c0,
+    /// index 62 -> 0x4555a0) reads the record's first int into a global; the
+    /// renderer then picks the colour curve from the preset table at 0x4be328
+    /// ([0] none, [1] "evening.amp", [2] "night.amp", [3] "indoor.amp"). It
+    /// has nothing to do with the message window.
+    EnvTint { preset: i32 },
     /// Present a choice; call `set_choice_result` with 1..=options.len().
     Choice { options: Vec<String> },
     /// Wait for the player to advance.
@@ -874,8 +878,10 @@ impl<'a> Interp<'a> {
                 None
             }
             170 => {
-                let mode = self.ints.first().copied().unwrap_or(1);
-                Some(Event::Window { mode })
+                // Ambient light preset. The corpus carries exactly one int
+                // per call and only ever uses {0, 1, 2, 3}.
+                let preset = self.ints.first().copied().unwrap_or(0);
+                Some(Event::EnvTint { preset })
             }
             156 => {
                 // Leave. The first int is the character id, not a slot — the
@@ -1009,6 +1015,28 @@ mod global_vm_tests {
         match it.next_event() {
             Event::Text { text, .. } => assert_eq!(text, "false"),
             other => panic!("expected false branch text, got {other:?}"),
+        }
+    }
+
+    /// ACT170 is the ambient light preset (0 none / 1 evening / 2 night /
+    /// 3 indoor), not a message-window switch: the record's first int is
+    /// carried straight through.
+    #[test]
+    fn act170_emits_the_ambient_preset() {
+        for preset in [0, 1, 2, 3] {
+            let p = program(vec![
+                Op::Rec { off: 0, kind: 0 },
+                Op::Int { off: 8, v: preset },
+                Op::Act { off: 16, id: 170 },
+                Op::Rec { off: 24, kind: 0 },
+                Op::Return { off: 32 },
+            ]);
+            let mut g = globals(1);
+            let mut it = Interp::new(&p, &mut g);
+            match it.next_event() {
+                Event::EnvTint { preset: got } => assert_eq!(got, preset),
+                other => panic!("expected EnvTint({preset}), got {other:?}"),
+            }
         }
     }
 }
