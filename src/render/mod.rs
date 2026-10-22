@@ -758,6 +758,7 @@ pub fn render_scene_ex(
 /// which is far too much to redo for every character printed.
 pub fn compose_scene_art(
     bg: &TgaImage,
+    effect: Option<&TgaImage>,
     w: u32,
     h: u32,
     sprites: &[SpriteDraw],
@@ -784,6 +785,24 @@ pub fn compose_scene_art(
     // overlays) matches that: standing sprites used to go dark with it, which
     // made every character look unlit.
     s.dim(shade);
+
+    // ACT146/147 mode >= 0x80 selects an opaque full-screen f0NNN effect
+    // plate. It belongs between the dimmed background and the standing
+    // sprites; drawing it later would incorrectly tint or cover the cast.
+    if let Some(effect) = effect {
+        s.blit_region_scaled(
+            effect,
+            0,
+            0,
+            effect.width,
+            effect.height,
+            0,
+            0,
+            w,
+            h,
+            255,
+        );
+    }
 
     // Standing character sprites (bottom-anchored), below the dialog box.
     for sp in sprites {
@@ -865,7 +884,7 @@ pub fn render_scene_ex_art(
     overlays: &[(&TgaImage, i32, i32, u32)],
 ) -> Surface {
     let mut s = compose_scene_art(
-        bg, w, h, sprites, lut, window, plate, frame, window_alpha, shade, overlays,
+        bg, None, w, h, sprites, lut, window, plate, frame, window_alpha, shade, overlays,
     );
     draw_dialog_text(&mut s, font, text, plate.is_some(), w, h, usize::MAX);
     s
@@ -1483,8 +1502,8 @@ mod tests {
             y: 656,
             alpha: 255,
         }];
-        let undimmed = compose_scene_art(&bg, LAYOUT_W, LAYOUT_H, &draws, None, false, None, None, 255, 0, &[]);
-        let dimmed = compose_scene_art(&bg, LAYOUT_W, LAYOUT_H, &draws, None, false, None, None, 255, 90, &[]);
+        let undimmed = compose_scene_art(&bg, None, LAYOUT_W, LAYOUT_H, &draws, None, false, None, None, 255, 0, &[]);
+        let dimmed = compose_scene_art(&bg, None, LAYOUT_W, LAYOUT_H, &draws, None, false, None, None, 255, 90, &[]);
         let px = |s: &Surface, x: u32, y: u32| {
             let i = ((y * s.width + x) * 4) as usize;
             s.pixels[i]
@@ -1498,5 +1517,50 @@ mod tests {
             px(&dimmed, 640, 690),
             "the background dim must not darken the character"
         );
+    }
+
+    #[test]
+    fn effect_plate_is_between_background_and_sprites() {
+        use super::{compose_scene_art, SpriteDraw};
+        use crate::codec::tga::TgaImage;
+        let bg = TgaImage {
+            width: LAYOUT_W,
+            height: LAYOUT_H,
+            rgba: [20u8, 40, 80, 255].repeat((LAYOUT_W * LAYOUT_H) as usize),
+        };
+        let effect = TgaImage {
+            width: LAYOUT_W,
+            height: LAYOUT_H,
+            rgba: [180u8, 20, 30, 255].repeat((LAYOUT_W * LAYOUT_H) as usize),
+        };
+        let sprite = TgaImage { width: 1, height: 1, rgba: vec![250, 250, 250, 255] };
+        let draws = [SpriteDraw {
+            img: &sprite,
+            logical_w: 1,
+            logical_h: 1,
+            x: 640,
+            y: 0,
+            alpha: 255,
+        }];
+        let composed = compose_scene_art(
+            &bg,
+            Some(&effect),
+            LAYOUT_W,
+            LAYOUT_H,
+            &draws,
+            None,
+            false,
+            None,
+            None,
+            255,
+            120,
+            &[],
+        );
+        let px = |x: u32, y: u32| {
+            let i = ((y * composed.width + x) * 4) as usize;
+            [composed.pixels[i], composed.pixels[i + 1], composed.pixels[i + 2]]
+        };
+        assert_eq!(px(0, 0), [180, 20, 30]);
+        assert_eq!(px(640, 0), [250, 250, 250]);
     }
 }

@@ -7,6 +7,8 @@
 //!   scene id            which .bnr/.txt to reload
 //!   interpreter state   pc + the transient fields of `Interp`
 //!   background id       re-resolved through `BgIndex` on load
+//!   ACT146/147 mode     re-resolves the optional `f0NNN` effect plate
+//!   ACT170 preset       retained for later background override lookup
 //!   sprite file names   re-resolved through `SpriteBank` on load
 //!   tint name           re-resolved through `load_tint` on load
 //!   last line of text   the dialog box is not state, it has to be stored
@@ -58,6 +60,11 @@ pub struct SaveState {
     pub vm: InterpState,
     /// Last `BgScene`; `None` means the black screen.
     pub bg: Option<(i64, u32)>,
+    /// Raw ACT146/147 K30 mode used to restore an f0NNN effect plate.
+    pub effect_mode: i32,
+    /// ACT170 ambient preset (0..=3), needed to resolve later background
+    /// override names after loading a save.
+    pub ambient_preset: i32,
     /// Name of the active `.AMP` colour curve.
     pub tint: Option<String>,
     /// One entry per stage slot: `(char_id, file name)`.
@@ -185,6 +192,8 @@ impl SaveState {
         );
         line("bg_id", self.bg.map(|b| b.0.to_string()).unwrap_or_default());
         line("bg_variant", self.bg.map(|b| b.1.to_string()).unwrap_or_default());
+        line("effect_mode", self.effect_mode.to_string());
+        line("ambient_preset", self.ambient_preset.to_string());
         line("tint", self.tint.clone().unwrap_or_default());
         for (i, s) in self.slots.iter().enumerate() {
             line(
@@ -303,6 +312,8 @@ impl SaveState {
                 condition_result: None,
             },
             bg,
+            effect_mode: num(&m, "effect_mode").unwrap_or(0),
+            ambient_preset: num(&m, "ambient_preset").unwrap_or(0),
             tint: m.get("tint").filter(|v| !v.is_empty()).cloned(),
             slots,
             focus: num(&m, "focus"),
@@ -436,6 +447,8 @@ mod tests {
                 condition_result: None,
             },
             bg: None,
+            effect_mode: 0,
+            ambient_preset: 0,
             tint: None,
             slots: vec![None; crate::SPRITE_SLOTS],
             focus: None,

@@ -669,8 +669,8 @@ fn main() {
                             let vt = voice.map(|v| format!("{}_{:04}_{:02}", v.scenario, v.line, v.char_id)).unwrap_or_default();
                             println!("  [text] speaker={:?} voice={} | {}", sp, vt, body);
                         }
-                        vm::lscr::Event::BgScene { id, variant, frames } =>
-                            println!("  [bg  ] id={} var={} frames={}", id, variant, frames),
+                        vm::lscr::Event::BgScene { id, variant, frames, mode } =>
+                            println!("  [bg  ] id={} var={} mode={} frames={}", id, variant, mode, frames),
                         vm::lscr::Event::EventCg { id, variant, frames } =>
                             println!("  [cg  ] id={} var={} frames={}", id, variant, frames),
                         vm::lscr::Event::Flash { frames, r, g, b } =>
@@ -909,6 +909,31 @@ fn load_background_asset(dirs: &[&std::path::Path], name: &str) -> Option<Loaded
     let out = load_background_asset_inner(dirs, name);
     tlog(&format!("load {name}"), t0);
     out
+}
+
+/// Resolve the full-screen effect plate selected by an ACT146/147 mode.
+/// The exe masks the high bit and formats the remaining value as `f0NNN.bmp`;
+/// the scaled WebP siblings are picked by the normal art loader.
+fn effect_name(mode: i32) -> Option<String> {
+    (mode >= 0x80).then(|| format!("f0{:03}.bmp", mode & 0x7f))
+}
+
+fn background_override_name(id: i64, variant: u32, preset: i32) -> String {
+    format!("b{:04}{}{}.amp", id, variant, preset.clamp(0, 9))
+}
+
+fn load_effect(dirs: &[&std::path::Path], mode: i32) -> Option<codec::tga::TgaImage> {
+    let name = effect_name(mode)?;
+    match load_background_asset(dirs, &name) {
+        Some(asset) => {
+            eprintln!("  effect: ACT146/147 mode {} -> {} ({}x)", mode, name, asset.src_scale);
+            Some(asset.img)
+        }
+        None => {
+            eprintln!("  effect: mode {} -> {} NOT FOUND", mode, name);
+            None
+        }
+    }
 }
 
 /// Load a scene asset and retain the scale represented by the decoded pixels.
@@ -1213,6 +1238,15 @@ fn effective_tint_name(
         .clone()
         .or_else(|| ambient_override.clone())
         .or_else(|| ambient_preset.clone())
+}
+
+fn ambient_preset_name(preset: i32) -> Option<String> {
+    match preset.clamp(0, 3) {
+        1 => Some("evening.amp".to_string()),
+        2 => Some("night.amp".to_string()),
+        3 => Some("indoor.amp".to_string()),
+        _ => None,
+    }
 }
 
 /// Decode the effective curve, logging what happened (the old inline logs).
@@ -1890,6 +1924,11 @@ fn run_game_at(
     // Black until the script sets one: WA2 opens on a black screen (the IC
     // prologue's "sepia.AMP" is a color-filter LUT, not a background image).
     let mut bg = solid_bg(W, H, [0, 0, 0]);
+    // Full-screen f0NNN effect selected by the current ACT146/147 K30 mode.
+    // It is separate from the background and survives until the next scene
+    // background command clears or replaces it.
+    let mut effect_mode: i32 = 0;
+    let mut effect: Option<codec::tga::TgaImage> = None;
     // Decode scale of the pixels in `bg`; `None` while the screen is a solid
     // colour. A fullscreen switch changes the wanted scale, which tells the
     // loop to re-decode the picture at the new one.
@@ -1972,6 +2011,7 @@ fn run_game_at(
     // override while that background is on screen. An explicit ACT172
     // filter wins over both.
     let mut ambient_preset: Option<String> = None;
+    let mut ambient_preset_id: i32 = 0;
     let mut ambient_override: Option<String> = None;
     let mut filter: Option<String> = None;
     let mut focus: Option<u32> = None;
@@ -2013,6 +2053,8 @@ fn run_game_at(
     if let Some(snap) = resume.as_ref() {
         current_id = snap.scene.clone();
         bg_id = snap.bg;
+        effect_mode = snap.effect_mode;
+        effect = load_effect(&s.bg_dirs(), effect_mode);
         if let Some((id, variant)) = snap.bg {
             if let Some(name) = s.bg_index.resolve(id, variant) {
                 if let Some(asset) = load_background_asset(&s.bg_dirs(), &name) {
@@ -2051,7 +2093,8 @@ fn run_game_at(
         // one global for the light, and only ACT170, ACT172 or a background
         // override replaces it.
         tint_name = snap.tint.clone();
-        ambient_preset = snap.tint.clone();
+        ambient_preset_id = snap.ambient_preset;
+        ambient_preset = ambient_preset_name(ambient_preset_id);
         if let Some(name) = snap.tint.as_deref() {
             tint = load_tint(&s.bg_dirs(), name);
         }
@@ -2095,7 +2138,7 @@ fn run_game_at(
                 }
             }
         }
-        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
         win.present(&cur_surf);
         eprintln!("load: scene {} at pc {}", current_id, snap.vm.pc);
         remember(
@@ -2104,6 +2147,8 @@ fn run_game_at(
                 &current_id,
                 snap.vm.clone(),
                 bg_id,
+                effect_mode,
+                ambient_preset_id,
                 bg_cg,
                 &bg_label,
                 &tint_name,
@@ -2315,10 +2360,10 @@ fn run_game_at(
                         line_base = None;
                         line_done = true;
                         reveal = body.chars().count();
-                        cur_surf = draw_scene(&bg, &body, speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                        cur_surf = draw_scene(&bg, &body, speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         win.present(&cur_surf);
                     } else {
-                        line_base = Some(draw_scene(&bg, "", speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut()));
+                        line_base = Some(draw_scene(&bg, "", speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut()));
                         reveal = 0;
                         line_done = false;
                         type_tick = 0;
@@ -2400,7 +2445,7 @@ fn run_game_at(
                         // The previous line has already been advanced past. Leave
                         // the box empty until the next line, so the old speaker's
                         // words are not left sitting on the new face.
-                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                             return Ok(None);
                         }
@@ -2418,7 +2463,7 @@ fn run_game_at(
                     if before > 0 {
                         line_base = None;
                         line_done = true;
-                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                             return Ok(None);
                         }
@@ -2436,13 +2481,15 @@ fn run_game_at(
                     let effective = effective_tint_name(&filter, &ambient_override, &ambient_preset);
                     tint_name = effective.clone();
                     tint = load_tint_logged(&dirs, &effective);
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     win.present(&cur_surf);
                 }
-                vm::lscr::Event::BgScene { id, variant, frames } => {
+                vm::lscr::Event::BgScene { id, variant, frames, mode } => {
                     // ACT146/147. id 0 and -2 are a scripted black screen.
                     // A missing file keeps the picture already on screen.
                     let old = clone_surf(&cur_surf);
+                    effect_mode = mode;
+                    effect = load_effect(&s.bg_dirs(), effect_mode);
                     if id == 0 || id == -2 {
                         plates.clear();
                         bg_cg = false;
@@ -2477,12 +2524,11 @@ fn run_game_at(
                                 "scene {} | bg {} id={} var={} fade={}f",
                                 current_id, name, id, variant, frames
                             );
-                            // Per-background ambient override: the original
-                            // looks for `b{ID:04}{variant:02}.amp` when the
-                            // background loads and prefers it over the ACT170
-                            // preset while that picture is on screen. Without
-                            // a file the preset stands.
-                            let ov = format!("b{:04}{:02}.amp", id, variant);
+                            // Per-background ambient override: the exe uses
+                            // the background id, its one-digit variant, and
+                            // the active ACT170 preset as three separate
+                            // sprintf arguments (`b{ID}{digit}{preset}.amp`).
+                            let ov = background_override_name(id, variant, ambient_preset_id);
                             if load_tint(&s.bg_dirs(), &ov).is_some() {
                                 eprintln!("  ambient: bg override {}", ov);
                                 ambient_override = Some(ov);
@@ -2509,7 +2555,7 @@ fn run_game_at(
                         tint_name = effective.clone();
                         tint = load_tint_logged(&s.bg_dirs(), &effective);
                     }
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                         return Ok(None);
                     }
@@ -2541,7 +2587,7 @@ fn run_game_at(
                     }
                     line_base = None;
                     line_done = true;
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                         return Ok(None);
                     }
@@ -2566,7 +2612,7 @@ fn run_game_at(
                         plates.push(Plate { slot, name, img: asset.img, art_scale: asset.art_scale });
                         line_base = None;
                         line_done = true;
-                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         win.present(&cur_surf);
                     } else {
                         eprintln!("  overlay: slot {} {} NOT FOUND", slot, name);
@@ -2576,14 +2622,10 @@ fn run_game_at(
                     // Ambient light preset. The original executable's table
                     // (0x4be328) maps 0..3 to none / evening / night / indoor;
                     // the message window is not involved.
-                    let name = match preset.clamp(0, 3) {
-                        1 => Some("evening.amp"),
-                        2 => Some("night.amp"),
-                        3 => Some("indoor.amp"),
-                        _ => None,
-                    };
-                    eprintln!("  ambient: preset {} ({})", preset, name.unwrap_or("<none>"));
-                    ambient_preset = name.map(|n| n.to_string());
+                    let name = ambient_preset_name(preset);
+                    eprintln!("  ambient: preset {} ({})", preset, name.as_deref().unwrap_or("<none>"));
+                    ambient_preset_id = preset.clamp(0, 3);
+                    ambient_preset = name;
                     // The preset takes the screen back even where a background
                     // override was in force.
                     ambient_override = None;
@@ -2593,7 +2635,7 @@ fn run_game_at(
                     tint = load_tint_logged(&dirs, &effective);
                     line_base = None;
                     line_done = true;
-                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::WaitFrames(n) => {
@@ -2770,6 +2812,7 @@ fn run_game_at(
                         win_size.0 as u32,
                         win_size.1 as u32,
                         tint.as_deref(),
+                        effect.as_ref(),
                         window,
                         msg_plate.as_ref(),
                         msg_frame.as_ref(),
@@ -2819,6 +2862,8 @@ fn run_game_at(
                                             vfont.as_mut(),
                                             win,
                                             &mut bg,
+                                            &mut effect,
+                                            &mut effect_mode,
                                             &mut bg_cg,
                                             &mut bg_label,
                                             &mut bg_id,
@@ -2831,6 +2876,7 @@ fn run_game_at(
                                             &mut last_text,
                                             &mut last_speaker,
                                             &mut ambient_preset,
+                                            &mut ambient_preset_id,
                                             &mut ambient_override,
                                             &mut filter,
                                             user_hide,
@@ -2942,6 +2988,7 @@ fn run_game_at(
                                         win_size.0 as u32,
                                         win_size.1 as u32,
                                         tint.as_deref(),
+                                        effect.as_ref(),
                                         window,
                                         msg_plate.as_ref(),
                                         msg_frame.as_ref(),
@@ -3014,6 +3061,7 @@ fn run_game_at(
                                                         win_size.0 as u32,
                                                         win_size.1 as u32,
                                                         tint.as_deref(),
+                                                        effect.as_ref(),
                                                         window,
                                                         msg_plate.as_ref(),
                                                         msg_frame.as_ref(),
@@ -3035,6 +3083,8 @@ fn run_game_at(
                                                         &it,
                                                         &current_id,
                                                         bg_id,
+                                                        effect_mode,
+                                                        ambient_preset_id,
                                                         &tint_name,
                                                         &slots,
                                                         focus,
@@ -3076,8 +3126,11 @@ fn run_game_at(
                                                             tint = None;
                                                             tint_name = None;
                                                             ambient_preset = None;
+                                                            ambient_preset_id = 0;
                                                             ambient_override = None;
                                                             filter = None;
+                                                            effect_mode = 0;
+                                                            effect = None;
                                                             bg = solid_bg(W, H, [0, 0, 0]);
                                                             bg_scale = None;
                                                             bg_src_scale = None;
@@ -3123,6 +3176,7 @@ fn run_game_at(
                                                                     win_size.0 as u32,
                                                                     win_size.1 as u32,
                                                                     tint.as_deref(),
+                                                                    effect.as_ref(),
                                                                     window,
                                                                     msg_plate.as_ref(),
                                                                     msg_frame.as_ref(),
@@ -3200,6 +3254,8 @@ fn run_game_at(
                             &current_id,
                             it.snapshot(),
                             bg_id,
+                            effect_mode,
+                            ambient_preset_id,
                             bg_cg,
                             &bg_label,
                             &tint_name,
@@ -3235,6 +3291,7 @@ fn run_game_at(
                                     win_size.0 as u32,
                                     win_size.1 as u32,
                                     tint.as_deref(),
+                                    effect.as_ref(),
                                     window,
                                     msg_plate.as_ref(),
                                     msg_frame.as_ref(),
@@ -3266,6 +3323,8 @@ fn run_game_at(
                                             vfont.as_mut(),
                                             win,
                                             &mut bg,
+                                            &mut effect,
+                                            &mut effect_mode,
                                             &mut bg_cg,
                                             &mut bg_label,
                                             &mut bg_id,
@@ -3278,6 +3337,7 @@ fn run_game_at(
                                             &mut last_text,
                                             &mut last_speaker,
                                             &mut ambient_preset,
+                                            &mut ambient_preset_id,
                                             &mut ambient_override,
                                             &mut filter,
                                             user_hide,
@@ -3460,6 +3520,7 @@ fn run_game_at(
                                         win_size.0 as u32,
                                         win_size.1 as u32,
                                         tint.as_deref(),
+                                        effect.as_ref(),
                                         window,
                                         msg_plate.as_ref(),
                                         msg_frame.as_ref(),
@@ -3534,6 +3595,7 @@ fn run_game_at(
                                                     win_size.0 as u32,
                                                     win_size.1 as u32,
                                                     tint.as_deref(),
+                                                    effect.as_ref(),
                                                     window,
                                                     msg_plate.as_ref(),
                                                     msg_frame.as_ref(),
@@ -3555,6 +3617,8 @@ fn run_game_at(
                                                     &it,
                                                     &current_id,
                                                     bg_id,
+                                                    effect_mode,
+                                                    ambient_preset_id,
                                                     &tint_name,
                                                     &slots,
                                                     focus,
@@ -3596,8 +3660,11 @@ fn run_game_at(
                                                         tint = None;
                                                         tint_name = None;
                                                         ambient_preset = None;
+                                                        ambient_preset_id = 0;
                                                         ambient_override = None;
                                                         filter = None;
+                                                        effect_mode = 0;
+                                                        effect = None;
                                                         bg = solid_bg(W, H, [0, 0, 0]);
                                                         bg_scale = None;
                                                         bg_src_scale = None;
@@ -3746,6 +3813,8 @@ fn run_game_at(
                     // again and made ordinary scene jumps look like a load.
                     slots = Default::default();
                     plates.clear();
+                    effect_mode = 0;
+                    effect = None;
                     line_base = None;
                     line_done = true;
                     focus = None;
@@ -3767,6 +3836,8 @@ struct LineSnap {
     scene: String,
     vm: vm::lscr::InterpState,
     bg: Option<(i64, u32)>,
+    effect_mode: i32,
+    ambient_preset: i32,
     bg_cg: bool,
     bg_label: String,
     tint_name: Option<String>,
@@ -3793,6 +3864,8 @@ fn capture_line(
     scene: &str,
     vm: vm::lscr::InterpState,
     bg: Option<(i64, u32)>,
+    effect_mode: i32,
+    ambient_preset: i32,
     bg_cg: bool,
     bg_label: &str,
     tint_name: &Option<String>,
@@ -3808,6 +3881,8 @@ fn capture_line(
         scene: scene.to_string(),
         vm,
         bg,
+        effect_mode,
+        ambient_preset,
         bg_cg,
         bg_label: bg_label.to_string(),
         tint_name: tint_name.clone(),
@@ -3868,6 +3943,8 @@ fn rewind_step(
     vfont: Option<&mut render::text::VectorFont>,
     win: &mut sdl2::Sdl,
     bg: &mut codec::tga::TgaImage,
+    effect: &mut Option<codec::tga::TgaImage>,
+    effect_mode: &mut i32,
     bg_cg: &mut bool,
     bg_label: &mut String,
     bg_id: &mut Option<(i64, u32)>,
@@ -3880,6 +3957,7 @@ fn rewind_step(
     last_text: &mut String,
     last_speaker: &mut Option<String>,
     ambient_preset: &mut Option<String>,
+    ambient_preset_id: &mut i32,
     ambient_override: &mut Option<String>,
     filter: &mut Option<String>,
     user_hide: bool,
@@ -3919,13 +3997,16 @@ fn rewind_step(
         *bg_cg = dest.bg_cg;
         *bg_label = dest.bg_label.clone();
     }
+    if *effect_mode != dest.effect_mode {
+        *effect_mode = dest.effect_mode;
+        *effect = load_effect(&s.bg_dirs(), *effect_mode);
+    }
     if tint_name != &dest.tint_name {
         *tint_name = dest.tint_name.clone();
         *tint = dest.tint_name.as_deref().and_then(|n| load_tint(&s.bg_dirs(), n));
     }
-    // The snapshot only keeps the effective name; treat it as the ambient
-    // preset so a later background override or ACT170 replaces it cleanly.
-    *ambient_preset = dest.tint_name.clone();
+    *ambient_preset_id = dest.ambient_preset;
+    *ambient_preset = ambient_preset_name(*ambient_preset_id);
     *ambient_override = None;
     *filter = None;
     if slot_keys(slots) != dest.slots {
@@ -4001,6 +4082,7 @@ fn rewind_step(
         win_size.0 as u32,
         win_size.1 as u32,
         tint.as_deref(),
+        effect.as_ref(),
         *window,
         msg_plate,
         msg_frame,
@@ -4032,6 +4114,8 @@ fn make_save(
     it: &vm::lscr::Interp,
     scene: &str,
     bg: Option<(i64, u32)>,
+    effect_mode: i32,
+    ambient_preset: i32,
     tint: Option<String>,
     slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
     focus: Option<u32>,
@@ -4042,6 +4126,8 @@ fn make_save(
         scene: scene.to_string(),
         vm: it.snapshot(),
         bg,
+        effect_mode,
+        ambient_preset,
         tint,
         slots: slots
             .iter()
@@ -4254,6 +4340,8 @@ fn handle_cmd(
     it: &vm::lscr::Interp,
     current_id: &str,
     bg_id: Option<(i64, u32)>,
+    effect_mode: i32,
+    ambient_preset: i32,
     tint_name: &Option<String>,
     slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
     focus: Option<u32>,
@@ -4269,6 +4357,8 @@ fn handle_cmd(
                 it,
                 current_id,
                 bg_id,
+                effect_mode,
+                ambient_preset,
                 tint_name.clone(),
                 slots,
                 focus,
@@ -4317,6 +4407,8 @@ fn handle_cmd(
                 it,
                 current_id,
                 bg_id,
+                effect_mode,
+                ambient_preset,
                 tint_name.clone(),
                 slots,
                 focus,
@@ -5177,7 +5269,7 @@ fn sprite_x_for(idx: usize, count: usize, w: u32) -> i32 {
 ///
 /// Advancing the text used to stretch the background, blend the sprites, apply
 /// the colour filter and stamp the message window again for every line. Only a
-/// stage change (background, sprite, overlay, filter, window size) really needs
+/// stage change (background, f0 effect, sprite, overlay, filter, window size) really needs
 /// that work; printing a line only has to repaint the text on a copy.
 struct SceneLayer {
     key: u64,
@@ -5200,6 +5292,7 @@ fn hash_u64(state: &mut u64, value: u64) {
 
 fn scene_art_key(
     bg: &codec::tga::TgaImage,
+    effect: Option<&codec::tga::TgaImage>,
     draws: &[render::SpriteDraw],
     tint: Option<&[u8]>,
     window: bool,
@@ -5213,6 +5306,9 @@ fn scene_art_key(
     let mut key = 0xcbf2_9ce4_8422_2325u64;
     hash_u64(&mut key, bg.rgba.as_ptr() as usize as u64);
     hash_u64(&mut key, bg.width as u64);
+    hash_u64(&mut key, effect.map(|e| e.rgba.as_ptr() as usize as u64).unwrap_or(0));
+    hash_u64(&mut key, effect.map(|e| e.width as u64).unwrap_or(0));
+    hash_u64(&mut key, effect.map(|e| e.height as u64).unwrap_or(0));
     for sp in draws {
         hash_u64(&mut key, sp.img.rgba.as_ptr() as usize as u64);
         hash_u64(&mut key, sp.logical_w as u64);
@@ -5243,6 +5339,7 @@ fn scene_art_key(
 #[allow(clippy::too_many_arguments)]
 fn scene_art(
     bg: &codec::tga::TgaImage,
+    effect: Option<&codec::tga::TgaImage>,
     draws: &[render::SpriteDraw],
     tint: Option<&[u8]>,
     window: bool,
@@ -5264,7 +5361,7 @@ fn scene_art(
         }
     }
     let surf = render::compose_scene_art(
-        bg, w, h, draws, tint, window, plate, frame, look.alpha, look.shade, overlays,
+        bg, effect, w, h, draws, tint, window, plate, frame, look.alpha, look.shade, overlays,
     );
     *store = Some(SceneLayer { key, w, h, surf: clone_surf(&surf) });
     surf
@@ -5283,6 +5380,7 @@ fn draw_scene(
     out_w: u32,
     out_h: u32,
     tint: Option<&[u8]>,
+    effect: Option<&codec::tga::TgaImage>,
     // 「ウィンドウ一時消去」: false hides the dialog box and its text.
     window: bool,
     plate: Option<&codec::tga::TgaImage>,
@@ -5334,11 +5432,11 @@ fn draw_scene(
     let render_w = if hires { out_w } else { render::LAYOUT_W };
     let render_h = if hires { out_h } else { render::LAYOUT_H };
     let key = scene_art_key(
-        bg, &draws, tint, window, plate, frame, &look, &overlays, render_w, render_h,
+        bg, effect, &draws, tint, window, plate, frame, &look, &overlays, render_w, render_h,
     );
     let t_art = std::time::Instant::now();
     let mut s = scene_art(
-        bg, &draws, tint, window, plate, frame, &look, &overlays, render_w, render_h, key,
+        bg, effect, &draws, tint, window, plate, frame, &look, &overlays, render_w, render_h, key,
     );
     tlog("scene art", t_art);
     // The bitmap atlas stamps its glyphs onto this layer; the vector path
@@ -8562,7 +8660,7 @@ mod font_sync_tests {
 /// preset but not the filter.
 #[cfg(test)]
 mod ambient_tint_tests {
-    use super::effective_tint_name;
+    use super::{ambient_preset_name, background_override_name, effect_name, effective_tint_name};
 
     fn s(name: &str) -> Option<String> {
         Some(name.to_string())
@@ -8609,5 +8707,21 @@ mod ambient_tint_tests {
             effective_tint_name(&None, &s("b202501.amp"), &None),
             s("b202501.amp")
         );
+    }
+
+    #[test]
+    fn background_override_uses_variant_and_preset_as_separate_digits() {
+        assert_eq!(background_override_name(2025, 0, 1), "b202501.amp");
+        assert_eq!(background_override_name(2025, 1, 1), "b202511.amp");
+        assert_eq!(background_override_name(2096, 1, 1), "b209611.amp");
+        assert_eq!(background_override_name(2, 0, 0), "b000200.amp");
+    }
+
+    #[test]
+    fn high_bit_background_modes_select_f0_effects() {
+        assert_eq!(effect_name(0x80).as_deref(), Some("f0000.bmp"));
+        assert_eq!(effect_name(0xA1).as_deref(), Some("f0033.bmp"));
+        assert_eq!(effect_name(1), None);
+        assert_eq!(ambient_preset_name(3).as_deref(), Some("indoor.amp"));
     }
 }

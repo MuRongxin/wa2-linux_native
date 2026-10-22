@@ -245,8 +245,10 @@ pub enum Event {
     /// The record is `K30/K23 vals=(mode, id, variant, frames, 0, 0, 0,
     /// 1280.0, 720.0)`; the image is `b{id:04}{variant:02}.tga` with a
     /// `b{id:04}*` fallback. `id == 0` or `-2` means a black screen.
-    /// `frames` is the transition length at 60 fps.
-    BgScene { id: i64, variant: u32, frames: u32 },
+    /// `frames` is the transition length at 60 fps. The raw `mode` is kept
+    /// only for K30 records: values >= 0x80 select the full-screen `f0NNN`
+    /// effect plate, while structural K23 records use zero.
+    BgScene { id: i64, variant: u32, frames: u32, mode: i32 },
     /// Event CG (ACT148), and a layer of one (ACT201 with the layer turned on).
     ///
     /// Same record shape as a background, but the exe's mode-1 path formats
@@ -792,10 +794,13 @@ impl<'a> Interp<'a> {
                 // Scene background: (mode, id, variant, frames, 0, 0, 0, w, h).
                 // 146 and 147 differ only in transition style.
                 if self.ints.len() >= 4 {
+                    // K23 carries the structural bootstrap record; only K30's
+                    // first integer is the effect mode used by the exe.
+                    let mode = if self.rec_kind == 30 { self.ints[0] } else { 0 };
                     let id = self.ints[1] as i64;
                     let variant = self.ints[2].max(0) as u32;
                     let frames = self.ints[3].max(0) as u32;
-                    return Some(Event::BgScene { id, variant, frames });
+                    return Some(Event::BgScene { id, variant, frames, mode });
                 }
                 None
             }
@@ -1036,6 +1041,31 @@ mod global_vm_tests {
             match it.next_event() {
                 Event::EnvTint { preset: got } => assert_eq!(got, preset),
                 other => panic!("expected EnvTint({preset}), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn background_mode_is_forwarded_only_from_k30() {
+        for kind in [30, 23] {
+            let p = program(vec![
+                Op::Rec { off: 0, kind },
+                Op::Int { off: 8, v: 0xA1 },
+                Op::Int { off: 20, v: 2025 },
+                Op::Int { off: 32, v: 1 },
+                Op::Int { off: 44, v: 60 },
+                Op::Act { off: 56, id: 146 },
+                Op::Rec { off: 64, kind: 0 },
+                Op::Return { off: 72 },
+            ]);
+            let mut g = globals(1);
+            let mut it = Interp::new(&p, &mut g);
+            match it.next_event() {
+                Event::BgScene { id, variant, frames, mode } => {
+                    assert_eq!((id, variant, frames), (2025, 1, 60));
+                    assert_eq!(mode, if kind == 30 { 0xA1 } else { 0 });
+                }
+                other => panic!("expected BgScene, got {other:?}"),
             }
         }
     }
