@@ -272,10 +272,11 @@ pub enum Event {
     /// op, and treating its empty token as "clear the background" wiped the
     /// background every time a scene dropped its tint.
     Tint { name: String },
-    /// ACT171 updates the two background-image blend channels used by the
-    /// original scene compositor. `channel=0` writes both channels;
-    /// `channel=1` and `channel=2` write one channel.
-    BgBlend { value: i32, channel: i32 },
+    /// ACT171 updates the two in-game message-window alpha channels used by
+    /// the original compositor. `channel=0` writes both channels;
+    /// `channel=1` writes the novel window and `channel=2` the visual/CG
+    /// window. Values are kept raw because the exe accepts a 32-bit field.
+    WindowAlpha { value: i32, channel: i32 },
     /// Play a movie (token like `mv01`).
     Movie { name: String },
     /// Load/switch a character's standing sprite. The file name is
@@ -903,7 +904,7 @@ impl<'a> Interp<'a> {
                 // integer fields respectively (absent fields default to 0).
                 let value = self.ints.first().copied().unwrap_or(0);
                 let channel = self.ints.get(1).copied().unwrap_or(0);
-                Some(Event::BgBlend { value, channel })
+                Some(Event::WindowAlpha { value, channel })
             }
             156 => {
                 // Leave. The first int is the character id, not a slot — the
@@ -1075,8 +1076,8 @@ mod global_vm_tests {
         let mut g = globals(1);
         let mut it = Interp::new(&p, &mut g);
         match it.next_event() {
-            Event::BgBlend { value, channel } => assert_eq!((value, channel), (255, 0)),
-            other => panic!("expected BgBlend, got {other:?}"),
+            Event::WindowAlpha { value, channel } => assert_eq!((value, channel), (255, 0)),
+            other => panic!("expected WindowAlpha, got {other:?}"),
         }
     }
 

@@ -680,8 +680,8 @@ fn main() {
                         vm::lscr::Event::Sound { opcode, args } =>
                             println!("  [sound] ACT{} {:?}", opcode, args),
                         vm::lscr::Event::Tint { name } => println!("  [tint] {}", if name.is_empty() { "<none>" } else { &name }),
-                        vm::lscr::Event::BgBlend { value, channel } =>
-                            println!("  [blend] value={} channel={}", value, channel),
+                        vm::lscr::Event::WindowAlpha { value, channel } =>
+                            println!("  [win-alpha] value={} channel={}", value, channel),
                         vm::lscr::Event::Movie { name } => println!("  [mv  ] {}", name),
                         vm::lscr::Event::Sprite { char_id, series, variant, slot, frames, kind } =>
                             println!("  [spr ] {:?} char={} series={} variant={} slot={} frames={}", kind, char_id, series, variant, slot, frames),
@@ -1894,6 +1894,9 @@ fn run_game_at(
 ) -> Result<Option<save::SaveState>, String> {
     set_render_art_scale(win);
     let mut resume = resume;
+    if resume.is_none() {
+        reset_script_window_alpha();
+    }
     let script_dir = s.script_dir.as_path();
     let bg_dirs = s.bg_dirs();
     let ui = UiSound::resolve(&bg_dirs);
@@ -1931,10 +1934,6 @@ fn run_game_at(
     // background command clears or replaces it.
     let mut effect_mode: i32 = 0;
     let mut effect: Option<codec::tga::TgaImage> = None;
-    // ACT171's two background transition blend channels. They are retained
-    // even while the current renderer presents a completed scene directly;
-    // the values are needed when a timed cross-fade is enabled.
-    let mut bg_blend = [255i32, 255i32];
     // Decode scale of the pixels in `bg`; `None` while the screen is a solid
     // colour. A fullscreen switch changes the wanted scale, which tells the
     // loop to re-decode the picture at the new one.
@@ -2469,7 +2468,7 @@ fn run_game_at(
                     if before > 0 {
                         line_base = None;
                         line_done = true;
-                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                             return Ok(None);
                         }
@@ -2618,7 +2617,7 @@ fn run_game_at(
                         plates.push(Plate { slot, name, img: asset.img, art_scale: asset.art_scale });
                         line_base = None;
                         line_done = true;
-                        cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                         win.present(&cur_surf);
                     } else {
                         eprintln!("  overlay: slot {} {} NOT FOUND", slot, name);
@@ -2644,17 +2643,20 @@ fn run_game_at(
                     cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     win.present(&cur_surf);
                 }
-                vm::lscr::Event::BgBlend { value, channel } => {
-                    match channel {
-                        0 => bg_blend = [value, value],
-                        1 => bg_blend[0] = value,
-                        2 => bg_blend[1] = value,
-                        other => eprintln!("  blend: ACT171 ignored unsupported channel {} value={}", other, value),
+                vm::lscr::Event::WindowAlpha { value, channel } => {
+                    if matches!(channel, 0 | 1 | 2) {
+                        set_script_window_alpha(value, channel);
+                        eprintln!(
+                            "  window: ACT171 alpha={} channel={} (novel/visual override)",
+                            value.clamp(0, 255), channel
+                        );
+                        line_base = None;
+                        line_done = true;
+                        cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                        win.present(&cur_surf);
+                    } else {
+                        eprintln!("  window: ACT171 ignored unsupported channel {} value={}", channel, value);
                     }
-                    eprintln!(
-                        "  blend: ACT171 value={} channel={} -> background channels [{}, {}]",
-                        value, channel, bg_blend[0], bg_blend[1]
-                    );
                 }
                 vm::lscr::Event::WaitFrames(n) => {
                     // Scripted pause (camera holds, fades). Skip mode does not
@@ -5068,12 +5070,44 @@ struct Look {
     shade: u8,
 }
 
+/// Runtime ACT171 overrides for the two message-window roles. The setting
+/// page supplies the normal values; a script can temporarily force either
+/// role to an exact 0..=255 alpha and the next scene redraw uses it.
+fn script_window_alpha_store() -> &'static std::sync::Mutex<[Option<u8>; 2]> {
+    static STORE: std::sync::OnceLock<std::sync::Mutex<[Option<u8>; 2]>> = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new([None, None]))
+}
+
+fn reset_script_window_alpha() {
+    if let Ok(mut state) = script_window_alpha_store().lock() {
+        *state = [None, None];
+    }
+}
+
+fn set_script_window_alpha(value: i32, channel: i32) {
+    let value = value.clamp(0, 255) as u8;
+    if let Ok(mut state) = script_window_alpha_store().lock() {
+        match channel {
+            0 => *state = [Some(value), Some(value)],
+            // 0x521910 is the novel-window value and 0x521914 is the
+            // visual/CG value in the original executable.
+            1 => state[0] = Some(value),
+            2 => state[1] = Some(value),
+            _ => {}
+        }
+    }
+}
+
 fn scene_look(settings: &menu::Settings, cg: bool) -> Look {
     let levels = menu::LEVELS as u32;
     let level = if cg { settings.alpha_cg } else { settings.alpha_novel };
     let level = level.clamp(0, menu::LEVELS) as u32;
+    let script_alpha = script_window_alpha_store()
+        .lock()
+        .ok()
+        .and_then(|state| state[usize::from(cg)].or(state[0]));
     Look {
-        alpha: (level * 255 / levels) as u8,
+        alpha: script_alpha.unwrap_or((level * 255 / levels) as u8),
         // Novel text gets a mild dim so the window reads. CG stays untouched,
         // and the top of the slider (10) only reaches about a third darker.
         shade: if cg {
