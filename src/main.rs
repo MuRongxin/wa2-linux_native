@@ -1076,6 +1076,40 @@ fn stop_voice(mx: &audio::Mixer, voice_stream: &mut Option<usize>) {
     }
 }
 
+/// Stop all scene-owned audio and clear any modal-screen streams that may not
+/// have a scene slot. The latter matters when returning Home and immediately
+/// starting another game: the title/music screen and the game share one SDL
+/// mixer, so leaving an untracked BGM slot alive makes the next scene sound
+/// like another interface.
+fn stop_game_audio(
+    mixer: Option<&audio::Mixer>,
+    bgm_track: &mut Option<(i32, usize)>,
+    fading_bgm: &mut Option<usize>,
+    voice_stream: &mut Option<usize>,
+    se_channels: &mut std::collections::HashMap<i32, usize>,
+    fading_se: &mut std::collections::HashMap<i32, usize>,
+) {
+    let Some(mx) = mixer else { return };
+    stop_voice(mx, voice_stream);
+    if let Some((_, slot)) = bgm_track.take() {
+        mx.stop(slot);
+    }
+    if let Some(slot) = fading_bgm.take() {
+        mx.stop(slot);
+    }
+    for slot in se_channels.drain().map(|(_, slot)| slot) {
+        mx.stop(slot);
+    }
+    for slot in fading_se.drain().map(|(_, slot)| slot) {
+        mx.stop(slot);
+    }
+    // Catch title/music streams whose owner was already dropped or whose slot
+    // was never copied into the scene's bookkeeping.
+    mx.stop_category(audio::mixer::CAT_BGM);
+    mx.stop_category(audio::mixer::CAT_SE);
+    mx.stop_category(audio::mixer::CAT_VOICE);
+}
+
 /// Scenario ids listed by the original sample-play table (`9999.bnr`).
 /// The table is deliberately explicit: ordinary scenes must never inherit the
 /// H-scene voice rule just because they happen to show an event CG.
@@ -1879,6 +1913,21 @@ fn run_game_at(
     // exactly this reason.
     let mut fading_se = std::collections::HashMap::<i32, usize>::new();
 
+    // The normal data-tree game has no command-line BGM. Clear any stream a
+    // title, music, or previous game screen left in the shared mixer before
+    // the first script event is interpreted. The explicit legacy CLI keeps
+    // its caller-provided BGM untouched.
+    if s.bgm.is_none() {
+        if let Some(mx) = mixer.as_ref() {
+            mx.stop_category(audio::mixer::CAT_BGM);
+            mx.stop_category(audio::mixer::CAT_SE);
+            mx.stop_category(audio::mixer::CAT_VOICE);
+            if std::env::var_os("WA2_DEBUG_AUDIO").is_some() {
+                eprintln!("  audio: cleared interface streams before scene {}", current_id);
+            }
+        }
+    }
+
     let mut cur_surf = render::render_scene(&bg, "", font, W, H);
     let mut bank = &mut rt.bank;
     // Standing sprites live in numbered stage slots (K16's first value): slot 0
@@ -2182,23 +2231,12 @@ fn run_game_at(
                         }
                         _ => bg_label.clone(),
                     };
+                    let bgm_tag = bgm_track
+                        .map(|(id, _)| id.to_string())
+                        .unwrap_or_else(|| "-".to_string());
                     if cn {
                         eprintln!(
-                            "scene {} | line {} | bg {} | sprites {} | focus {} | window {} | voice {}",
-                            current_id,
-                            line_no,
-                            bg_tag,
-                            cast,
-                            focus_id,
-                            if window { "open" } else { "hidden" },
-                            voice_id
-                        );
-                    } else {
-                        let who = speaker.as_deref().unwrap_or("-");
-                        let preview = body.replace('\n', " / ");
-                        let preview: String = preview.chars().take(42).collect();
-                        eprintln!(
-                            "scene {} | line {} | bg {} | sprites {} | focus {} | window {} | voice {} | {} | {}",
+                            "scene {} | line {} | bg {} | sprites {} | focus {} | window {} | voice {} | bgm {}",
                             current_id,
                             line_no,
                             bg_tag,
@@ -2206,6 +2244,22 @@ fn run_game_at(
                             focus_id,
                             if window { "open" } else { "hidden" },
                             voice_id,
+                            bgm_tag
+                        );
+                    } else {
+                        let who = speaker.as_deref().unwrap_or("-");
+                        let preview = body.replace('\n', " / ");
+                        let preview: String = preview.chars().take(42).collect();
+                        eprintln!(
+                            "scene {} | line {} | bg {} | sprites {} | focus {} | window {} | voice {} | bgm {} | {} | {}",
+                            current_id,
+                            line_no,
+                            bg_tag,
+                            cast,
+                            focus_id,
+                            if window { "open" } else { "hidden" },
+                            voice_id,
+                            bgm_tag,
                             who,
                             preview
                         );
@@ -2550,7 +2604,15 @@ fn run_game_at(
                                     } else { eprintln!("  BGM: missing track {}", id); }
                                 }
                             }
-                            159 => { if let Some((_, slot)) = bgm_track.take() { mx.fade(slot, 0.0, arg(0), true); } }
+                            159 => {
+                                let fade = arg(0);
+                                if let Some((old, slot)) = bgm_track.take() {
+                                    eprintln!("  BGM: ACT159 stop track {} fade={}f", old, fade);
+                                    mx.fade(slot, 0.0, fade, true);
+                                } else {
+                                    eprintln!("  BGM: ACT159 stop (no scene track) fade={}f", fade);
+                                }
+                            }
                             161 => { if let Some((_, slot)) = bgm_track { mx.fade(slot, volume(arg(0)), arg(1), false); } }
                             165 if arg(5) == 2 => {
                                 // Original 0x40f2d0 updates the existing decoder in mode 2.
@@ -2984,8 +3046,17 @@ fn run_game_at(
                                                             focus = None;
                                                             break 'events;
                                                         }
-                                                        CmdOutcome::Home => return Ok(None),
-                                                        CmdOutcome::Quit => return Ok(None),
+                                                        CmdOutcome::Home | CmdOutcome::Quit => {
+                                                            stop_game_audio(
+                                                                mixer.as_ref(),
+                                                                &mut bgm_track,
+                                                                &mut fading_bgm,
+                                                                &mut voice_stream,
+                                                                &mut se_channels,
+                                                                &mut fading_se,
+                                                            );
+                                                            return Ok(None);
+                                                        }
                                                         CmdOutcome::Stay => {
                                                             // F-17: the line under
                                                             // the choice rows still
@@ -3492,8 +3563,17 @@ fn run_game_at(
                                                         focus = None;
                                                         break 'events;
                                                     }
-                                                    CmdOutcome::Home => return Ok(None),
-                                                    CmdOutcome::Quit => return Ok(None),
+                                                    CmdOutcome::Home | CmdOutcome::Quit => {
+                                                        stop_game_audio(
+                                                            mixer.as_ref(),
+                                                            &mut bgm_track,
+                                                            &mut fading_bgm,
+                                                            &mut voice_stream,
+                                                            &mut se_channels,
+                                                            &mut fading_se,
+                                                        );
+                                                        return Ok(None);
+                                                    }
                                                     CmdOutcome::Stay => {
                                                         // F-17: the option screen
                                                         // may have changed the

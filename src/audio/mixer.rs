@@ -265,6 +265,25 @@ impl Mixer {
         let n = { self.inner.lock().unwrap().streams.len() };
         for i in 0..n { self.stop(i); }
     }
+
+    /// Stop every stream in one category, including streams owned by a modal
+    /// screen rather than by the scene interpreter. This is used at the game
+    /// boundary so title/music BGM cannot leak into the first game scene.
+    pub fn stop_category(&self, cat: usize) {
+        let mut g = self.inner.lock().unwrap();
+        for stream in g.streams.iter_mut() {
+            let matches = stream.as_ref().map(|s| s.cat == cat).unwrap_or(false);
+            if !matches {
+                continue;
+            }
+            if let Some(mut s) = stream.take() {
+                if let Some(mut child) = s.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
 }
 
 impl Drop for Mixer {
