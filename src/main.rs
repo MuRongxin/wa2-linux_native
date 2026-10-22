@@ -1474,10 +1474,22 @@ impl Session {
         } else {
             Vec::new()
         };
-        // The default source is the 4x tree; keep the 8x master next to it so
-        // fullscreen can read it. Trees the player chose explicitly (2x proxy,
-        // original TGA) are left alone.
+        // The default source is the 4x tree; keep the 2x proxy and 8x master
+        // next to it so previews can use 2x in a window and 4x in fullscreen.
+        // The scene renderer still chooses its normal 4x/8x path separately.
         if d.art_scale == 4 {
+            let bg2 = d.root.join("bg_2x");
+            let sp2 = d.root.join("sprite_2x");
+            let cn2 = d.root.join("bg_cn_2x");
+            if bg2.is_dir() {
+                bg_trees.push((2, bg2));
+                if sp2.is_dir() {
+                    sprite_trees.push((2, sp2));
+                }
+                if d.cn && cn2.is_dir() {
+                    bg_cn_trees.push((2, cn2));
+                }
+            }
             let bg8 = d.root.join("bg_8x");
             let sp8 = d.root.join("sprite_8x");
             let cn8 = d.root.join("bg_cn_8x");
@@ -5509,7 +5521,7 @@ fn play_ui_se(mixer: Option<&audio::Mixer>, path: Option<&Path>) {
 /// CG mode: a grid of thumbnails, then a zoomable full view of one picture.
 ///
 /// The grid reads the source tree selected for the current window. `cg::load_thumb`
-/// resizes 2x/4x/8x masters during decode and keeps only the current page in
+/// resizes 2x/4x masters during decode and keeps only the current page in
 /// memory, so the fullscreen grid never enlarges the original 256x144 `tv*`
 /// copies or leaves a disk cache behind.
 fn browse_cg(
@@ -5537,42 +5549,55 @@ fn browse_cg(
     eprintln!("cg: {} images, {} pages", stems.len(), pages);
     let mut sel = 0usize;
     let mut debug_page = usize::MAX;
-    let mut thumbs: std::collections::HashMap<String, Option<codec::tga::TgaImage>> =
+    let mut thumbs: std::collections::HashMap<String, Option<std::sync::Arc<codec::tga::TgaImage>>> =
         std::collections::HashMap::new();
     let mut page_loader: Option<cg::PageLoader> = None;
     let mut thumb_page = usize::MAX;
     let mut thumb_box = (0u32, 0u32);
+    let mut thumb_source_scale = 0u32;
     loop {
         let page = sel / cg::PER_PAGE;
         let (ww, wh) = win.window_size();
         let ww = ww.max(1) as u32;
         let wh = wh.max(1) as u32;
-        let preview_w = (CELL_W.saturating_mul(ww) / W)
-            .max(1)
-            .saturating_mul(cg::PREVIEW_SCALE);
-        let preview_h = (CELL_H.saturating_mul(wh) / H)
-            .max(1)
-            .saturating_mul(cg::PREVIEW_SCALE);
-        if page != thumb_page || thumb_box != (preview_w, preview_h) {
+        let (preview_w, preview_h) = cg::preview_box(ww, wh);
+        let preview_scale = if win.is_fullscreen() || win.is_maximized() { 4 } else { 2 };
+        let preview_dirs = cg::preview_dirs(dirs, preview_scale);
+        if page != thumb_page
+            || thumb_box != (preview_w, preview_h)
+            || thumb_source_scale != preview_scale
+        {
             thumbs.clear();
             drop(page_loader.take());
             thumb_page = page;
             thumb_box = (preview_w, preview_h);
+            thumb_source_scale = preview_scale;
             let first = page * cg::PER_PAGE;
             let last = (first + cg::PER_PAGE).min(stems.len());
+            let page_stems: Vec<String> = stems[first..last]
+                .iter()
+                .filter_map(|stem| {
+                    if let Some(img) = cg::peek_thumb(&preview_dirs, stem, preview_w, preview_h) {
+                        thumbs.insert(stem.clone(), Some(img));
+                        None
+                    } else {
+                        Some(stem.clone())
+                    }
+                })
+                .collect();
             page_loader = cg::start_page_loader(
-                dirs,
-                &stems[first..last],
+                &preview_dirs,
+                &page_stems,
                 preview_w,
                 preview_h,
             );
             if page_loader.is_none() {
                 // Thread creation is expected to succeed, but the page must
                 // remain usable even under a very restricted process limit.
-                for stem in &stems[first..last] {
+                for stem in &page_stems {
                     thumbs.insert(
                         stem.clone(),
-                        cg::load_thumb(dirs, stem, preview_w, preview_h),
+                        cg::load_thumb(&preview_dirs, stem, preview_w, preview_h),
                     );
                 }
             }
@@ -7459,6 +7484,32 @@ fn run_title(
     }
     let mut bgm_slot = start_title_bgm(mixer, bg_dirs);
     let ui = UiSound::resolve(bg_dirs);
+    // Warm the first two CG pages while the title screen is visible. The
+    // worker stores decoded previews in cg's process-local memory cache, so
+    // entering CG can reuse completed work without a disk cache or a blocking
+    // decode on the UI thread.
+    let cg_preview_scale = if win.is_fullscreen() || win.is_maximized() { 4 } else { 2 };
+    let cg_preview_dirs = cg::preview_dirs(bg_dirs, cg_preview_scale);
+    let cg_stems = cg::cg_stems(&cg_preview_dirs);
+    let (cg_ww, cg_wh) = win.window_size();
+    let (cg_pw, cg_ph) = cg::preview_box(cg_ww.max(1) as u32, cg_wh.max(1) as u32);
+    let cg_warmup_stems: Vec<String> = cg_stems
+        .into_iter()
+        .take(cg::PER_PAGE * 2)
+        .collect();
+    let cg_warmup = cg::start_page_loader(
+        &cg_preview_dirs,
+        &cg_warmup_stems,
+        cg_pw,
+        cg_ph,
+    );
+    if std::env::var_os("WA2_DEBUG_CG").is_some() && cg_warmup.is_some() {
+        eprintln!(
+            "cg: startup warmup queued {} previews from {}x source",
+            cg_warmup_stems.len(),
+            cg_preview_scale,
+        );
+    }
 
     let item_y = |i: usize| (Y0 + i as i32 * PITCH) as f32;
     // What the player picked. Collected instead of returned so the title BGM

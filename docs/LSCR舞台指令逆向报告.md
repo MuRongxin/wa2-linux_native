@@ -243,10 +243,11 @@ Rec K16: vals=(slot, 0, [0, 15,] 256, 128) ACT154/155  ← 怎么上屏
 | `tools/cg_dedup_cluster.py` | 上面那套两遍图像聚类；`--cluster-threshold` / `--mad` 可调 |
 | `tools/tables/h_scene_cg.tsv` | 机器可读的场景 → CG 对照表 |
 
-运行时 CG 概览不使用磁盘缩略图缓存：按当前窗口的目录顺序直接读取 2x/4x/8x 事件 CG，
-在 WebP 解码阶段缩到显示单元两倍尺寸，只把当前页的 20 张预览保存在内存中，离开页面
-或翻页时释放。不再使用原版 256×144 的 `tv*` 小图。旧的 `data/cache/cg_thumbs` 与
-`data/cache/cg_thumbs_v2` 都是历史派生缓存，删除不影响功能。`tools/cg_dedup_cluster.py`
+运行时 CG 概览不使用磁盘缩略图缓存：窗口读取 2x、全屏读取 4x 事件 CG，在解码阶段
+缩到显示单元两倍尺寸。游戏启动后后台预热前两页，完成的预览放在进程内存中；进入 CG
+或翻页时优先复用，当前页仍按需后台补齐，离开页面后不写盘。不再使用原版 256×144 的
+`tv*` 小图。旧的 `data/cache/cg_thumbs` 与 `data/cache/cg_thumbs_v2` 都是历史派生缓存，
+删除不影响功能。`tools/cg_dedup_cluster.py`
 使用的灰度 `.npy` 缓存仍独立放在旧目录，不参与运行时显示。
 
 ### 12.5 顺带可做

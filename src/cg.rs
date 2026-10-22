@@ -4,20 +4,20 @@
 //! pieces (`_bg`, `_chr`, `_chreff`, ...) are parts of one picture, not pictures
 //! of their own, so they are dropped.
 //!
-//! The directory order supplied by the session selects the source tree for
-//! the current window: 4x in a normal window, 8x when fullscreen, or the
-//! explicitly selected 2x proxy. WebP is resized inside the decoder to twice
-//! the displayed cell size, while TGA is reduced with the renderer's area
-//! filter. The original `tv{number}.tga` files are deliberately never used:
-//! they are only 256x144 and become visibly soft on a fullscreen grid.
+//! The overview selects a 2x source in a normal window and a 4x source when
+//! fullscreen; the full CG view may still use the session's 8x art. WebP is
+//! resized inside the decoder to twice the displayed cell size, while TGA is
+//! reduced with the renderer's area filter. The original `tv{number}.tga`
+//! files are deliberately never used: they are only 256x144 and become
+//! visibly soft on a fullscreen grid.
 
 use crate::codec::image;
 use crate::codec::tga::TgaImage;
 use crate::render::Surface;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 /// Grid shape. Five 240px cells plus the gaps fill the 1280px layout exactly.
 pub const COLS: usize = 5;
@@ -28,6 +28,31 @@ pub const PER_PAGE: usize = COLS * ROWS;
 /// are supplied by the browser because the window can be resized while this
 /// screen is open.
 pub const PREVIEW_SCALE: u32 = 2;
+
+/// The logical grid cell is 240x144. Decode at two source pixels per output
+/// pixel so a resize or fullscreen presentation still has clean detail.
+pub fn preview_box(window_w: u32, window_h: u32) -> (u32, u32) {
+    (
+        (240u32.saturating_mul(window_w.max(1)) / 1280)
+            .max(1)
+            .saturating_mul(PREVIEW_SCALE),
+        (144u32.saturating_mul(window_h.max(1)) / 720)
+            .max(1)
+            .saturating_mul(PREVIEW_SCALE),
+    )
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct PreviewKey {
+    source: PathBuf,
+    max_w: u32,
+    max_h: u32,
+}
+
+fn preview_cache() -> &'static Mutex<HashMap<PreviewKey, Arc<TgaImage>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PreviewKey, Arc<TgaImage>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Parts of a single composed picture, listed as separate files in the trees.
 /// Every suffix the trees actually ship: these are the parts one composed CG
@@ -62,12 +87,55 @@ pub fn cg_stems(dirs: &[&Path]) -> Vec<String> {
     stems
 }
 
+/// Select preview source trees without ever asking the CG overview to decode
+/// the 8x master. Windowed previews use 2x when present; fullscreen previews
+/// use 4x. If an exact tree is missing, the nearest scaled tree wins before a
+/// 1x fallback, while the caller's language/override directory priority stays
+/// intact.
+pub fn preview_dirs<'a>(dirs: &[&'a Path], max_scale: u32) -> Vec<&'a Path> {
+    let max_scale = max_scale.max(1);
+    let mut order: Vec<(usize, u32)> = dirs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, image::dir_art_scale(p)))
+        .collect();
+    order.sort_by_key(|(i, scale)| {
+        let priority = if *scale == max_scale {
+            0
+        } else if *scale > 1 && *scale < max_scale {
+            1 + (max_scale - *scale)
+        } else if *scale > max_scale {
+            10 + (*scale - max_scale)
+        } else {
+            100
+        };
+        (priority, *i)
+    });
+    order.into_iter().map(|(i, _)| dirs[i]).collect()
+}
+
 /// Decode one CG directly from the selected art tree. The returned image is a
-/// page-local preview and is never written to disk.
-pub fn load_thumb(dirs: &[&Path], stem: &str, max_w: u32, max_h: u32) -> Option<TgaImage> {
+/// memory-cached preview and is never written to disk.
+pub fn load_thumb(dirs: &[&Path], stem: &str, max_w: u32, max_h: u32) -> Option<Arc<TgaImage>> {
     let source = picture_path(dirs, stem)?;
+    let key = PreviewKey { source: source.clone(), max_w, max_h };
+    if let Ok(cache) = preview_cache().lock() {
+        if let Some(img) = cache.get(&key) {
+            return Some(Arc::clone(img));
+        }
+    }
     let started = std::time::Instant::now();
-    let img = make_thumb(&source, max_w, max_h)?;
+    let img = Arc::new(make_thumb(&source, max_w, max_h)?);
+    if let Ok(mut cache) = preview_cache().lock() {
+        // Keep the warmup pages and a few recently visited pages without
+        // allowing a long CG browsing session to retain every page forever.
+        if cache.len() >= 64 && !cache.contains_key(&key) {
+            if let Some(old) = cache.keys().next().cloned() {
+                cache.remove(&old);
+            }
+        }
+        cache.insert(key, Arc::clone(&img));
+    }
     if debug_cg() {
         eprintln!(
             "cg: thumb {} memory={} {}x{} source={} ({}x) target={}x{} {:.1}ms",
@@ -85,17 +153,26 @@ pub fn load_thumb(dirs: &[&Path], stem: &str, max_w: u32, max_h: u32) -> Option<
     Some(img)
 }
 
+/// Look up a warmup result without decoding or spawning a worker. The CG
+/// browser uses this before starting its page loader so completed startup work
+/// appears on the very first frame.
+pub fn peek_thumb(dirs: &[&Path], stem: &str, max_w: u32, max_h: u32) -> Option<Arc<TgaImage>> {
+    let source = picture_path(dirs, stem)?;
+    let key = PreviewKey { source, max_w, max_h };
+    preview_cache().lock().ok()?.get(&key).cloned()
+}
+
 /// A single worker for the currently visible CG page. The worker owns cloned
 /// directory paths, so the UI loop stays responsive while WebP is decoded.
 /// Results are kept by the caller in a page-local map and disappear when the
 /// page changes or the browser closes.
 pub struct PageLoader {
-    rx: mpsc::Receiver<(String, Option<TgaImage>)>,
+    rx: mpsc::Receiver<(String, Option<Arc<TgaImage>>)>,
     cancel: Arc<AtomicBool>,
 }
 
 impl PageLoader {
-    pub fn poll(&self) -> Vec<(String, Option<TgaImage>)> {
+    pub fn poll(&self) -> Vec<(String, Option<Arc<TgaImage>>)> {
         self.rx.try_iter().collect()
     }
 }
@@ -106,10 +183,10 @@ impl Drop for PageLoader {
     }
 }
 
-/// Start decoding one page in the background. There is only one worker per
-/// page, intentionally: twenty concurrent dwebp processes would contend for
-/// the same CPU and make the first page feel worse. A failed thread spawn is
-/// reported to the caller so it can use the synchronous fallback.
+/// Start decoding one page in the background. Two workers keep a normal 2x
+/// page responsive while avoiding the CPU and memory spike of one process per
+/// thumbnail. A failed thread spawn is reported to the caller so it can use
+/// the synchronous fallback.
 pub fn start_page_loader(
     dirs: &[&Path],
     stems: &[String],
@@ -120,25 +197,40 @@ pub fn start_page_loader(
         return None;
     }
     let owned_dirs: Vec<PathBuf> = dirs.iter().map(|p| p.to_path_buf()).collect();
-    let jobs = stems.to_vec();
+    let jobs = Arc::new(Mutex::new(VecDeque::from(stems.to_vec())));
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    let worker_cancel = Arc::clone(&cancel);
-    let spawn = std::thread::Builder::new()
-        .name("wa2-cg-page".into())
-        .spawn(move || {
-            let refs: Vec<&Path> = owned_dirs.iter().map(|p| p.as_path()).collect();
-            for stem in jobs {
-                if worker_cancel.load(Ordering::Relaxed) {
-                    break;
+    let workers = stems.len().min(2);
+    let mut spawned = 0usize;
+    for worker_id in 0..workers {
+        let dirs = owned_dirs.clone();
+        let jobs = Arc::clone(&jobs);
+        let tx = tx.clone();
+        let cancel = Arc::clone(&cancel);
+        let spawn = std::thread::Builder::new()
+            .name(format!("wa2-cg-page-{worker_id}"))
+            .spawn(move || {
+                let refs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let stem = match jobs.lock().ok().and_then(|mut q| q.pop_front()) {
+                        Some(stem) => stem,
+                        None => break,
+                    };
+                    let img = load_thumb(&refs, &stem, max_w, max_h);
+                    if tx.send((stem, img)).is_err() {
+                        break;
+                    }
                 }
-                let img = load_thumb(&refs, &stem, max_w, max_h);
-                if tx.send((stem, img)).is_err() {
-                    break;
-                }
-            }
-        });
-    if spawn.is_err() {
+            });
+        if spawn.is_ok() {
+            spawned += 1;
+        }
+    }
+    drop(tx);
+    if spawned == 0 {
         return None;
     }
     Some(PageLoader { rx, cancel })
@@ -277,6 +369,24 @@ mod tests {
         assert_eq!(fit_size(1280, 720, 480, 288), (480, 270));
         assert_eq!(fit_size(1280, 720, 720, 432), (720, 405));
         assert_eq!(fit_size(1280, 3362, 240, 144), (54, 144));
+    }
+
+    #[test]
+    fn preview_dirs_cap_fullscreen_preview_at_4x() {
+        let dirs = [
+            Path::new("data/bg_8x"),
+            Path::new("data/bg_4x"),
+            Path::new("data/bg_2x"),
+            Path::new("data/bg"),
+        ];
+        let names = |max| {
+            preview_dirs(&dirs, max)
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(2), ["data/bg_2x", "data/bg_4x", "data/bg_8x", "data/bg"]);
+        assert_eq!(names(4), ["data/bg_4x", "data/bg_2x", "data/bg_8x", "data/bg"]);
     }
 }
 
