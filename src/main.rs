@@ -5508,9 +5508,10 @@ fn play_ui_se(mixer: Option<&audio::Mixer>, path: Option<&Path>) {
 /// screen) page through them; Esc or the right button returns to the title.
 /// CG mode: a grid of thumbnails, then a zoomable full view of one picture.
 ///
-/// The grid uses the highest-quality event CG source available. `cg::load_thumb`
-/// resizes WebP masters during decode and caches a 960x540 preview, so the
-/// fullscreen grid never enlarges the original 256x144 `tv*` copies.
+/// The grid reads the source tree selected for the current window. `cg::load_thumb`
+/// resizes 2x/4x/8x masters during decode and keeps only the current page in
+/// memory, so the fullscreen grid never enlarges the original 256x144 `tv*`
+/// copies or leaves a disk cache behind.
 fn browse_cg(
     win: &mut sdl2::Sdl,
     dirs: &[&std::path::Path],
@@ -5538,11 +5539,49 @@ fn browse_cg(
     let mut debug_page = usize::MAX;
     let mut thumbs: std::collections::HashMap<String, Option<codec::tga::TgaImage>> =
         std::collections::HashMap::new();
+    let mut page_loader: Option<cg::PageLoader> = None;
+    let mut thumb_page = usize::MAX;
+    let mut thumb_box = (0u32, 0u32);
     loop {
         let page = sel / cg::PER_PAGE;
         let (ww, wh) = win.window_size();
         let ww = ww.max(1) as u32;
         let wh = wh.max(1) as u32;
+        let preview_w = (CELL_W.saturating_mul(ww) / W)
+            .max(1)
+            .saturating_mul(cg::PREVIEW_SCALE);
+        let preview_h = (CELL_H.saturating_mul(wh) / H)
+            .max(1)
+            .saturating_mul(cg::PREVIEW_SCALE);
+        if page != thumb_page || thumb_box != (preview_w, preview_h) {
+            thumbs.clear();
+            drop(page_loader.take());
+            thumb_page = page;
+            thumb_box = (preview_w, preview_h);
+            let first = page * cg::PER_PAGE;
+            let last = (first + cg::PER_PAGE).min(stems.len());
+            page_loader = cg::start_page_loader(
+                dirs,
+                &stems[first..last],
+                preview_w,
+                preview_h,
+            );
+            if page_loader.is_none() {
+                // Thread creation is expected to succeed, but the page must
+                // remain usable even under a very restricted process limit.
+                for stem in &stems[first..last] {
+                    thumbs.insert(
+                        stem.clone(),
+                        cg::load_thumb(dirs, stem, preview_w, preview_h),
+                    );
+                }
+            }
+        }
+        if let Some(loader) = page_loader.as_ref() {
+            for (stem, img) in loader.poll() {
+                thumbs.insert(stem, img);
+            }
+        }
         let mut frame = render::Surface::new(ww, wh, [6, 14, 26, 255]);
         if std::env::var_os("WA2_DEBUG_CG").is_some() && page != debug_page {
             eprintln!("cg: grid page={} selection={} window={}x{}", page + 1, stems[sel], ww, wh);
@@ -5561,20 +5600,22 @@ fn browse_cg(
                 let cy = ly * wh as i32 / H as i32;
                 let cw = (CELL_W * ww / W).max(1);
                 let ch = (CELL_H * wh / H).max(1);
-                let entry = thumbs
-                    .entry(stem.clone())
-                    .or_insert_with(|| cg::load_thumb(dirs, stem));
-                match entry {
-                    Some(img) => {
+                match thumbs.get(stem) {
+                    Some(Some(img)) => {
                         // The 16:9 preview keeps its shape inside the 5:3 cell.
                         let dh = (cw * img.height / img.width.max(1)).min(ch);
                         let inset = ((ch - dh) / 2) as i32;
                         frame.blit_region_scaled(img, 0, 0, img.width, img.height,
                             cx, cy + inset, cw, dh, 255);
                     }
-                    None => {
+                    Some(None) => {
                         frame.fill_rect(cx, cy, cw, ch, [16, 32, 48, 255]);
                         draw_label(&mut frame, stem, 16, lx + 8, ly + 60, false, ww, wh);
+                    }
+                    None => {
+                        frame.fill_rect(cx, cy, cw, ch, [10, 24, 38, 255]);
+                        let loading = if cn { "读取中…" } else { "読み込み中…" };
+                        draw_label(&mut frame, loading, 16, lx, ly + 60, true, ww, wh);
                     }
                 }
                 if idx == sel {
