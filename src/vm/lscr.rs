@@ -272,6 +272,10 @@ pub enum Event {
     /// op, and treating its empty token as "clear the background" wiped the
     /// background every time a scene dropped its tint.
     Tint { name: String },
+    /// ACT171 updates the two background-image blend channels used by the
+    /// original scene compositor. `channel=0` writes both channels;
+    /// `channel=1` and `channel=2` write one channel.
+    BgBlend { value: i32, channel: i32 },
     /// Play a movie (token like `mv01`).
     Movie { name: String },
     /// Load/switch a character's standing sprite. The file name is
@@ -794,9 +798,13 @@ impl<'a> Interp<'a> {
                 // Scene background: (mode, id, variant, frames, 0, 0, 0, w, h).
                 // 146 and 147 differ only in transition style.
                 if self.ints.len() >= 4 {
-                    // K23 carries the structural bootstrap record; only K30's
-                    // first integer is the effect mode used by the exe.
-                    let mode = if self.rec_kind == 30 { self.ints[0] } else { 0 };
+                    // K30 and the legacy K16 wrappers both carry the same
+                    // `(mode, id, variant, frames, ...)` layout. K23 is the
+                    // structural bootstrap record and does not carry the
+                    // executable's effect mode. Dropping K16's first value
+                    // made `(2001,0,60,...)` resolve to missing `b000600` and
+                    // lose its f0 effect plate.
+                    let mode = if matches!(self.rec_kind, 16 | 30) { self.ints[0] } else { 0 };
                     let id = self.ints[1] as i64;
                     let variant = self.ints[2].max(0) as u32;
                     let frames = self.ints[3].max(0) as u32;
@@ -887,6 +895,15 @@ impl<'a> Interp<'a> {
                 // per call and only ever uses {0, 1, 2, 3}.
                 let preset = self.ints.first().copied().unwrap_or(0);
                 Some(Event::EnvTint { preset })
+            }
+            171 => {
+                // The exe wrapper reads int#1 as the value and int#6 as the
+                // channel selector, then calls 0x401880. In the decoded
+                // record representation these are the first and second
+                // integer fields respectively (absent fields default to 0).
+                let value = self.ints.first().copied().unwrap_or(0);
+                let channel = self.ints.get(1).copied().unwrap_or(0);
+                Some(Event::BgBlend { value, channel })
             }
             156 => {
                 // Leave. The first int is the character id, not a slot — the
@@ -1046,6 +1063,24 @@ mod global_vm_tests {
     }
 
     #[test]
+    fn act171_preserves_value_and_channel() {
+        let p = program(vec![
+            Op::Rec { off: 0, kind: 30 },
+            Op::Int { off: 8, v: 255 },
+            Op::Int { off: 20, v: 0 },
+            Op::Act { off: 32, id: 171 },
+            Op::Rec { off: 40, kind: 0 },
+            Op::Return { off: 48 },
+        ]);
+        let mut g = globals(1);
+        let mut it = Interp::new(&p, &mut g);
+        match it.next_event() {
+            Event::BgBlend { value, channel } => assert_eq!((value, channel), (255, 0)),
+            other => panic!("expected BgBlend, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn background_mode_is_forwarded_only_from_k30() {
         for kind in [30, 23] {
             let p = program(vec![
@@ -1067,6 +1102,33 @@ mod global_vm_tests {
                 }
                 other => panic!("expected BgScene, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn legacy_k16_background_forwards_effect_mode() {
+        let p = program(vec![
+            Op::Rec { off: 0, kind: 16 },
+            Op::Int { off: 8, v: 2001 },
+            Op::Int { off: 20, v: 0 },
+            Op::Int { off: 32, v: 60 },
+            Op::Int { off: 44, v: 0 },
+            Op::Int { off: 56, v: 0 },
+            Op::Int { off: 68, v: 0 },
+            Op::Flt { off: 80, v: 1280.0 },
+            Op::Flt { off: 92, v: 720.0 },
+            Op::Act { off: 104, id: 146 },
+            Op::Rec { off: 112, kind: 0 },
+            Op::Return { off: 120 },
+        ]);
+        let mut g = globals(1);
+        let mut it = Interp::new(&p, &mut g);
+        match it.next_event() {
+            Event::BgScene { id, variant, frames, mode } => {
+                assert_eq!((id, variant, frames), (0, 60, 0));
+                assert_eq!(mode, 2001);
+            }
+            other => panic!("expected K16 BgScene, got {other:?}"),
         }
     }
 }

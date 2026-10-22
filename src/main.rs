@@ -680,6 +680,8 @@ fn main() {
                         vm::lscr::Event::Sound { opcode, args } =>
                             println!("  [sound] ACT{} {:?}", opcode, args),
                         vm::lscr::Event::Tint { name } => println!("  [tint] {}", if name.is_empty() { "<none>" } else { &name }),
+                        vm::lscr::Event::BgBlend { value, channel } =>
+                            println!("  [blend] value={} channel={}", value, channel),
                         vm::lscr::Event::Movie { name } => println!("  [mv  ] {}", name),
                         vm::lscr::Event::Sprite { char_id, series, variant, slot, frames, kind } =>
                             println!("  [spr ] {:?} char={} series={} variant={} slot={} frames={}", kind, char_id, series, variant, slot, frames),
@@ -1929,6 +1931,10 @@ fn run_game_at(
     // background command clears or replaces it.
     let mut effect_mode: i32 = 0;
     let mut effect: Option<codec::tga::TgaImage> = None;
+    // ACT171's two background transition blend channels. They are retained
+    // even while the current renderer presents a completed scene directly;
+    // the values are needed when a timed cross-fade is enabled.
+    let mut bg_blend = [255i32, 255i32];
     // Decode scale of the pixels in `bg`; `None` while the screen is a solid
     // colour. A fullscreen switch changes the wanted scale, which tells the
     // loop to re-decode the picture at the new one.
@@ -2637,6 +2643,18 @@ fn run_game_at(
                     line_done = true;
                     cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     win.present(&cur_surf);
+                }
+                vm::lscr::Event::BgBlend { value, channel } => {
+                    match channel {
+                        0 => bg_blend = [value, value],
+                        1 => bg_blend[0] = value,
+                        2 => bg_blend[1] = value,
+                        other => eprintln!("  blend: ACT171 ignored unsupported channel {} value={}", other, value),
+                    }
+                    eprintln!(
+                        "  blend: ACT171 value={} channel={} -> background channels [{}, {}]",
+                        value, channel, bg_blend[0], bg_blend[1]
+                    );
                 }
                 vm::lscr::Event::WaitFrames(n) => {
                     // Scripted pause (camera holds, fades). Skip mode does not
