@@ -1,12 +1,5 @@
 /target
-
-# Runtime log from upscale_art.py.
-/upscale.log
-/upscale-failed.txt
-/imagex-upscale.log
-/imagex-failed.txt
-# Local cloud-upscale helper contains the user's ImageX credentials.
-/imagex_upscale.py
+/others/
 
 # Local agent notes (keep on this machine only).
 /AGENTS.md

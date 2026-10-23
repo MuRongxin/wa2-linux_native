@@ -239,15 +239,28 @@ fn main() {
                 return;
             }
             let secs: f64 = if args.len() >= 4 { args[3].parse().unwrap_or(5.0) } else { 5.0 };
+            if !std::path::Path::new(&args[2]).is_file() {
+                eprintln!("audio-test: input file not found: {}", args[2]);
+                return;
+            }
             let win = match sdl2::Sdl::new("wa2-audio", 320, 240) { Some(w) => w, None => { eprintln!("no SDL/display"); return; } };
             let mixer = match audio::Mixer::new(&win) { Some(m) => m, None => { eprintln!("audio device failed"); return; } };
             eprintln!("playing {} for {}s", args[2], secs);
-            mixer.play(&args[2], 1.0, false);
+            let slot = mixer.play(&args[2], 1.0, false);
+            if slot == usize::MAX {
+                eprintln!("audio-test: unable to decode or open {}", args[2]);
+                return;
+            }
+            let pulled_before = audio::mixer::pulled_samples();
             let t0 = std::time::Instant::now();
             while t0.elapsed().as_secs_f64() < secs {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            println!("audio-test done: driver={} pulled {} samples, queued {} bytes", sdl2::sdl_audio_driver(), audio::mixer::pulled_samples(), audio::mixer::queued_bytes());
+            let pulled = audio::mixer::pulled_samples();
+            if pulled == pulled_before {
+                eprintln!("audio-test: decoder produced no PCM for {}", args[2]);
+            }
+            println!("audio-test done: driver={} pulled {} samples, queued {} bytes", sdl2::sdl_audio_driver(), pulled, audio::mixer::queued_bytes());
         }
         "movie-test" => {
             // movie-test <mv.pak> [--audio <ogg>]
@@ -1427,12 +1440,13 @@ fn upcoming_art(
     let mut bgs: Vec<String> = Vec::new();
     let mut sprites: Vec<String> = Vec::new();
     let mut ints: Vec<i32> = Vec::new();
-    let (mut kind, mut tok_hit, mut act_hit) = (0u32, false, false);
+    let (mut tok_hit, mut act_hit) = (false, false);
     let mut pending: Option<(u32, u32, u32)> = None;
+    let mut pending_tok: Option<u32> = None;
     for (i, op) in p.ops.iter().enumerate() {
         match op {
             Op::Rec { kind: k, .. } => {
-                if kind == 30 && !tok_hit && !act_hit && ints.len() == 3 {
+                if *k == 30 && !tok_hit && !act_hit && ints.len() == 3 {
                     let cid = ints[0];
                     let variant = ints[1];
                     let flag = ints[2];
@@ -1449,21 +1463,41 @@ fn upcoming_art(
                     }
                 }
                 ints.clear();
-                kind = *k;
                 tok_hit = false;
                 act_hit = false;
+                pending_tok = None;
             }
-            Op::Tok { .. } => tok_hit = true,
+            Op::Tok { n, .. } => {
+                tok_hit = true;
+                // ACT176 stores [image name, "", directory]. The interpreter
+                // resolves the first token, so the prefetch scanner must not
+                // overwrite it with the directory token that follows.
+                if pending_tok.is_none() {
+                    pending_tok = Some(*n);
+                }
+            }
             Op::Int { v, .. } => ints.push(*v),
             Op::Act { id, .. } => {
                 act_hit = true;
                 match *id {
                     146 | 147 => {
+                        if let Some(n) = ints.first().and_then(|mode| effect_name(*mode)) {
+                            if !bgs.contains(&n) {
+                                bgs.push(n);
+                            }
+                        }
                         if ints.len() >= 4 && ints[1] > 0 {
                             if let Some(n) = bg.resolve(ints[1] as i64, ints[2].max(0) as u32) {
                                 if !bgs.contains(&n) {
                                     bgs.push(n);
                                 }
+                            }
+                        }
+                    }
+                    176 => {
+                        if let Some(tok) = pending_tok.and_then(|n| p.token(n)) {
+                            if !bgs.contains(&tok.to_string()) {
+                                bgs.push(tok.to_string());
                             }
                         }
                     }
@@ -1513,16 +1547,19 @@ fn prefetch_paths(
     sprite_dir: Option<&std::path::Path>,
     sprites: &[String],
 ) -> Vec<std::path::PathBuf> {
+    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for name in bgs.iter().take(PREFETCH_BG) {
         if let Some((p, _)) = resolve_asset_path(dirs, name).into_iter().next() {
-            out.push(p);
+            if seen.insert(p.clone()) {
+                out.push(p);
+            }
         }
     }
     if let Some(dir) = sprite_dir {
         for name in sprites.iter().take(PREFETCH_SPRITE) {
             let p = dir.join(name);
-            if p.is_file() {
+            if p.is_file() && seen.insert(p.clone()) {
                 out.push(p);
             }
         }
@@ -1706,6 +1743,57 @@ mod art_tree_tests {
         assert_eq!(names(8), ["bg_8x", "bg_4x"]);
         // A lower target takes the next larger tree, then the smaller one.
         assert_eq!(names(2), ["bg_4x", "bg_8x"]);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_scan_tests {
+    use super::{prefetch_paths, upcoming_art, BgIndex};
+    use crate::vm::lscr::{Op, Program};
+    use std::collections::HashMap;
+
+    #[test]
+    fn upcoming_art_includes_effect_and_overlay_assets() {
+        let program = Program {
+            ops: vec![
+                Op::Rec { off: 0, kind: 30 },
+                Op::Int { off: 8, v: 0xA1 },
+                Op::Int { off: 20, v: 2001 },
+                Op::Int { off: 32, v: 0 },
+                Op::Int { off: 44, v: 60 },
+                Op::Act { off: 56, id: 146 },
+                Op::Rec { off: 64, kind: 30 },
+                Op::Tok { off: 72, n: 0 },
+                Op::Tok { off: 80, n: 1 },
+                Op::Tok { off: 88, n: 2 },
+                Op::Int { off: 96, v: 0 },
+                Op::Act { off: 108, id: 176 },
+            ],
+            index: HashMap::new(),
+            labels: Vec::new(),
+            tokens: vec!["ギター.tga".to_string(), "".to_string(), "grp".to_string()],
+            entry: 0,
+        };
+        let index = BgIndex::build(&[]);
+        let (bgs, sprites) = upcoming_art(&program, &index, None);
+        assert!(bgs.iter().any(|n| n == "f0033.bmp"), "f0 effect was not queued: {bgs:?}");
+        assert!(bgs.iter().any(|n| n == "ギター.tga"), "overlay was not queued: {bgs:?}");
+        assert!(sprites.is_empty());
+    }
+
+    #[test]
+    fn prefetch_paths_deduplicates_shared_assets() {
+        let dir = std::env::temp_dir().join(format!("wa2-prefetch-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("f0033.bmp"), b"test").unwrap();
+        let paths = prefetch_paths(
+            &[dir.as_path()],
+            &["f0033.bmp".to_string(), "f0033.bmp".to_string()],
+            None,
+            &[],
+        );
+        assert_eq!(paths, vec![dir.join("f0033.bmp")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

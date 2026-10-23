@@ -1082,6 +1082,64 @@ mod global_vm_tests {
     }
 
     #[test]
+    fn sprite_enter_change_and_exit_preserve_slot_and_frames() {
+        let p = program(vec![
+            // K30 face selection followed by K16 ACT155 entrance.
+            Op::Rec { off: 0, kind: 30 },
+            Op::Int { off: 8, v: 10 },
+            Op::Int { off: 20, v: 111 },
+            Op::Int { off: 32, v: 1000 },
+            Op::Rec { off: 44, kind: 16 },
+            Op::Int { off: 52, v: 1 },
+            Op::Int { off: 64, v: 0 },
+            Op::Int { off: 76, v: 256 },
+            Op::Int { off: 88, v: 128 },
+            Op::Act { off: 100, id: 155 },
+            // Same character, new face, K16 ACT154 in the same slot.
+            Op::Rec { off: 108, kind: 30 },
+            Op::Int { off: 116, v: 10 },
+            Op::Int { off: 128, v: 103 },
+            Op::Int { off: 140, v: 1000 },
+            Op::Rec { off: 152, kind: 16 },
+            Op::Int { off: 160, v: 1 },
+            Op::Int { off: 172, v: 0 },
+            Op::Int { off: 184, v: 0 },
+            Op::Int { off: 196, v: 12 },
+            Op::Int { off: 208, v: 256 },
+            Op::Int { off: 220, v: 128 },
+            Op::Act { off: 232, id: 154 },
+            // ACT156 removes the character by ID, not by slot.
+            Op::Rec { off: 240, kind: 16 },
+            Op::Int { off: 248, v: 10 },
+            Op::Int { off: 260, v: 0 },
+            Op::Int { off: 272, v: 20 },
+            Op::Act { off: 284, id: 156 },
+            Op::Rec { off: 292, kind: 0 },
+            Op::Return { off: 300 },
+        ]);
+        let mut g = globals(1);
+        let mut it = Interp::new(&p, &mut g);
+        match it.next_event() {
+            Event::Sprite { char_id, variant, series, slot, frames, kind } => {
+                assert_eq!((char_id, variant, series, slot, frames), (10, 111, 1, 1, 15));
+                assert_eq!(kind, SpriteKind::Enter);
+            }
+            other => panic!("expected sprite entrance, got {other:?}"),
+        }
+        match it.next_event() {
+            Event::Sprite { char_id, variant, series, slot, frames, kind } => {
+                assert_eq!((char_id, variant, series, slot, frames), (10, 103, 1, 1, 12));
+                assert_eq!(kind, SpriteKind::Change);
+            }
+            other => panic!("expected sprite change, got {other:?}"),
+        }
+        match it.next_event() {
+            Event::SpriteExit { char_id, frames } => assert_eq!((char_id, frames), (10, 20)),
+            other => panic!("expected sprite exit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn background_mode_is_forwarded_only_from_k30() {
         for kind in [30, 23] {
             let p = program(vec![
