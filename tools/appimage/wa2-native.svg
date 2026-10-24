@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect x="4" y="4" width="120" height="120" rx="24" fill="#052f50"/>
+  <path d="M64 16v48M43 28l42 24M85 28L43 52M64 16l-7 9m7-9 7 9M43 28l4 11m-4-11 12-1M85 28l-12-1m12 1-4 11" fill="none" stroke="#b7e7ee" stroke-width="3" stroke-linecap="round"/>
+  <text x="64" y="103" text-anchor="middle" font-family="sans-serif" font-weight="bold" font-size="34" fill="#f7fbff">WA2</text>
+</svg>

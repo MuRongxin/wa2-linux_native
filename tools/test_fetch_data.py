@@ -355,7 +355,7 @@ class InstallTests(unittest.TestCase):
         rustc.chmod(0o755)
         env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ["PATH"],
                    WA2_DATA=str(self.root / "custom data"), WA2_DATA_PROXY="", GITHUB_TOKEN="",
-                   WA2_DATA_PROXIES="", WA2_DATA_REPO="test/game", WA2_DATA_TAG="data-v1.1.0", WA2_DATA_CACHE=str(self.cache))
+                   WA2_AUTO_INSTALL="0", WA2_DATA_PROXIES="", WA2_DATA_REPO="test/game", WA2_DATA_TAG="data-v1.1.0", WA2_DATA_CACHE=str(self.cache))
         command = ["bash", str(self.dest / "run.sh")]
         return command, env
 
@@ -404,6 +404,23 @@ class InstallTests(unittest.TestCase):
         self.assertIn("--download-only", run.stdout)
         run = subprocess.run(command + ["--unknown"], env=env, text=True, capture_output=True, timeout=15)
         self.assertEqual(run.returncode, 2)
+        self.assertEqual(self.requests, [])
+
+    def test_launcher_prefers_appimage_without_system_python(self):
+        command, env = self.launcher()
+        binary = self.dest / "bin/wa2-native-linux-x86_64.AppImage"
+        binary.parent.mkdir()
+        binary.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > launch-args\n"
+                          "printf '%s' \"$WA2_PROJECT_ROOT\" > launch-root\n")
+        binary.chmod(0o755)
+        fake_python = self.root / "fakebin/python3"
+        fake_python.write_text("#!/bin/sh\necho 'Unexpected system Python call' >&2\nexit 91\n")
+        fake_python.chmod(0o755)
+        env["WA2_BUILD_FROM_SOURCE"] = "0"
+        run = subprocess.run(command + ["1002"], cwd="/", env=env, text=True, capture_output=True, timeout=15)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual((self.dest / "launch-args").read_text(), "1002\n")
+        self.assertEqual((self.dest / "launch-root").read_text(), str(self.dest))
         self.assertEqual(self.requests, [])
 
 

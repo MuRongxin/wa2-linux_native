@@ -4,6 +4,7 @@
 import argparse
 import ctypes
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,8 @@ def check_runtime(need_build=False, verbose=False):
         elif verbose:
             print(f"  {name}: OK ({path})")
     if need_build:
+        if not shutil.which("cc"):
+            missing.append("cc（C 编译器/链接器，首次构建需要）")
         for name in ("cargo", "rustc"):
             if not shutil.which(name):
                 missing.append(f"{name}（首次构建需要 Rust 工具链）")
@@ -42,6 +45,8 @@ def check_runtime(need_build=False, verbose=False):
                 result = subprocess.run([name, "--version"], capture_output=True, text=True, timeout=10)
                 if result.returncode:
                     missing.append(f"{name}（Rust 工具链尚未安装完成或不可用）")
+                elif name == "rustc" and (match := re.search(r"rustc (\d+)\.(\d+)", result.stdout)) and tuple(map(int, match.groups())) < (1, 90):
+                    missing.append("rustc（需要 Rust 1.90 或更新版本）")
                 elif verbose:
                     print(f"  {result.stdout.strip()}")
             except (OSError, subprocess.TimeoutExpired):
@@ -49,8 +54,9 @@ def check_runtime(need_build=False, verbose=False):
     if verbose:
         decoder = shutil.which("dwebp")
         print(f"  dwebp: {decoder or '未安装，使用 ffmpeg 解码'}")
-        fonts = Path(__file__).resolve().parent.parent / "fonts/manifest.tsv"
-        print(f"  内置字体包: {'已找到' if fonts.is_file() else '未找到，将由引擎检查系统字体'}")
+        folder = Path(__file__).resolve().parent
+        has_fonts = any((base / "fonts/manifest.tsv").is_file() for base in (folder, folder.parent))
+        print(f"  内置字体包: {'已找到' if has_fonts else '未找到，将由引擎检查系统字体'}")
     if missing:
         print("缺少或无法使用以下依赖：\n  " + "\n  ".join(missing), file=sys.stderr)
         print("请先安装 SDL2、FreeType、ffmpeg（包含 ffprobe）；从源码首次启动还需要 Rust/Cargo。"

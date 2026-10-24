@@ -20,6 +20,10 @@ usage() {
   --help             显示帮助
 
 缺少 data 时自动下载 data-v1.1.0，通过 gh-proxy 加速，支持断点续传。
+仓库不包含 AppImage；若已放置到 bin/ 则优先使用，无需额外游戏运行库。
+AppImage 缺失或无法启动时，自动安装必要环境并使用本机编译版本。
+WA2_BUILD_FROM_SOURCE=1 使用本地构建版本。
+WA2_AUTO_INSTALL=0 禁用自动安装系统软件包；--check 始终只检查。
 WA2_DATA 指定资源目录；WA2_DATA_PROXIES 配置代理列表；WA2_DATA_PROXIES= 关闭代理。
 兼容 WA2_DATA_PROXY；WA2_DATA_TAG 可切换发布标签。
 HELP
@@ -47,21 +51,111 @@ case "${1:-}" in
     ;;
 esac
 
+force_build=0
+installed_environment=0
+appimage_failed=0
+
+load_cargo_environment() {
+  local cargo_env=${CARGO_HOME:-"$HOME/.cargo"}/env
+  if [ -f "$cargo_env" ]; then
+    # shellcheck disable=SC1090
+    . "$cargo_env"
+  fi
+}
+
+install_environment() {
+  if [ "$mode" = check ] || [ "${WA2_AUTO_INSTALL:-1}" = 0 ]; then
+    echo "未自动安装软件包。直接运行 ./run.sh 可自动准备环境，或手动安装依赖。" >&2
+    return 1
+  fi
+  local profile=play
+  [ "$mode" != download ] || profile=download
+  echo "正在安装本机启动所需的环境……"
+  if ! bash tools/install_runtime.sh "$profile"; then
+    echo "环境安装未完成，请处理上面的包管理器/权限错误后重新运行。" >&2
+    return 1
+  fi
+  installed_environment=1
+  load_cargo_environment
+  if [ "$profile" = play ] && command -v rustup >/dev/null 2>&1; then
+    export RUSTUP_TOOLCHAIN=stable
+  fi
+}
+
+appimage=./bin/wa2-native-linux-x86_64.AppImage
+appimage_key=
+native_marker=./target/.wa2-native-fallback
+prefer_native=0
+if [ -f "$appimage" ]; then
+  appimage_key="$(stat -Lc '%s:%Y' "$appimage"):$(uname -m):$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+fi
+if [ -n "$appimage_key" ] && [ -f "$native_marker" ] && [ -x ./target/release/wa2-native ]; then
+  if [ "$(cat "$native_marker")" = "$appimage_key" ]; then
+    prefer_native=1
+    echo "使用本机编译版本。"
+  fi
+fi
+if [ "${WA2_BUILD_FROM_SOURCE:-0}" != 1 ] && [ "$prefer_native" = 0 ] && [ "$(uname -m)" = x86_64 ] && [ -f "$appimage" ]; then
+  export WA2_PROJECT_ROOT="$PWD"
+  # Always use the self-contained extraction path: a /dev/fuse node alone
+  # does not guarantee that FUSE helpers and mount permissions are available.
+  export APPIMAGE_EXTRACT_AND_RUN=1
+  if [ -x "$appimage" ] || chmod u+x "$appimage"; then
+    if "$appimage" "$@"; then
+      exit 0
+    else
+      image_status=$?
+    fi
+  else
+    image_status=126
+  fi
+  # User cancellation and resource failures do not call for system changes.
+  case "$image_status" in
+    2|75|130|137|143) exit "$image_status" ;;
+  esac
+  echo "AppImage 未能启动（退出码 $image_status），改用本机环境。" >&2
+  appimage_failed=1
+  force_build=1
+  if [ "$mode" != check ]; then
+    install_environment || exit 1
+  fi
+fi
+
+load_cargo_environment
 BIN=./target/release/wa2-native
 [ -x "$BIN" ] || BIN=./target/debug/wa2-native
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "启动时检查/下载资源需要 Python 3，请先安装 python3。" >&2
-  exit 1
-fi
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else "需要 Python 3.8 或更新版本。")'
-if [ "$mode" != download ]; then
-  runtime_args=()
-  [ -x "$BIN" ] || runtime_args+=(--need-build)
-  if [ "$mode" = check ]; then
-    echo "检查启动环境……"
-    runtime_args+=(--verbose)
+
+native_environment_ready() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "缺少 Python 3，准备安装。" >&2
+    return 1
   fi
-  python3 tools/check_runtime.py "${runtime_args[@]}"
+  python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else "需要 Python 3.8 或更新版本。")' || return 1
+  if [ "$mode" != download ]; then
+    local runtime_args=()
+    if [ ! -x "$BIN" ] || [ "$force_build" = 1 ]; then
+      runtime_args+=(--need-build)
+    fi
+    if [ "$mode" = check ]; then
+      echo "检查启动环境……"
+      runtime_args+=(--verbose)
+    fi
+    python3 tools/check_runtime.py "${runtime_args[@]}" || return 1
+  fi
+}
+
+if ! native_environment_ready; then
+  [ "$installed_environment" = 0 ] || exit 1
+  install_environment || exit 1
+  native_environment_ready || exit 1
+fi
+if [ "$mode" = play ] && { [ ! -x "$BIN" ] || [ "$force_build" = 1 ]; }; then
+  echo "正在为这台机器构建游戏……"
+  cargo build --release --target-dir "$PWD/target"
+  BIN=./target/release/wa2-native
+  if [ "$appimage_failed" = 1 ]; then
+    printf '%s\n' "$appimage_key" > "$native_marker"
+  fi
 fi
 WA2_DATA="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "${WA2_DATA:-./data}")"
 export WA2_DATA
@@ -84,11 +178,6 @@ if [ "$mode" != play ]; then
   exit 0
 fi
 
-if [ ! -x "$BIN" ]; then
-  echo "首次启动：正在构建游戏……"
-  cargo build --release
-  BIN=./target/release/wa2-native
-fi
 # 默认窗口读 4x 树、全屏读 8x 母版；WA2_ART_SCALE=2 可用 2x 快速路径。
 if [ -z "$scene" ]; then
   exec "$BIN" title

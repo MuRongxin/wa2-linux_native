@@ -1,0 +1,30 @@
+{
+  "baseline": "Ubuntu 22.04 x86_64 / glibc 2.35",
+  "sources": {
+    "ubuntu": {
+      "name": "ubuntu-base-22.04.5-base-amd64.tar.gz",
+      "url": "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz",
+      "sha256": "242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a"
+    },
+    "python": {
+      "name": "cpython-3.12.15+20261021-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "sha256": "6d7521138fd33afddc1ccd08abb007d9a2829e38117c2576f9efdc0ec73ce772"
+    },
+    "runtime": {
+      "name": "runtime-x86_64",
+      "url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64",
+      "sha256": "617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46"
+    },
+    "sdl": {
+      "name": "SDL2-2.32.10.tar.gz",
+      "url": "https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz",
+      "sha256": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165"
+    },
+    "ffmpeg": {
+      "name": "ffmpeg-9.0.2.tar.xz",
+      "url": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+      "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+    }
+  }
+}

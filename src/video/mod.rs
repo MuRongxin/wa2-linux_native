@@ -46,15 +46,17 @@ impl Movie {
             }
         }
         let mut child = Command::new("ffmpeg")
-            // `-fps_mode passthrough` is essential: WA2's ASF containers declare
+            // Passthrough (`-vsync 0`) is essential: WA2's ASF containers declare
             // a bogus `r_frame_rate` of 1000/1, so ffmpeg's default frame-rate
             // conversion duplicates every decoded frame ~33x. The engine would
             // then read 1000 identical frames per second of wall clock and show
             // only the first instants of the movie (usually a black fade-in) -
-            // playback looked frozen and black. Passthrough emits each decoded
+            // playback looked frozen and black. Use the equivalent legacy
+            // option so native fallbacks also work with older distro FFmpeg.
+            // Passthrough emits each decoded
             // frame exactly once and `fps` (packets / duration) paces it.
             .args(&["-hide_banner", "-loglevel", "error", "-i", path,
-                    "-fps_mode", "passthrough",
+                    "-vsync", "0",
                     "-f", "rawvideo", "-pix_fmt", "rgba",
                     "-s", &format!("{}x{}", width, height), "-"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
