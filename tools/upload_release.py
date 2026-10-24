@@ -9,10 +9,10 @@ copyright violation).
 
 Typical flow::
 
-    python3 tools/package_data.py --version data-v1.0.0
+    python3 tools/package_data.py --version data-v1.1.0
     GITHUB_TOKEN=ghp_xxx python3 tools/upload_release.py \
-        --repo MuRongxin/wa2-linux_native --tag data-v1.0.0 \
-        --dir release/data-v1.0.0 --notes-file docs/RELEASE_DATA.md
+        --repo MuRongxin/wa2-linux_native --tag data-v1.1.0 \
+        --dir release/data-v1.1.0 --notes-file docs/RELEASE_DATA.md
 
 The release is created as a draft, all assets are uploaded, and it is
 published at the end so users never see a half-uploaded release.
@@ -102,7 +102,7 @@ def upload_asset(repo: str, release_id: int, path: Path, token: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", default="MuRongxin/wa2-linux_native")
-    parser.add_argument("--tag", default="data-v1.0.0")
+    parser.add_argument("--tag", default="data-v1.1.0")
     parser.add_argument("--title", default="")
     parser.add_argument("--notes-file", default="")
     parser.add_argument("--dir", required=True, help="directory with manifest.json / SHA256SUMS / parts")

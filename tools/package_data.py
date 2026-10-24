@@ -7,15 +7,14 @@ Archive Utility and Linux ``unzip`` can all open it by double click / one
 command.  The ``tarzst`` format is kept as an option for Linux-first mirrors
 (one concatenated zstd stream, needs ``cat ... | zstd -d | tar -xf -``).
 
-Only the trees needed at runtime are included; derived caches
-(``data/cache``, ``data/*_2x`` proxy trees) are intentionally skipped and can be
-regenerated with ``tools/build_ui_cache.py`` / ``tools/build_timeline_cache.py``.
+Only the trees needed at runtime are included; derived caches are intentionally
+skipped and can be regenerated with ``tools/build_ui_cache.py`` /
+``tools/build_timeline_cache.py``.
 
 Examples::
 
-    python3 tools/package_data.py --version data-v1.0.0        # ZIP parts
-    python3 tools/package_data.py --version data-v1.0.0 --format tarzst
-    python3 tools/package_data.py --version data-v1.0.0-4x --with-4x
+    python3 tools/package_data.py --version data-v1.1.0        # 2x/4x/8x pack
+    python3 tools/package_data.py --version data-v1.1.0 --with-1x-art
 """
 
 from __future__ import annotations
@@ -28,22 +27,31 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TREES = [
+RUNTIME_TREES = [
     "script",
     "script_cn",
-    "bg",
-    "sprite",
-    "bg_cn",
     "voice",
     "bgm",
     "se",
     "font",
     "movie",
     "movie_2x",
+]
+# Keep the 1x background directory only for the small .AMP colour curves. The
+# actual 1x pictures are superseded by the scaled siblings below.
+DEFAULT_TREES = RUNTIME_TREES + [
+    "bg",
+    "bg_2x",
+    "sprite_2x",
+    "bg_cn_2x",
+    "bg_4x",
+    "sprite_4x",
+    "bg_cn_4x",
     "bg_8x",
     "sprite_8x",
     "bg_cn_8x",
 ]
+LEGACY_1X_ART_TREES = {"bg", "sprite", "bg_cn"}
 OPTIONAL_4X = ["bg_4x", "sprite_4x", "bg_cn_4x"]
 # Already-compressed formats: store them instead of wasting CPU on deflate.
 STORE_EXTS = {
@@ -57,7 +65,15 @@ def human(n: int) -> str:
     return f"{n / 1e9:.2f} GB"
 
 
-def tree_inventory(data_dir: Path, trees: list[str]) -> dict:
+def include_file(tree: str, path: Path, include_1x_art: bool) -> bool:
+    if include_1x_art or tree not in LEGACY_1X_ART_TREES:
+        return True
+    # These curves are still used by the runtime for ambient and explicit
+    # colour filters, even though the 1x image pixels are no longer needed.
+    return path.suffix.lower() == ".amp"
+
+
+def tree_inventory(data_dir: Path, trees: list[str], include_1x_art: bool) -> dict:
     total_files = 0
     total_bytes = 0
     per_tree = {}
@@ -68,7 +84,7 @@ def tree_inventory(data_dir: Path, trees: list[str]) -> dict:
         files = 0
         size = 0
         for entry in path.rglob("*"):
-            if entry.is_file():
+            if entry.is_file() and include_file(tree, entry, include_1x_art):
                 files += 1
                 size += entry.stat().st_size
         per_tree[tree] = {"files": files, "bytes": size}
@@ -96,11 +112,11 @@ def zip_safe_name(arcname: str, src: Path) -> str:
         return ""
 
 
-def collect_files(data_dir: Path, trees: list[str]) -> list[tuple[Path, str, int]]:
+def collect_files(data_dir: Path, trees: list[str], include_1x_art: bool) -> list[tuple[Path, str, int]]:
     entries = []
     for tree in trees:
         for path in sorted((data_dir / tree).rglob("*")):
-            if path.is_file():
+            if path.is_file() and include_file(tree, path, include_1x_art):
                 arcname = f"data/{tree}/{path.relative_to(data_dir / tree).as_posix()}"
                 safe = zip_safe_name(arcname, path)
                 if not safe:
@@ -182,25 +198,34 @@ def sha256_file(path: Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default=str(ROOT / "data"))
-    parser.add_argument("--version", default="data-v1.0.0")
+    parser.add_argument("--version", default="data-v1.1.0")
     parser.add_argument("--out", default="")
     parser.add_argument("--format", choices=["zip", "tarzst"], default="zip")
     parser.add_argument("--part-size-mib", type=int, default=1750,
                         help="input-bytes budget per part (keeps the zip below GitHub's 2048 MiB limit)")
     parser.add_argument("--trees", default=",".join(DEFAULT_TREES))
-    parser.add_argument("--with-4x", action="store_true")
+    parser.add_argument("--with-4x", action="store_true",
+                        help="legacy flag; 4x trees are included by default")
+    parser.add_argument("--with-1x-art", action="store_true",
+                        help="also include original 1x bg/sprite/bg_cn pixels")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     data_dir = Path(args.data).expanduser().resolve()
     trees = [t.strip() for t in args.trees.split(",") if t.strip()]
     if args.with_4x:
-        trees += OPTIONAL_4X
+        for tree in OPTIONAL_4X:
+            if tree not in trees:
+                trees.append(tree)
+    if args.with_1x_art:
+        for tree in ("sprite", "bg_cn"):
+            if tree not in trees:
+                trees.append(tree)
     out_dir = Path(args.out).expanduser().resolve() if args.out else ROOT / "release" / args.version
     out_dir.mkdir(parents=True, exist_ok=True)
     budget = args.part_size_mib * 1024 * 1024
-    inv = tree_inventory(data_dir, trees)
-    entries = collect_files(data_dir, trees)
+    inv = tree_inventory(data_dir, trees, args.with_1x_art)
+    entries = collect_files(data_dir, trees, args.with_1x_art)
     print(f"version : {args.version}")
     print(f"format  : {args.format}")
     print(f"output  : {out_dir}")
@@ -221,6 +246,8 @@ def main() -> int:
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "generator": "tools/package_data.py",
         "container": "zip-parts",
+        "include_1x_art": args.with_1x_art,
+        "tree_filters": {} if args.with_1x_art else {"bg": {"suffixes": [".amp"]}},
         "part_size_budget_bytes": budget,
         "trees": trees,
         "inventory": inv,
