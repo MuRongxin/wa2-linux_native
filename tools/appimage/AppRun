@@ -1,9 +1,0 @@
-#!/bin/sh
-set -eu
-appdir=${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
-export WA2_APPDIR="$appdir"
-export PATH="$appdir/usr/bin:$appdir/python/bin:${PATH:-/usr/bin:/bin}"
-export LD_LIBRARY_PATH="$appdir/python/lib:$appdir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export SSL_CERT_FILE="${SSL_CERT_FILE:-$appdir/usr/share/wa2-native/ca-certificates.crt}"
-export ALSA_CONFIG_DIR="${ALSA_CONFIG_DIR:-$appdir/usr/share/alsa}"
-exec "$appdir/python/bin/python3" -I -B -u "$appdir/usr/share/wa2-native/launcher.py" "$@"

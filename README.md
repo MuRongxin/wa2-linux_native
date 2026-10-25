@@ -193,7 +193,7 @@ done
 
 **发布新资源**
 
-`tools/package_data.py` 生成的 `manifest.json` 和其中列出的全部 ZIP 必须放在同一个 Release；建议同时提供 `SHA256SUMS`。标签与分卷文件名前缀是独立字段，下载器按标签找到 Release，再按清单下载附件。
+[资源打包工具](https://github.com/MuRongxin/wa2-linux_native/blob/951e0db12a7cd99d78f9248a0f3f9165dfbf13eb/tools/package_data.py) 生成的 `manifest.json` 和其中列出的全部 ZIP 必须放在同一个 Release；建议同时提供 `SHA256SUMS`。标签与分卷文件名前缀是独立字段，下载器按标签找到 Release，再按清单下载附件。
 
 ~~~bash
 # 只检查清单和附件，不下载大文件
@@ -253,7 +253,7 @@ wa2-native/
 ├── bin/                下载的 AppImage、解包缓存与本地打包产物（不入库）
 ├── src/                剧本、渲染、音视频和界面实现
 ├── fonts/              内置中文字体与许可证
-├── tools/              下载、资源处理与打包工具
+├── tools/              启动检查、程序与资源下载工具
 └── data/               外部游戏资源、存档、设置和缓存
 ~~~
 
@@ -277,35 +277,24 @@ WA2_BUILD_FROM_SOURCE=1 ./run.sh
 
 ~~~bash
 cargo test --release
-python3 -m unittest discover -s tools -p test_fetch_data.py
 ~~~
 
 </details>
 
 <details>
-<summary><strong>构建 AppImage</strong></summary>
+<summary><strong>AppImage 打包与发布</strong></summary>
 
-构建机需要 Python 3.12+、Rust、`bwrap`、`mksquashfs`、`patchelf`，以及可用的 Linux 用户命名空间；首次构建需要联网下载依赖。
+当前仓库只保留启动所需工具。完整的打包器、构建配置和测试保留在[打包工具历史版本](https://github.com/MuRongxin/wa2-linux_native/tree/951e0db12a7cd99d78f9248a0f3f9165dfbf13eb/tools)。需要重新打包时，可从该版本取回 `build_appimage.py` 与 `appimage/` 中的构建文件。
 
-~~~bash
-python3 tools/build_appimage.py
+构建机需要 Python 3.12+、Rust、`bwrap`、`mksquashfs`、`patchelf`，以及可用的 Linux 用户命名空间。构建基线为隔离的 Ubuntu 20.04，不修改宿主系统软件包。
 
-# 仅更新启动脚本并重新打包，复用已编译的引擎和运行组件
-python3 tools/build_appimage.py --repack-only
-
-# 检查实际 AppImage 产物
-python3 -m unittest discover -s tools -p test_appimage.py
-~~~
-
-构建器在 `target/appimage-20.04/` 内建立隔离的 Ubuntu 20.04 环境，不修改宿主系统软件包。下载来源、版本和 SHA-256 固定在 `tools/appimage/sources.lock.json`。可通过 `WA2_BUILD_APT_MIRROR` 指定构建环境的 HTTPS Ubuntu 软件源镜像。
-
-产物位于 `bin/wa2-native-linux-x86_64.AppImage`，并附带 `.sha256`、`.build.json` 和生成的 `release.conf`。发布时：
+发布时：
 
 1. 使用独立的程序标签，如 `app-v0.1.0`，上传 AppImage、校验文件与构建信息。
-2. 将生成的 `bin/release.conf` 同步到 `tools/appimage/release.conf`，随源码更新。
+2. 将生成的 `release.conf` 同步到 `tools/appimage/release.conf`，随源码更新。
 3. 保持 `data-v1.1.0` 素材 Release 独立，无需重新打包素材。
 
-`bin/` 已加入 Git 忽略规则，二进制附件不进入仓库。AppImage 不包含游戏素材；运行组件许可证、FFmpeg 对应源码和构建配方随包提供。
+`bin/`、`bin_/` 和任意目录下的 `*.AppImage` 均已加入 Git 忽略规则。AppImage 不包含游戏素材；运行组件许可证、FFmpeg 对应源码和构建配方随包提供。
 
 </details>
 

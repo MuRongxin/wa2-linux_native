@@ -1,5 +1,11 @@
 /target
 /bin/
+/bin_/
+
+# AppImage artifacts stay outside Git, regardless of their directory/name.
+*.AppImage
+*.AppImage.sha256
+*.AppImage.part
 /others/
 
 # Local agent notes (keep on this machine only).
