@@ -5,8 +5,8 @@
 set -euo pipefail
 
 profile=${1:-play}
-if [[ "$profile" != play && "$profile" != download ]]; then
-  echo "用法：bash tools/install_runtime.sh [play|download]" >&2
+if [[ "$profile" != play && "$profile" != download && "$profile" != bootstrap ]]; then
+  echo "用法：bash tools/install_runtime.sh [play|download|bootstrap]" >&2
   exit 2
 fi
 
@@ -24,25 +24,29 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 if command -v apt-get >/dev/null 2>&1; then
-  packages=(python3 ca-certificates)
+  packages=(ca-certificates coreutils util-linux)
+  [ "$profile" = bootstrap ] || packages+=(python3)
   command -v curl >/dev/null 2>&1 || packages+=(curl)
-  [ "$profile" = download ] || packages+=(build-essential pkg-config libsdl2-2.0-0 libfreetype6 ffmpeg)
+  [ "$profile" != play ] || packages+=(build-essential pkg-config libsdl2-2.0-0 libfreetype6 ffmpeg)
   "${root_command[@]}" apt-get update
   "${root_command[@]}" apt-get install -y --no-install-recommends "${packages[@]}"
 elif command -v dnf >/dev/null 2>&1; then
-  packages=(python3 ca-certificates)
+  packages=(ca-certificates coreutils util-linux)
+  [ "$profile" = bootstrap ] || packages+=(python3)
   command -v curl >/dev/null 2>&1 || packages+=(curl)
-  [ "$profile" = download ] || packages+=(gcc gcc-c++ make pkgconf-pkg-config SDL2 freetype ffmpeg)
+  [ "$profile" != play ] || packages+=(gcc gcc-c++ make pkgconf-pkg-config SDL2 freetype ffmpeg)
   "${root_command[@]}" dnf install -y "${packages[@]}"
 elif command -v pacman >/dev/null 2>&1; then
-  packages=(python ca-certificates)
+  packages=(ca-certificates coreutils util-linux)
+  [ "$profile" = bootstrap ] || packages+=(python)
   command -v curl >/dev/null 2>&1 || packages+=(curl)
-  [ "$profile" = download ] || packages+=(base-devel pkgconf sdl2 freetype2 ffmpeg)
+  [ "$profile" != play ] || packages+=(base-devel pkgconf sdl2 freetype2 ffmpeg)
   "${root_command[@]}" pacman -S --needed --noconfirm "${packages[@]}"
 elif command -v zypper >/dev/null 2>&1; then
-  packages=(python3 ca-certificates)
+  packages=(ca-certificates coreutils util-linux)
+  [ "$profile" = bootstrap ] || packages+=(python3)
   command -v curl >/dev/null 2>&1 || packages+=(curl)
-  [ "$profile" = download ] || packages+=(gcc gcc-c++ make pkg-config libSDL2-2_0-0 libfreetype6 ffmpeg)
+  [ "$profile" != play ] || packages+=(gcc gcc-c++ make pkg-config libSDL2-2_0-0 libfreetype6 ffmpeg)
   "${root_command[@]}" zypper --non-interactive install --no-recommends "${packages[@]}"
 else
   echo "暂不支持此发行版的自动安装。需要 Python 3.8+、C 编译器、SDL2、FreeType、ffmpeg/ffprobe 和 Rust。" >&2

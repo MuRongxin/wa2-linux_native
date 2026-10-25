@@ -1,10 +1,13 @@
 {
-  "baseline": "Ubuntu 22.04 x86_64 / glibc 2.35",
+  "baseline": "Ubuntu 20.04 x86_64 / glibc 2.31",
   "sources": {
     "ubuntu": {
-      "name": "ubuntu-base-22.04.5-base-amd64.tar.gz",
-      "url": "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz",
-      "sha256": "242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a"
+      "name": "ubuntu-base-20.04.5-base-amd64.tar.gz",
+      "url": "https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release/ubuntu-base-20.04.5-base-amd64.tar.gz",
+      "sha256": "60e216b60947653dc8989be3821380268315b99b2959c29882781541bfe5a426",
+      "mirrors": [
+        "https://mirrors.ustc.edu.cn/ubuntu-cdimage/ubuntu-base/releases/20.04/release/ubuntu-base-20.04.5-base-amd64.tar.gz"
+      ]
     },
     "python": {
       "name": "cpython-3.12.15+20261021-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
@@ -25,6 +28,15 @@
       "name": "ffmpeg-9.0.2.tar.xz",
       "url": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
       "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+    },
+    "nasm": {
+      "name": "nasm-2.16.03.tar.gz",
+      "url": "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.gz",
+      "mirrors": [
+        "https://download.videolan.org/contrib/nasm/nasm-2.16.03.tar.gz"
+      ],
+      "sha256": "5bc940dd8a4245686976a8f7e96ba9340a0915f2d5b88356874890e207bdb581"
     }
-  }
+  },
+  "baseline_dir": "ubuntu-20.04"
 }

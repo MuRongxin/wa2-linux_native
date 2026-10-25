@@ -12,7 +12,7 @@
   <code>Linux x86_64</code>&nbsp;
   <code>Rust · 零第三方 crate</code>&nbsp;
   <code>2x / 4x / 8x</code>&nbsp;
-  <code>AppImage · 可选</code>
+  <code>AppImage · 自动获取</code>
 </p>
 
 <p>
@@ -47,26 +47,28 @@ cd wa2-native
 ./run.sh
 ~~~
 
-**第一次运行会自动准备环境、编译引擎并下载资源，完成后进入标题画面。** 仓库不包含 AppImage 二进制文件；若已另行获取或构建，可放到 `bin/wa2-native-linux-x86_64.AppImage`，启动脚本会优先使用。
+**第一次运行会自动下载程序与资源，完成后进入标题画面。** 仓库只保存源码和启动工具；`run.sh` 从独立的程序 Release 获取 AppImage，按仓库中的固定 SHA-256 校验后使用包内环境，正常情况下无需安装系统 Python 或 Rust。
 
 环境和数据准备好后，日常启动无需联网。
 
-| 可选 AppImage | 首次资源下载 | 解压后的资源 | 首次安装建议空闲空间 |
+| AppImage | 首次资源下载 | 解压后的资源 | 首次安装建议空闲空间 |
 | :---: | :---: | :---: | :---: |
-| 约 **68 MiB** | 约 **45.63 GB** | 约 **50.79 GB** | 约 **100 GB** |
+| 约 **76.14 MiB** | 约 **45.63 GB** | 约 **50.79 GB** | 约 **100 GB** |
 
 安装期间需要同时存放 ZIP 和解压后的文件；安装成功后会自动清理下载的 ZIP。以上资源体积对应 [`data-v1.1.0`](https://github.com/MuRongxin/wa2-linux_native/releases/tag/data-v1.1.0)。
 
 ### 启动时会发生什么
 
-1. **准备程序**：存在可用的本地 AppImage 时优先使用；否则检查本机依赖，缺少时自动安装，并在首次启动时编译引擎。
+1. **下载程序**：按固定版本下载 AppImage，显示进度、速度与剩余时间；支持多代理和断点续传。只有 SHA-256 正确的完整文件才会替换本地程序。
 2. **准备资源**：缺少可用数据时，自动下载 Release 分卷；终端实时显示进度、速度和预计剩余时间，支持中断续传与下载通道切换。
 3. **校验并解压**：逐卷检查 SHA-256，显示解压进度，全部完成并通过文件统计检查后才启动游戏。
-4. **进入游戏**：后续运行复用本地资源和缓存，无需重复下载。
+4. **进入游戏**：程序首次解包后按 SHA-256 缓存运行目录，后续启动复用程序、运行目录与资源，无需重复下载和解包。
 
-可选 AppImage 内置 Python、SDL2、FreeType、ffmpeg / ffprobe、dwebp 和中文字体，面向 **x86_64、glibc 2.35+** 的 Linux 桌面环境，例如 Ubuntu 22.04+、Debian 12+；显示和音频仍使用系统驱动。通过 `run.sh` 启动时采用解包运行模式，**无需配置 FUSE**。
+AppImage 内置 Python、SDL2、FreeType、ffmpeg / ffprobe、dwebp、中文字体及 X11、Wayland、PulseAudio、ALSA 后端运行库。构建基线为 **Ubuntu 20.04 x86_64 / glibc 2.31**；窗口系统、音频服务和显卡驱动由桌面系统提供。`run.sh` 使用缓存的解包运行目录，**无需配置 FUSE**。
 
-没有 AppImage 或它无法启动时，脚本会自动安装必要的本机环境，再从源码编译运行。系统包使用现有的 `apt-get`、`dnf`、`pacman` 或 `zypper`，过程中可能需要输入管理员密码；Rust 安装到当前用户。具体包能否安装取决于发行版现有软件源。
+程序不兼容或无法运行时，脚本会自动安装必要的本机环境，再从源码编译运行。系统包使用现有的 `apt-get`、`dnf`、`pacman` 或 `zypper`，过程中可能需要输入管理员密码；Rust 安装到当前用户。具体包能否安装取决于发行版现有软件源。
+
+首次下载仅需 `curl` 或 `wget`、`coreutils` 和 `flock`；缺失时只安装这些下载工具。网络错误、校验失败和空间不足会保留错误与断点，不会触发 Rust 或游戏运行库安装。
 
 需要自己管理环境时，可关闭自动安装：
 
@@ -80,7 +82,7 @@ WA2_AUTO_INSTALL=0 ./run.sh
 | :--- | :--- |
 | `./run.sh` | 进入标题画面 |
 | `./run.sh 1002` | 直接进入指定场景，方便调试 |
-| `./run.sh --download-only` | 只下载、校验和解压资源 |
+| `./run.sh --download-only` | 准备 AppImage 与资源，不启动游戏、不编译引擎 |
 | `./run.sh --check` | 检查运行环境和在线 Release；不安装、不构建、不下载分卷、不启动游戏 |
 | `./run.sh --help` | 查看启动帮助 |
 
@@ -130,6 +132,7 @@ WA2_DATA="$HOME/Games/wa2-data" ./run.sh  # 自定义数据目录
 | `WA2_FONT_HOME` / `WA2_FONT_HISTORY` / `WA2_FONT_GAME` | 分别覆盖 UI、已读文本与对白字体 |
 | `WA2_ART_CACHE_MB` | 素材内存缓存预算，单位 MB |
 | `WA2_DATA_PROXIES` | 下载代理列表；空值关闭代理 |
+| `WA2_APPIMAGE_PROXIES` | 单独指定程序下载代理；默认沿用资源代理，空值仅直连 |
 | `WA2_DATA_TAG` | 资源 Release 标签，默认 `data-v1.1.0` |
 | `WA2_DATA_REPO` | 资源仓库，默认 `MuRongxin/wa2-linux_native` |
 | `WA2_DATA_CACHE` | 下载缓存目录，默认 `.wa2-release-parts/` |
@@ -140,7 +143,17 @@ WA2_DATA="$HOME/Games/wa2-data" ./run.sh  # 自定义数据目录
 
 </details>
 
-## 下载与资源
+## 程序与资源下载
+
+程序与素材使用独立的 Release：
+
+| 内容 | 版本 | 本地位置 |
+| :--- | :--- | :--- |
+| 引擎与运行环境 | [`app-v0.1.0`](https://github.com/MuRongxin/wa2-linux_native/releases/tag/app-v0.1.0) | `bin/wa2-native-linux-x86_64.AppImage` |
+| 程序运行目录 | 与 AppImage 的 SHA-256 对应 | `bin/runtime/<sha256>/` |
+| 游戏素材 | [`data-v1.1.0`](https://github.com/MuRongxin/wa2-linux_native/releases/tag/data-v1.1.0) | `data/` |
+
+程序版本、大小和 SHA-256 固定在 `tools/appimage/release.conf`。脚本不会把最新素材 Release 误当作程序，也不会每次启动自动升级；更新仓库中的程序版本后才获取对应新包，已有素材、存档与配置继续使用。
 
 当前资源包包含 **2x / 4x / 8x 背景、立绘和中文界面**，以及运行所需的中日文剧本、语音、音乐、音效、影片和位图字体。省去了 1x 原始背景与立绘，保留必要的调色曲线。
 
@@ -148,7 +161,7 @@ WA2_DATA="$HOME/Games/wa2-data" ./run.sh  # 自定义数据目录
 
 `gh-proxy.com` → `ghfast.top` → `ghproxy.net` → GitHub 直连
 
-下载失败或持续低速时会切换通道，并尽量保留当前分卷断点。中断后重新运行 `./run.sh` 即可继续；临时下载保存在 `.wa2-release-parts/`。
+下载失败时会切换通道，并尽量保留断点；素材下载和 curl 程序下载也会在持续低速时切换。中断后重新运行 `./run.sh` 即可继续。程序临时文件保存在 `bin/.downloads/`，素材分卷保存在 `.wa2-release-parts/`；这些目录均不进入 Git。
 
 ~~~bash
 # 仅使用 GitHub 直连
@@ -187,7 +200,7 @@ done
 python3 tools/fetch_data.py --tag data-v1.1.0 --dry-run
 ~~~
 
-兼容旧的单代理变量 `WA2_DATA_PROXY`；同时设置时以 `WA2_DATA_PROXIES` 为准。访问私有 Release 可设置 `GITHUB_TOKEN`，此时使用 GitHub 认证直连，跳过代理。
+兼容旧的单代理变量 `WA2_DATA_PROXY`；同时设置时以 `WA2_DATA_PROXIES` 为准。访问私有素材 Release 可设置 `GITHUB_TOKEN`，此时使用 GitHub 认证直连，跳过代理。程序引导下载使用公开 Release，不会向代理发送令牌。
 
 </details>
 
@@ -196,14 +209,14 @@ python3 tools/fetch_data.py --tag data-v1.1.0 --dry-run
 <details>
 <summary><strong>我需要先安装 Rust、Python、ffmpeg 或中文字体吗？</strong></summary>
 
-无需提前手动安装。普通克隆不包含 AppImage，首次运行时脚本会自动安装缺少的本机依赖与构建工具链，字体由仓库提供。如果另行放置了可用的 AppImage，则使用包内运行组件。`./run.sh --check` 可以先查看情况，且不会安装软件。
+通常无需手动安装。普通克隆不包含 AppImage，首次运行由脚本下载，并使用其中的 Python、媒体工具、运行库和字体。只有本机编译兜底才需要 Rust；缺少下载工具时只安装轻量下载依赖。`./run.sh --check` 可以先查看情况，且不会安装软件。
 
 </details>
 
 <details>
-<summary><strong>为什么程序只有约 68 MiB，首次下载却有几十 GB？</strong></summary>
+<summary><strong>为什么程序包很小，首次下载却有几十 GB？</strong></summary>
 
-约 68 MiB 是可选 AppImage 的体积，它只包含引擎与运行组件，不随 Git 克隆下载。游戏素材单独保存在 Release 中，包含 2x、4x、8x 多套画面、语音和影片；首次安装建议预留约 100 GB 空间。切换到 2x 运行只改变读取的素材树，当前安装器仍会下载整套资源。
+AppImage 只包含引擎与运行组件，不随 Git 克隆下载。游戏素材单独保存在 Release 中，包含 2x、4x、8x 多套画面、语音和影片；首次安装建议预留约 100 GB 空间。切换到 2x 运行只改变读取的素材树，当前安装器仍会下载整套资源。
 
 </details>
 
@@ -237,7 +250,7 @@ python3 tools/fetch_data.py --tag data-v1.1.0 --dry-run
 ~~~text
 wa2-native/
 ├── run.sh              启动、资源准备与本机环境回退
-├── bin/                本地 AppImage、校验和与构建信息（不入库）
+├── bin/                下载的 AppImage、解包缓存与本地打包产物（不入库）
 ├── src/                剧本、渲染、音视频和界面实现
 ├── fonts/              内置中文字体与许可证
 ├── tools/              下载、资源处理与打包工具
@@ -284,9 +297,15 @@ python3 tools/build_appimage.py --repack-only
 python3 -m unittest discover -s tools -p test_appimage.py
 ~~~
 
-构建器在 `target/appimage/` 内建立隔离的 Ubuntu 22.04 环境，不修改宿主系统软件包。下载来源、版本和 SHA-256 固定在 `tools/appimage/sources.lock.json`。
+构建器在 `target/appimage-20.04/` 内建立隔离的 Ubuntu 20.04 环境，不修改宿主系统软件包。下载来源、版本和 SHA-256 固定在 `tools/appimage/sources.lock.json`。可通过 `WA2_BUILD_APT_MIRROR` 指定构建环境的 HTTPS Ubuntu 软件源镜像。
 
-产物位于 `bin/wa2-native-linux-x86_64.AppImage`，并附带校验和与构建信息。`bin/` 已加入 Git 忽略规则，打包产物只保存在本地，可单独发布到 Release。AppImage 不包含游戏素材；运行组件许可证、FFmpeg 对应源码和构建配方随包提供。
+产物位于 `bin/wa2-native-linux-x86_64.AppImage`，并附带 `.sha256`、`.build.json` 和生成的 `release.conf`。发布时：
+
+1. 使用独立的程序标签，如 `app-v0.1.0`，上传 AppImage、校验文件与构建信息。
+2. 将生成的 `bin/release.conf` 同步到 `tools/appimage/release.conf`，随源码更新。
+3. 保持 `data-v1.1.0` 素材 Release 独立，无需重新打包素材。
+
+`bin/` 已加入 Git 忽略规则，二进制附件不进入仓库。AppImage 不包含游戏素材；运行组件许可证、FFmpeg 对应源码和构建配方随包提供。
 
 </details>
 

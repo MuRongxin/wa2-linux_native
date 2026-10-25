@@ -336,6 +336,9 @@ class InstallTests(unittest.TestCase):
         tools = self.dest / "tools"
         tools.mkdir(parents=True)
         shutil.copy2(ROOT / "run.sh", self.dest / "run.sh")
+        shutil.copy2(ROOT / "tools/prepare_appimage.sh", tools / "prepare_appimage.sh")
+        (tools / "appimage").mkdir()
+        shutil.copy2(ROOT / "tools/appimage/release.conf", tools / "appimage/release.conf")
         source = (ROOT / "tools/fetch_data.py").read_text().replace(
             'API = "https://api.github.com"', 'API = ' + repr(self.base))
         (tools / "fetch_data.py").write_text(source)
@@ -355,7 +358,7 @@ class InstallTests(unittest.TestCase):
         rustc.chmod(0o755)
         env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ["PATH"],
                    WA2_DATA=str(self.root / "custom data"), WA2_DATA_PROXY="", GITHUB_TOKEN="",
-                   WA2_AUTO_INSTALL="0", WA2_DATA_PROXIES="", WA2_DATA_REPO="test/game", WA2_DATA_TAG="data-v1.1.0", WA2_DATA_CACHE=str(self.cache))
+                   WA2_AUTO_INSTALL="0", WA2_BUILD_FROM_SOURCE="1", WA2_DATA_PROXIES="", WA2_DATA_REPO="test/game", WA2_DATA_TAG="data-v1.1.0", WA2_DATA_CACHE=str(self.cache))
         command = ["bash", str(self.dest / "run.sh")]
         return command, env
 
@@ -410,13 +413,19 @@ class InstallTests(unittest.TestCase):
         command, env = self.launcher()
         binary = self.dest / "bin/wa2-native-linux-x86_64.AppImage"
         binary.parent.mkdir()
-        binary.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > launch-args\n"
-                          "printf '%s' \"$WA2_PROJECT_ROOT\" > launch-root\n")
+        binary.write_text("#!/bin/sh\nmkdir -p squashfs-root/usr/bin\n"
+                          "cat > squashfs-root/AppRun <<'ENTRY'\n#!/bin/sh\n"
+                          "printf '%s\\n' \"$@\" > launch-args\n"
+                          "printf '%s' \"$WA2_PROJECT_ROOT\" > launch-root\nENTRY\n"
+                          "printf '#!/bin/sh\\nexit 0\\n' > squashfs-root/usr/bin/wa2-native\n"
+                          "chmod +x squashfs-root/AppRun squashfs-root/usr/bin/wa2-native\n")
         binary.chmod(0o755)
         fake_python = self.root / "fakebin/python3"
         fake_python.write_text("#!/bin/sh\necho 'Unexpected system Python call' >&2\nexit 91\n")
         fake_python.chmod(0o755)
         env["WA2_BUILD_FROM_SOURCE"] = "0"
+        env["WA2_APPIMAGE_SHA256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        env["WA2_APPIMAGE_SIZE"] = str(binary.stat().st_size)
         run = subprocess.run(command + ["1002"], cwd="/", env=env, text=True, capture_output=True, timeout=15)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertEqual((self.dest / "launch-args").read_text(), "1002\n")

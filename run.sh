@@ -16,14 +16,15 @@ usage() {
   无参数             检查资源并进入标题画面
   场景号             直接进入指定场景，例如 ./run.sh 1002
   --check            检查启动依赖和 Release 附件，不下载分卷、不启动游戏
-  --download-only    只下载、校验和解压资源，不构建、不启动游戏
+  --download-only    只准备程序与资源，不构建、不启动游戏
   --help             显示帮助
 
 缺少 data 时自动下载 data-v1.1.0，通过 gh-proxy 加速，支持断点续传。
-仓库不包含 AppImage；若已放置到 bin/ 则优先使用，无需额外游戏运行库。
-AppImage 缺失或无法启动时，自动安装必要环境并使用本机编译版本。
+缺少 AppImage 时，从独立的程序 Release 下载、校验，并缓存解包目录。
+下载失败保留断点；仅在程序不兼容或无法运行时安装本机环境并编译。
 WA2_BUILD_FROM_SOURCE=1 使用本地构建版本。
 WA2_AUTO_INSTALL=0 禁用自动安装系统软件包；--check 始终只检查。
+WA2_APPIMAGE_PROXIES 可单独设置程序下载代理（默认沿用资源代理）。
 WA2_DATA 指定资源目录；WA2_DATA_PROXIES 配置代理列表；WA2_DATA_PROXIES= 关闭代理。
 兼容 WA2_DATA_PROXY；WA2_DATA_TAG 可切换发布标签。
 HELP
@@ -82,40 +83,63 @@ install_environment() {
   fi
 }
 
+# Program and data releases have separate, pinned versions. The bootstrapper
+# does not need Python: the verified AppImage supplies its own interpreter.
+source tools/appimage/release.conf
 appimage=./bin/wa2-native-linux-x86_64.AppImage
-appimage_key=
+appimage_digest=${WA2_APPIMAGE_SHA256:-$APPIMAGE_RELEASE_SHA256}
+appimage_key="$appimage_digest:$(uname -m):$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
 native_marker=./target/.wa2-native-fallback
 prefer_native=0
-if [ -f "$appimage" ]; then
-  appimage_key="$(stat -Lc '%s:%Y' "$appimage"):$(uname -m):$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+if [ -f "$native_marker" ] && [ -x ./target/release/wa2-native ] &&
+   [ "$(cat "$native_marker")" = "$appimage_key" ]; then
+  prefer_native=1
+  echo "使用本机编译版本。"
 fi
-if [ -n "$appimage_key" ] && [ -f "$native_marker" ] && [ -x ./target/release/wa2-native ]; then
-  if [ "$(cat "$native_marker")" = "$appimage_key" ]; then
-    prefer_native=1
-    echo "使用本机编译版本。"
+if [ "${WA2_BUILD_FROM_SOURCE:-0}" != 1 ] && [ "$prefer_native" = 0 ] && [ "$(uname -m)" = x86_64 ]; then
+  prepare_mode=--ensure
+  [ "$mode" != check ] || prepare_mode=--check
+  prepare_status=0
+  bash tools/prepare_appimage.sh "$prepare_mode" || prepare_status=$?
+  if [ "$prepare_status" = 69 ] && [ "$mode" != check ] && [ "${WA2_AUTO_INSTALL:-1}" != 0 ]; then
+    # Only the downloader/coreutils are needed here, never Rust or game libs.
+    bash tools/install_runtime.sh bootstrap || exit 1
+    prepare_status=0
+    bash tools/prepare_appimage.sh "$prepare_mode" || prepare_status=$?
   fi
-fi
-if [ "${WA2_BUILD_FROM_SOURCE:-0}" != 1 ] && [ "$prefer_native" = 0 ] && [ "$(uname -m)" = x86_64 ] && [ -f "$appimage" ]; then
-  export WA2_PROJECT_ROOT="$PWD"
-  # Always use the self-contained extraction path: a /dev/fuse node alone
-  # does not guarantee that FUSE helpers and mount permissions are available.
-  export APPIMAGE_EXTRACT_AND_RUN=1
-  if [ -x "$appimage" ] || chmod u+x "$appimage"; then
-    if "$appimage" "$@"; then
+  case "$prepare_status" in
+    0) ;;
+    78) appimage_failed=1; force_build=1 ;;
+    *) exit "$prepare_status" ;;
+  esac
+  if [ "$prepare_status" = 0 ]; then
+    appdir="$PWD/bin/runtime/$appimage_digest/squashfs-root"
+    if [ "$mode" = check ] && { [ ! -x "$appdir/AppRun" ] || [ ! -x "$appdir/usr/bin/wa2-native" ] ||
+       [ "$(cat "${appdir%/squashfs-root}/.complete" 2>/dev/null || true)" != "$appimage_digest" ]; }; then
+      # A check must not extract the image or install Python just to inspect
+      # data. Use host Python when available, otherwise explain the omission.
+      if command -v python3 >/dev/null 2>&1; then
+        python3 -u tools/fetch_data.py --dry-run --dest "$PWD" \
+          --data-dir "${WA2_DATA:-$PWD/data}" \
+          --repo "${WA2_DATA_REPO:-MuRongxin/wa2-linux_native}" \
+          --tag "${WA2_DATA_TAG:-data-v1.1.0}"
+      else
+        echo "未检查素材清单：当前没有系统 Python；正常启动将使用 AppImage 内置 Python。"
+      fi
+      exit 0
+    fi
+    if env APPDIR="$appdir" APPIMAGE="$PWD/${appimage#./}" WA2_PROJECT_ROOT="$PWD" "$appdir/AppRun" "$@"; then
       exit 0
     else
       image_status=$?
     fi
-  else
-    image_status=126
+    case "$image_status" in
+      2|75|130|137|143) exit "$image_status" ;;
+    esac
+    echo "AppImage 无法运行（退出码 $image_status），改用本机环境。" >&2
+    appimage_failed=1
+    force_build=1
   fi
-  # User cancellation and resource failures do not call for system changes.
-  case "$image_status" in
-    2|75|130|137|143) exit "$image_status" ;;
-  esac
-  echo "AppImage 未能启动（退出码 $image_status），改用本机环境。" >&2
-  appimage_failed=1
-  force_build=1
   if [ "$mode" != check ]; then
     install_environment || exit 1
   fi

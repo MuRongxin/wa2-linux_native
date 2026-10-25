@@ -1,7 +1,7 @@
 #!/bin/bash
 # Runs inside the isolated Ubuntu baseline prepared by build_appimage.py.
 set -euo pipefail
-export PATH=/opt/rust/bin:/usr/bin:/bin
+export PATH=/build/build-tools/bin:/opt/rust/bin:/usr/bin:/bin
 export CARGO_HOME=/build/cargo-home
 export CARGO_TARGET_DIR=/build/cargo-target
 export RUSTC=/opt/rust/bin/rustc
@@ -10,6 +10,16 @@ cd /project
 cargo build --release --locked --offline
 
 mkdir -p /build/sources /build/payload/usr/bin /build/payload/usr/lib
+# Focal's NASM predates the assembly macros used by our FFmpeg. Build the
+# pinned assembler inside the same baseline, preserving optimized decoders.
+if [ ! -x /build/build-tools/bin/nasm ]; then
+  tar --no-same-owner -xf /build/downloads/nasm-2.16.03.tar.gz -C /build/sources
+  cd /build/sources/nasm-2.16.03
+  ./configure --prefix=/build/build-tools
+  make -j"${WA2_BUILD_JOBS:-8}" nasm
+  mkdir -p /build/build-tools/bin
+  cp nasm /build/build-tools/bin/nasm
+fi
 if [ ! -d /build/sources/SDL2-2.32.10 ]; then
   tar --no-same-owner -xf /build/downloads/SDL2-2.32.10.tar.gz -C /build/sources
 fi
