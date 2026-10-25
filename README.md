@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="tools/appimage/wa2-native.svg" width="96" height="96" alt="wa2-native 雪花图标">
+<img src="launcher/wa2-native.svg" width="96" height="96" alt="wa2-native 雪花图标">
 
 <h1>WHITE ALBUM 2 · Native</h1>
 
@@ -153,7 +153,7 @@ WA2_DATA="$HOME/Games/wa2-data" ./run.sh  # 自定义数据目录
 | 程序运行目录 | 与 AppImage 的 SHA-256 对应 | `bin/runtime/<sha256>/` |
 | 游戏素材 | [`data-v1.1.0`](https://github.com/MuRongxin/wa2-linux_native/releases/tag/data-v1.1.0) | `data/` |
 
-程序版本、大小和 SHA-256 固定在 `tools/appimage/release.conf`。脚本不会把最新素材 Release 误当作程序，也不会每次启动自动升级；更新仓库中的程序版本后才获取对应新包，已有素材、存档与配置继续使用。
+程序版本、大小和 SHA-256 固定在 `launcher/release.conf`。脚本不会把最新素材 Release 误当作程序，也不会每次启动自动升级；更新仓库中的程序版本后才获取对应新包，已有素材、存档与配置继续使用。
 
 当前资源包包含 **2x / 4x / 8x 背景、立绘和中文界面**，以及运行所需的中日文剧本、语音、音乐、音效、影片和位图字体。省去了 1x 原始背景与立绘，保留必要的调色曲线。
 
@@ -197,7 +197,7 @@ done
 
 ~~~bash
 # 只检查清单和附件，不下载大文件
-python3 tools/fetch_data.py --tag data-v1.1.0 --dry-run
+python3 launcher/fetch_data.py --tag data-v1.1.0 --dry-run
 ~~~
 
 兼容旧的单代理变量 `WA2_DATA_PROXY`；同时设置时以 `WA2_DATA_PROXIES` 为准。访问私有素材 Release 可设置 `GITHUB_TOKEN`，此时使用 GitHub 认证直连，跳过代理。程序引导下载使用公开 Release，不会向代理发送令牌。
@@ -253,7 +253,7 @@ wa2-native/
 ├── bin/                下载的 AppImage、解包缓存与本地打包产物（不入库）
 ├── src/                剧本、渲染、音视频和界面实现
 ├── fonts/              内置中文字体与许可证
-├── tools/              启动检查、程序与资源下载工具
+├── launcher/           启动检查、程序与资源下载支持文件
 └── data/               外部游戏资源、存档、设置和缓存
 ~~~
 
@@ -284,14 +284,14 @@ cargo test --release
 <details>
 <summary><strong>AppImage 打包与发布</strong></summary>
 
-当前仓库只保留启动所需工具。完整的打包器、构建配置和测试保留在[打包工具历史版本](https://github.com/MuRongxin/wa2-linux_native/tree/951e0db12a7cd99d78f9248a0f3f9165dfbf13eb/tools)。需要重新打包时，可从该版本取回 `build_appimage.py` 与 `appimage/` 中的构建文件。
+启动所需文件位于 `launcher/`；本地辅助目录 `tools/` 已忽略，不随仓库提交。完整的打包器、构建配置和测试保留在[打包工具历史版本](https://github.com/MuRongxin/wa2-linux_native/tree/951e0db12a7cd99d78f9248a0f3f9165dfbf13eb/tools)。需要重新打包时，可从该版本取回 `build_appimage.py` 与 `appimage/` 中的构建文件。
 
 构建机需要 Python 3.12+、Rust、`bwrap`、`mksquashfs`、`patchelf`，以及可用的 Linux 用户命名空间。构建基线为隔离的 Ubuntu 20.04，不修改宿主系统软件包。
 
 发布时：
 
 1. 使用独立的程序标签，如 `app-v0.1.0`，上传 AppImage、校验文件与构建信息。
-2. 将生成的 `release.conf` 同步到 `tools/appimage/release.conf`，随源码更新。
+2. 将生成的 `release.conf` 同步到 `launcher/release.conf`，随源码更新。
 3. 保持 `data-v1.1.0` 素材 Release 独立，无需重新打包素材。
 
 `bin/`、`bin_/` 和任意目录下的 `*.AppImage` 均已加入 Git 忽略规则。AppImage 不包含游戏素材；运行组件许可证、FFmpeg 对应源码和构建配方随包提供。

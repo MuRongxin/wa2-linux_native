@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Download, verify and restore independent ZIP parts from a GitHub Release.
 
-    python3 tools/fetch_data.py --tag data-v1.1.0 --dest .
+    python3 launcher/fetch_data.py --tag data-v1.1.0 --dest .
 
 run.sh uses --ensure to leave existing playable data alone. Downloads use
 several proxies by default; --proxy '' disables them. GITHUB_TOKEN is supported for
@@ -178,7 +178,7 @@ def validate_manifest(manifest: dict) -> None:
     if not isinstance(manifest, dict):
         raise FetchError("资源清单必须是 JSON 对象。")
     if manifest.get("container") != "zip-parts":
-        raise FetchError("仅支持 tools/package_data.py 生成的独立 ZIP 分卷。")
+        raise FetchError("仅支持独立 ZIP 分卷资源包。")
     trees = manifest.get("inventory", {}).get("trees", {})
     if not trees or any(not re.fullmatch(r"[A-Za-z0-9_-]+", t) or t in ("save", "cache") for t in trees):
         raise FetchError("资源清单中的数据目录无效。")

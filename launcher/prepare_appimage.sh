@@ -7,7 +7,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 mode=${1:---ensure}
 [[ "$mode" = --ensure || "$mode" = --check ]] || exit 2
 # This file is part of the source checkout, never downloaded or evaluated.
-source tools/appimage/release.conf
+source launcher/release.conf
 repo=${WA2_APPIMAGE_REPO:-$APPIMAGE_RELEASE_REPO}
 tag=${WA2_APPIMAGE_TAG:-$APPIMAGE_RELEASE_TAG}
 digest=${WA2_APPIMAGE_SHA256:-$APPIMAGE_RELEASE_SHA256}

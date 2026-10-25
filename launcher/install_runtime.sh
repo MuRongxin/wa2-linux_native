@@ -6,7 +6,7 @@ set -euo pipefail
 
 profile=${1:-play}
 if [[ "$profile" != play && "$profile" != download && "$profile" != bootstrap ]]; then
-  echo "用法：bash tools/install_runtime.sh [play|download|bootstrap]" >&2
+  echo "用法：bash launcher/install_runtime.sh [play|download|bootstrap]" >&2
   exit 2
 fi
 

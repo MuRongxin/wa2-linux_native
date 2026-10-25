@@ -72,7 +72,7 @@ install_environment() {
   local profile=play
   [ "$mode" != download ] || profile=download
   echo "正在安装本机启动所需的环境……"
-  if ! bash tools/install_runtime.sh "$profile"; then
+  if ! bash launcher/install_runtime.sh "$profile"; then
     echo "环境安装未完成，请处理上面的包管理器/权限错误后重新运行。" >&2
     return 1
   fi
@@ -85,7 +85,7 @@ install_environment() {
 
 # Program and data releases have separate, pinned versions. The bootstrapper
 # does not need Python: the verified AppImage supplies its own interpreter.
-source tools/appimage/release.conf
+source launcher/release.conf
 appimage=./bin/wa2-native-linux-x86_64.AppImage
 appimage_digest=${WA2_APPIMAGE_SHA256:-$APPIMAGE_RELEASE_SHA256}
 appimage_key="$appimage_digest:$(uname -m):$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
@@ -100,12 +100,12 @@ if [ "${WA2_BUILD_FROM_SOURCE:-0}" != 1 ] && [ "$prefer_native" = 0 ] && [ "$(un
   prepare_mode=--ensure
   [ "$mode" != check ] || prepare_mode=--check
   prepare_status=0
-  bash tools/prepare_appimage.sh "$prepare_mode" || prepare_status=$?
+  bash launcher/prepare_appimage.sh "$prepare_mode" || prepare_status=$?
   if [ "$prepare_status" = 69 ] && [ "$mode" != check ] && [ "${WA2_AUTO_INSTALL:-1}" != 0 ]; then
     # Only the downloader/coreutils are needed here, never Rust or game libs.
-    bash tools/install_runtime.sh bootstrap || exit 1
+    bash launcher/install_runtime.sh bootstrap || exit 1
     prepare_status=0
-    bash tools/prepare_appimage.sh "$prepare_mode" || prepare_status=$?
+    bash launcher/prepare_appimage.sh "$prepare_mode" || prepare_status=$?
   fi
   case "$prepare_status" in
     0) ;;
@@ -119,7 +119,7 @@ if [ "${WA2_BUILD_FROM_SOURCE:-0}" != 1 ] && [ "$prefer_native" = 0 ] && [ "$(un
       # A check must not extract the image or install Python just to inspect
       # data. Use host Python when available, otherwise explain the omission.
       if command -v python3 >/dev/null 2>&1; then
-        python3 -u tools/fetch_data.py --dry-run --dest "$PWD" \
+        python3 -u launcher/fetch_data.py --dry-run --dest "$PWD" \
           --data-dir "${WA2_DATA:-$PWD/data}" \
           --repo "${WA2_DATA_REPO:-MuRongxin/wa2-linux_native}" \
           --tag "${WA2_DATA_TAG:-data-v1.1.0}"
@@ -164,7 +164,7 @@ native_environment_ready() {
       echo "检查启动环境……"
       runtime_args+=(--verbose)
     fi
-    python3 tools/check_runtime.py "${runtime_args[@]}" || return 1
+    python3 launcher/check_runtime.py "${runtime_args[@]}" || return 1
   fi
 }
 
@@ -197,7 +197,7 @@ fi
 if [ -n "${WA2_DATA_CACHE:-}" ]; then
   fetch_args+=(--parts-dir "$WA2_DATA_CACHE")
 fi
-python3 -u tools/fetch_data.py "${fetch_args[@]}"
+python3 -u launcher/fetch_data.py "${fetch_args[@]}"
 if [ "$mode" != play ]; then
   exit 0
 fi

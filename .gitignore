@@ -7,6 +7,7 @@
 *.AppImage.sha256
 *.AppImage.part
 /others/
+/tools/
 
 # Local agent notes (keep on this machine only).
 /AGENTS.md
