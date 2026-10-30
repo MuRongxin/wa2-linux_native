@@ -76,6 +76,15 @@ AppImage 内置 Python、SDL2、FreeType、ffmpeg / ffprobe、dwebp、中文字�
 WA2_AUTO_INSTALL=0 ./run.sh
 ~~~
 
+### macOS
+
+macOS（Apple 芯片与 Intel）不使用 AppImage，`run.sh` 直接从源码构建。需要 Xcode 命令行工具和 [Homebrew](https://brew.sh)；缺少 SDL2、FreeType 或 ffmpeg 时，脚本会以当前用户执行 `brew install sdl2 freetype ffmpeg webp`，无需管理员密码。资源下载、存档和设置与 Linux 相同，都在项目目录内。
+
+~~~bash
+xcode-select --install   # 仅首次需要
+./run.sh
+~~~
+
 ### 常用启动命令
 
 | 命令 | 用途 |
