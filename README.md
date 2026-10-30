@@ -42,7 +42,7 @@
 在 Linux 桌面环境中打开终端：
 
 ~~~bash
-git clone https://github.com/MuRongxin/wa2-linux_native.git wa2-native
+git clone --depth 1 https://github.com/MuRongxin/wa2-linux_native.git wa2-native
 cd wa2-native
 ./run.sh
 ~~~
