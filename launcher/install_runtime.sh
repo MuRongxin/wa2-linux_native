@@ -10,8 +10,10 @@ if [[ "$profile" != play && "$profile" != download && "$profile" != bootstrap ]]
   exit 2
 fi
 
+os=$(uname -s)
 root_command=()
-if [ "$EUID" -ne 0 ]; then
+# Homebrew installs as the current user and refuses to run as root.
+if [ "$EUID" -ne 0 ] && [ "$os" != Darwin ]; then
   if command -v sudo >/dev/null 2>&1; then
     root_command=(sudo)
   elif command -v doas >/dev/null 2>&1; then
@@ -23,7 +25,20 @@ if [ "$EUID" -ne 0 ]; then
   echo "将安装必要的系统软件包；系统可能要求输入管理员密码。"
 fi
 
-if command -v apt-get >/dev/null 2>&1; then
+if [ "$os" = Darwin ]; then
+  # Python 3, curl and the C toolchain come with the Xcode command line tools.
+  if ! xcode-select -p >/dev/null 2>&1; then
+    echo "需要 Xcode 命令行工具：请先运行 xcode-select --install，完成后重新运行 ./run.sh。" >&2
+    exit 1
+  fi
+  if [ "$profile" = play ]; then
+    if ! command -v brew >/dev/null 2>&1; then
+      echo "macOS 需要 Homebrew（https://brew.sh）安装 SDL2、FreeType 和 ffmpeg，装好后重新运行 ./run.sh。" >&2
+      exit 1
+    fi
+    brew install sdl2 freetype ffmpeg webp
+  fi
+elif command -v apt-get >/dev/null 2>&1; then
   packages=(ca-certificates coreutils util-linux)
   [ "$profile" = bootstrap ] || packages+=(python3)
   command -v curl >/dev/null 2>&1 || packages+=(curl)
