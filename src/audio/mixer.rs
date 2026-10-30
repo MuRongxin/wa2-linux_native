@@ -11,6 +11,11 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 unsafe extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
+/// O_NONBLOCK; F_GETFL (3) and F_SETFL (4) agree across Linux and macOS, this does not.
+#[cfg(not(target_os = "macos"))]
+const O_NONBLOCK: i32 = 0x800;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x4;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -59,9 +64,9 @@ impl Stream {
         if looping { command.args(["-stream_loop", "-1"]); }
         let child = command.args(["-i", input, "-f", "s16le", "-ar", "48000", "-ac", "2", "-"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-        // Linux O_NONBLOCK: no decoder may hold the mixer lock while waiting.
+        // O_NONBLOCK: no decoder may hold the mixer lock while waiting.
         let fd = child.stdout.as_ref()?.as_raw_fd();
-        unsafe { let flags = fcntl(fd, 3); if flags >= 0 { fcntl(fd, 4, flags | 0x800); } }
+        unsafe { let flags = fcntl(fd, 3); if flags >= 0 { fcntl(fd, 4, flags | O_NONBLOCK); } }
         Some(Stream { label: input.to_string(), cat: CAT_ALL, carry: Vec::new(),
             child: Some(child), pcm: VecDeque::new(), volume: 1.0, looping, eos: false,
             ramp: None })
