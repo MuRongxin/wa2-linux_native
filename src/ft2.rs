@@ -45,6 +45,18 @@ extern "C" {
 
 const RTLD_NOW: c_int = 2;
 
+/// FreeType runtime names, tried in order (see `SDL_LIBS` in sdl2.rs for why
+/// macOS lists absolute paths).
+#[cfg(not(target_os = "macos"))]
+const FT_LIBS: &[&str] = &["libfreetype.so.6", "libfreetype.so"];
+#[cfg(target_os = "macos")]
+const FT_LIBS: &[&str] = &[
+    "libfreetype.6.dylib",
+    "/opt/homebrew/lib/libfreetype.6.dylib",
+    "/usr/local/lib/libfreetype.6.dylib",
+    "/opt/local/lib/libfreetype.6.dylib",
+];
+
 /// FT_LOAD_RENDER: load the glyph and render it into the slot's bitmap.
 const FT_LOAD_RENDER: c_int = 0x0000_0004;
 /// FT_LOAD_NO_BITMAP: ignore embedded bitmap strikes and render the outline.
@@ -175,8 +187,8 @@ impl Ft {
         }
         unsafe {
             let mut lib = std::ptr::null_mut();
-            for cand in ["libfreetype.so.6", "libfreetype.so"] {
-                let c = CString::new(cand).unwrap();
+            for cand in FT_LIBS {
+                let c = CString::new(*cand).unwrap();
                 lib = dlopen(c.as_ptr(), RTLD_NOW);
                 if !lib.is_null() {
                     break;

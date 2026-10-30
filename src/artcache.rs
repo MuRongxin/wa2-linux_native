@@ -118,6 +118,34 @@ fn default_budget_mb() -> usize {
             }
         }
     }
+    // macOS has no MemAvailable (free RAM is mostly file cache it reclaims on
+    // demand), so take an eighth of physical memory instead.
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn sysctlbyname(
+                name: *const std::os::raw::c_char,
+                oldp: *mut std::os::raw::c_void,
+                oldlenp: *mut usize,
+                newp: *mut std::os::raw::c_void,
+                newlen: usize,
+            ) -> std::os::raw::c_int;
+        }
+        let mut bytes: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let rc = unsafe {
+            sysctlbyname(
+                b"hw.memsize\0".as_ptr().cast(),
+                (&mut bytes as *mut u64).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 {
+            return ((bytes / 1024 / 1024 / 8) as usize).clamp(512, 6144);
+        }
+    }
     512
 }
 

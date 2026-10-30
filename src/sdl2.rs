@@ -189,15 +189,32 @@ fn cursor_bitmap(kind: u8) -> ([u8; 32], [u8; 32]) {
     (data, mask)
 }
 
+/// SDL2 runtime names, tried in order. dyld does not search the Homebrew or
+/// MacPorts prefixes by default, so macOS also tries them by absolute path.
+#[cfg(not(target_os = "macos"))]
+const SDL_LIBS: &[&str] = &["libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so"];
+#[cfg(target_os = "macos")]
+const SDL_LIBS: &[&str] = &[
+    "libSDL2-2.0.0.dylib",
+    "/opt/homebrew/lib/libSDL2-2.0.0.dylib",
+    "/usr/local/lib/libSDL2-2.0.0.dylib",
+    "/opt/local/lib/libSDL2-2.0.0.dylib",
+];
+
+/// The handle `Sdl::new` loaded, reused by the diagnostics below so they
+/// resolve SDL2 the same way the window did.
+static SDL_LIB: OnceLock<usize> = OnceLock::new();
+
 impl Sdl {
     /// Try to open a window + streaming texture. Returns None if SDL2 is
     /// unavailable or window creation fails (e.g. no display).
     pub fn new(title: &str, tw: u32, th: u32) -> Option<Sdl> {
         unsafe {
-            for cand in ["libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so"] {
-                let c = CString::new(cand).unwrap();
+            for cand in SDL_LIBS {
+                let c = CString::new(*cand).unwrap();
                 let lib = dlopen(c.as_ptr(), RTLD_NOW);
                 if !lib.is_null() {
+                    SDL_LIB.get_or_init(|| lib as usize);
                     return Sdl::init_from(lib, title, tw, th);
                 }
             }
@@ -242,8 +259,9 @@ impl Sdl {
             .map(|p| std::mem::transmute(p));
 
         // Choose the pulse audio driver BEFORE any SDL_Init (PipeWire system):
-        // SDL picks the driver at init time from SDL_AUDIODRIVER.
-        if std::env::var_os("SDL_AUDIODRIVER").is_none() {
+        // SDL picks the driver at init time from SDL_AUDIODRIVER. macOS has
+        // only CoreAudio, which SDL already picks on its own.
+        if cfg!(target_os = "linux") && std::env::var_os("SDL_AUDIODRIVER").is_none() {
             std::env::set_var("SDL_AUDIODRIVER", "pulse");
         }
         let init: unsafe extern "C" fn(u32) -> c_int = std::mem::transmute(s_init);
@@ -569,15 +587,19 @@ impl Sdl {
 /// `SDL_SetWindowFullscreen` updates SDL's own size immediately, but without
 /// a window manager the real X window stays 1280×720, so the picture and the
 /// pointer never change. After the request we move that window ourselves.
+/// macOS always has a window manager (Cocoa runs its own fullscreen
+/// transition), so there the request alone is enough and moving the window by
+/// hand would only fight that transition.
 pub fn set_fullscreen(&self, on: bool) {
     let Some(f) = FULLSCREEN.get() else { return };
+    let move_by_hand = !cfg!(target_os = "macos");
     if on {
         self.remember_windowed();
         let rc = unsafe { (f)(self.window, SDL_WINDOW_FULLSCREEN_DESKTOP) };
         if rc != 0 {
             eprintln!("sdl: set fullscreen failed");
         }
-        if let Some((x, y, w, h)) = self.display_bounds() {
+        if let Some((x, y, w, h)) = self.display_bounds().filter(|_| move_by_hand) {
             self.set_bordered(false);
             self.x11_move_resize(x, y, w as u32, h as u32);
             self.sdl_set_pos(x, y);
@@ -588,11 +610,13 @@ pub fn set_fullscreen(&self, on: bool) {
         if rc != 0 {
             eprintln!("sdl: leave fullscreen failed");
         }
-        self.set_bordered(true);
-        if let Some((x, y, w, h)) = take_windowed() {
-            self.x11_move_resize(x, y, w as u32, h as u32);
-            self.sdl_set_size(w, h);
-            self.sdl_set_pos(x, y);
+        if move_by_hand {
+            self.set_bordered(true);
+            if let Some((x, y, w, h)) = take_windowed() {
+                self.x11_move_resize(x, y, w as u32, h as u32);
+                self.sdl_set_size(w, h);
+                self.sdl_set_pos(x, y);
+            }
         }
     }
     self.pump();
@@ -891,8 +915,8 @@ pub fn sdl_pause_audio(dev: u32, paused: bool) {
 /// Name of the active SDL audio driver (diagnostic), e.g. "pulse" / "alsa" / "dummy".
 pub fn sdl_audio_driver() -> String {
     unsafe {
-        let lib = dlopen(CString::new("libSDL2-2.0.so.0").unwrap().as_ptr(), RTLD_NOW);
-        if lib.is_null() { return "?".into(); }
+        let Some(&lib) = SDL_LIB.get() else { return "?".into() };
+        let lib = lib as *mut c_void;
         let p = dlsym(lib, CString::new("SDL_GetCurrentAudioDriver").unwrap().as_ptr());
         if p.is_null() { return "?".into(); }
         let f: unsafe extern "C" fn() -> *const c_char = std::mem::transmute(p);
@@ -904,8 +928,8 @@ pub fn sdl_audio_driver() -> String {
 /// SDL_GetError() string (diagnostic).
 pub fn sdl_get_error() -> String {
     unsafe {
-        let lib = dlopen(CString::new("libSDL2-2.0.so.0").unwrap().as_ptr(), RTLD_NOW);
-        if lib.is_null() { return "?".into(); }
+        let Some(&lib) = SDL_LIB.get() else { return "?".into() };
+        let lib = lib as *mut c_void;
         let p = dlsym(lib, CString::new("SDL_GetError").unwrap().as_ptr());
         if p.is_null() { return "?".into(); }
         let f: unsafe extern "C" fn() -> *const c_char = std::mem::transmute(p);
