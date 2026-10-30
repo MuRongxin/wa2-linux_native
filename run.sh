@@ -22,7 +22,7 @@ usage() {
 缺少 data 时自动下载 data-v1.1.0，通过 gh-proxy 加速，支持断点续传。
 缺少 AppImage 时，从独立的程序 Release 下载、校验，并缓存解包目录。
 下载失败保留断点；仅在程序不兼容或无法运行时安装本机环境并编译。
-WA2_BUILD_FROM_SOURCE=1 使用本地构建版本。
+WA2_BUILD_FROM_SOURCE=1 使用本地构建版本；macOS 始终从源码构建（依赖由 Homebrew 安装）。
 WA2_AUTO_INSTALL=0 禁用自动安装系统软件包；--check 始终只检查。
 WA2_APPIMAGE_PROXIES 可单独设置程序下载代理（默认沿用资源代理）。
 WA2_DATA 指定资源目录；WA2_DATA_PROXIES 配置代理列表；WA2_DATA_PROXIES= 关闭代理。
@@ -96,7 +96,9 @@ if [ -f "$native_marker" ] && [ -x ./target/release/wa2-native ] &&
   prefer_native=1
   echo "使用本机编译版本。"
 fi
-if [ "${WA2_BUILD_FROM_SOURCE:-0}" != 1 ] && [ "$prefer_native" = 0 ] && [ "$(uname -m)" = x86_64 ]; then
+# The AppImage is Linux-only; macOS (Intel included) always builds from source.
+if [ "${WA2_BUILD_FROM_SOURCE:-0}" != 1 ] && [ "$prefer_native" = 0 ] &&
+   [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
   prepare_mode=--ensure
   [ "$mode" != check ] || prepare_mode=--check
   prepare_status=0
@@ -164,7 +166,8 @@ native_environment_ready() {
       echo "检查启动环境……"
       runtime_args+=(--verbose)
     fi
-    python3 launcher/check_runtime.py "${runtime_args[@]}" || return 1
+    # Guarded expansion: macOS ships bash 3.2, where an empty array trips set -u.
+    python3 launcher/check_runtime.py ${runtime_args[@]+"${runtime_args[@]}"} || return 1
   fi
 }
 

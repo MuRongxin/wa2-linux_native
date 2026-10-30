@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Linux runtime/build prerequisites before downloading game assets."""
+"""Check Linux/macOS runtime/build prerequisites before downloading game assets."""
 
 import argparse
 import ctypes
@@ -13,6 +13,20 @@ LIBRARIES = {
     "SDL2": ("libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so"),
     "FreeType": ("libfreetype.so.6", "libfreetype.so"),
 }
+if sys.platform == "darwin":
+    # Same names and prefixes the engine tries (SDL_LIBS / FT_LIBS).
+    LIBRARIES = {
+        label: (name,) + tuple(f"{prefix}/lib/{name}" for prefix in ("/opt/homebrew", "/usr/local", "/opt/local"))
+        for label, name in (("SDL2", "libSDL2-2.0.0.dylib"), ("FreeType", "libfreetype.6.dylib"))
+    }
+
+
+def have_c_toolchain():
+    if sys.platform == "darwin":
+        # /usr/bin/cc exists even without the command line tools: it is a stub
+        # that pops up the installer, so ask xcode-select instead.
+        return subprocess.run(["xcode-select", "-p"], capture_output=True).returncode == 0
+    return shutil.which("cc") is not None
 
 
 def check_runtime(need_build=False, verbose=False):
@@ -35,8 +49,8 @@ def check_runtime(need_build=False, verbose=False):
         elif verbose:
             print(f"  {name}: OK ({path})")
     if need_build:
-        if not shutil.which("cc"):
-            missing.append("cc（C 编译器/链接器，首次构建需要）")
+        if not have_c_toolchain():
+            missing.append("cc（C 编译器/链接器，首次构建需要；macOS 运行 xcode-select --install）")
         for name in ("cargo", "rustc"):
             if not shutil.which(name):
                 missing.append(f"{name}（首次构建需要 Rust 工具链）")
