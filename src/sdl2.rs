@@ -242,6 +242,7 @@ impl Sdl {
             std::mem::transmute(sym(lib, "SDL_GetWindowSize")?);
         let f_open_audio: unsafe extern "C" fn(*const c_char, c_int, *const SdlAudioSpec, *mut SdlAudioSpec, c_int) -> u32 = std::mem::transmute(sym(lib, "SDL_OpenAudioDevice")?);
         let f_queue_audio: unsafe extern "C" fn(u32, *const c_void, u32) -> c_int = std::mem::transmute(sym(lib, "SDL_QueueAudio")?);
+        let f_queued_audio: unsafe extern "C" fn(u32) -> u32 = std::mem::transmute(sym(lib, "SDL_GetQueuedAudioSize")?);
         let f_pause_audio: unsafe extern "C" fn(u32, c_int) = std::mem::transmute(sym(lib, "SDL_PauseAudioDevice")?);
         let f_get_error: unsafe extern "C" fn() -> *const c_char = std::mem::transmute(sym(lib, "SDL_GetError")?);
         let f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(sym(lib, "SDL_PollEvent")?);
@@ -271,7 +272,7 @@ impl Sdl {
         // Publish the audio API only after SDL has been loaded. Previously these
         // pointers were resolved but never installed, so Mixer::new always got
         // device 0 and every run was silent.
-        let _ = AUDIO.set(AudioFns { open: f_open_audio, queue: f_queue_audio, pause: f_pause_audio, get_error: f_get_error });
+        let _ = AUDIO.set(AudioFns { open: f_open_audio, queue: f_queue_audio, queued: f_queued_audio, pause: f_pause_audio, get_error: f_get_error });
         let f_full: unsafe extern "C" fn(*mut c_void, u32) -> c_int =
             std::mem::transmute(sym(lib, "SDL_SetWindowFullscreen")?);
         let _ = FULLSCREEN.set(f_full);
@@ -860,6 +861,7 @@ struct SdlAudioSpec {
 struct AudioFns {
     open: unsafe extern "C" fn(*const c_char, c_int, *const SdlAudioSpec, *mut SdlAudioSpec, c_int) -> u32,
     queue: unsafe extern "C" fn(u32, *const c_void, u32) -> c_int,
+    queued: unsafe extern "C" fn(u32) -> u32,
     pause: unsafe extern "C" fn(u32, i32),
     get_error: unsafe extern "C" fn() -> *const c_char,
 }
@@ -902,6 +904,14 @@ pub fn sdl_open_audio(rate: u32, ch: u16) -> u32 {
 pub fn sdl_queue_audio(dev: u32, bytes: &[u8]) {
     if let Some(f) = AUDIO.get() {
         unsafe { (f.queue)(dev, bytes.as_ptr() as *const c_void, bytes.len() as u32); }
+    }
+}
+
+/// Bytes queued on the device and not yet played.
+pub fn sdl_queued_audio(dev: u32) -> u32 {
+    match AUDIO.get() {
+        Some(f) => unsafe { (f.queued)(dev) },
+        None => 0,
     }
 }
 

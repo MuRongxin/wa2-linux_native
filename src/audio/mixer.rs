@@ -22,6 +22,10 @@ use std::thread;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
+/// Bytes kept queued on the device: three 1024-frame blocks (~64 ms).
+const QUEUE_TARGET: u32 = 3 * 1024 * CHANNELS as u32 * 2;
+/// Decoded samples buffered per stream before its pipe is left alone.
+const PCM_HIGH: usize = 16_384;
 
 /// Mixer categories. The option screen's four volume sliders map onto these:
 /// `all` scales everything, the others scale one kind of sound.
@@ -108,33 +112,34 @@ impl Mixer {
                     let mut g = inner2.lock().unwrap();
                     for s in g.streams.iter_mut() {
                         if let Some(st) = s {
-                            if st.eos || st.pcm.len() >= 8192 { continue; }
-                            let mut buf = [0u8; 4096];
-                            if let Some(child) = st.child.as_mut() {
-                                if let Some(out) = child.stdout.as_mut() {
-                                    match out.read(&mut buf) {
-                                        Ok(0) => {
-                                            st.eos = true;
-                                            // Decoder exited on its own: reap it, or every
-                                            // finished SE/voice line stays a zombie.
-                                            if let Some(c) = st.child.as_mut() {
-                                                if matches!(c.try_wait(), Ok(Some(_))) {
-                                                    st.child = None;
-                                                }
+                            // Drain the pipe up to the high-water mark. One read per pass
+                            // only ever matched one block of output, so a short read put
+                            // the stream behind for good.
+                            while !st.eos && st.pcm.len() < PCM_HIGH {
+                                let mut buf = [0u8; 4096];
+                                let Some(out) = st.child.as_mut().and_then(|c| c.stdout.as_mut()) else { break };
+                                match out.read(&mut buf) {
+                                    Ok(0) => {
+                                        st.eos = true;
+                                        // Decoder exited on its own: reap it, or every
+                                        // finished SE/voice line stays a zombie.
+                                        if let Some(c) = st.child.as_mut() {
+                                            if matches!(c.try_wait(), Ok(Some(_))) {
+                                                st.child = None;
                                             }
                                         }
-                                        Ok(n) => {
-                                            st.carry.extend_from_slice(&buf[..n]);
-                                            let usable = st.carry.len() - (st.carry.len() % 2);
-                                            for ch in st.carry[..usable].chunks_exact(2) {
-                                                st.pcm.push_back(i16::from_le_bytes([ch[0], ch[1]]));
-                                            }
-                                            PULLED.fetch_add((usable / 2) as u64, Ordering::Relaxed);
-                                            st.carry.drain(..usable);
-                                        }
-                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                        Err(_) => st.eos = true,
                                     }
+                                    Ok(n) => {
+                                        st.carry.extend_from_slice(&buf[..n]);
+                                        let usable = st.carry.len() - (st.carry.len() % 2);
+                                        for ch in st.carry[..usable].chunks_exact(2) {
+                                            st.pcm.push_back(i16::from_le_bytes([ch[0], ch[1]]));
+                                        }
+                                        PULLED.fetch_add((usable / 2) as u64, Ordering::Relaxed);
+                                        st.carry.drain(..usable);
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(_) => st.eos = true,
                                 }
                             }
                         }
@@ -160,9 +165,8 @@ impl Mixer {
                         .unwrap_or(0);
                     let prev = LAST_DBG.load(Ordering::Relaxed);
                     if now.saturating_sub(prev) < 1000 {
-                        let block = mix_once(&inner2);
-                        crate::sdl2::sdl_queue_audio(dev, &block);
-                        thread::sleep(std::time::Duration::from_micros(21_333));
+                        top_up(dev, &inner2);
+                        thread::sleep(std::time::Duration::from_millis(5));
                         continue;
                     }
                     LAST_DBG.store(now, Ordering::Relaxed);
@@ -188,14 +192,11 @@ impl Mixer {
                     let audible = names.len();
                     let slots = g.streams.len();
                     drop(g);
-                    eprintln!("  audio: n={} slots={} [{}]", audible, slots, names.join(" + "));
+                    eprintln!("  audio: n={} slots={} [{}] queued={}B", audible, slots,
+                              names.join(" + "), crate::sdl2::sdl_queued_audio(dev));
                 }
-                let block = mix_once(&inner2);
-                QUEUED.fetch_add(block.len() as u64, Ordering::Relaxed);
-                crate::sdl2::sdl_queue_audio(dev, &block);
-                // 1024 stereo frames at 48 kHz take ~21.33 ms. Pushing every
-                // 10 ms made the SDL queue grow at over twice real time.
-                thread::sleep(std::time::Duration::from_micros(21_333));
+                top_up(dev, &inner2);
+                thread::sleep(std::time::Duration::from_millis(5));
             }
         });
         crate::sdl2::sdl_pause_audio(dev, false);
@@ -296,6 +297,17 @@ impl Drop for Mixer {
         self.inner.lock().unwrap().quit = true;
         if let Some(h) = self.worker.take() { let _ = h.join(); }
         self.stop_all();
+    }
+}
+
+/// Top the device queue up to QUEUE_TARGET by what it actually holds. Pacing
+/// by sleep alone produced 86% of real time on macOS (each 21.33 ms sleep ran
+/// ~3 ms long), so the queue ran dry several times a second.
+fn top_up(dev: u32, inner: &Arc<Mutex<MixerInner>>) {
+    while crate::sdl2::sdl_queued_audio(dev) < QUEUE_TARGET {
+        let block = mix_once(inner);
+        QUEUED.fetch_add(block.len() as u64, Ordering::Relaxed);
+        crate::sdl2::sdl_queue_audio(dev, &block);
     }
 }
 
