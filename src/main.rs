@@ -1,3 +1,6 @@
+mod acceptance;
+#[cfg(test)]
+mod test_data;
 mod archive;
 mod artcache;
 mod audio;
@@ -17,6 +20,117 @@ mod video;
 mod vm;
 
 use std::path::Path;
+
+/// Resource-backed checkpoints deliberately use the normal title/story paths.
+fn run_acceptance(args: &[String]) -> Result<(), String> {
+    let kind = args[1].trim_start_matches("acceptance-");
+    let (id, out) = match kind {
+        "title" if args.len() == 3 => ("1002", args[2].as_str()),
+        "scene" if args.len() == 4 && ["1002", "2001", "3002"].contains(&args[2].as_str()) =>
+            (args[2].as_str(), args[3].as_str()),
+        "movie" if args.len() == 5 => (args[2].as_str(), args[3].as_str()),
+        "load" if args.len() == 4 => (args[2].as_str(), args[3].as_str()),
+        _ => return Err("usage: acceptance-title OUT | acceptance-scene {1002|2001|3002} OUT | acceptance-load SAVE OUT | acceptance-movie FILE OUT SECONDS".into()),
+    };
+    acceptance::start(kind, Path::new(out))?;
+    let mut win = sdl2::Sdl::new("WHITE ALBUM 2 — acceptance", 1280, 720).ok_or("SDL window unavailable")?;
+    if kind == "movie" {
+        let seconds = args[4].parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 1.0 && *n <= 60.0).ok_or("movie seconds must be 1..60")?;
+        let mut movie = video::Movie::open(id).ok_or("movie could not be opened")?;
+        if !movie.has_audio { return Err("choose a real movie with its own audio stream".into()); }
+        let mixer = audio::Mixer::new(&win).ok_or("audio unavailable")?;
+        let slot = movie.play_audio(&mixer, audio::mixer::CAT_BGM).ok_or("movie audio decoder unavailable")?;
+        let before = audio::mixer::pulled_samples();
+        let start = std::time::Instant::now();
+        let mut frame = Vec::new();
+        let mut count = 0usize;
+        let mut varied = false;
+        let mut previous = String::new();
+        let mut last = None;
+        while start.elapsed().as_secs_f64() < seconds {
+            if !movie.read_frame(&mut frame) { break; }
+            let hash = sha256::hex_digest(&frame);
+            if !previous.is_empty() && hash != previous { varied = true; }
+            previous = hash;
+            win.present_raw(&frame, movie.width, movie.height);
+            last = Some(render::Surface { width: movie.width, height: movie.height, pixels: frame.clone() });
+            count += 1;
+            if matches!(win.poll_input(), sdl2::Input::Quit) { return Err("movie cancelled".into()); }
+            win.delay((1000.0 / movie.fps.max(1.0)).round().clamp(1.0, 100.0) as u32);
+        }
+        let samples = audio::mixer::pulled_samples().saturating_sub(before);
+        mixer.stop(slot);
+        if count < 2 || !varied || movie.decoder_failed() || samples == 0 {
+            return Err(format!("movie evidence insufficient: frames={count}, changing={varied}, samples={samples}"));
+        }
+        let mut p = acceptance::probe().unwrap();
+        acceptance::native(&p, true)?;
+        acceptance::field(&p, "source", id)?;
+        acceptance::field(&p, "frames", count)?;
+        acceptance::field(&p, "changing_frames", varied)?;
+        acceptance::field(&p, "decoded_samples", samples)?;
+        acceptance::field(&p, "queued_bytes", audio::mixer::queued_bytes())?;
+        let surf = last.ok_or("no movie frame")?;
+        acceptance::screenshot(&p, "movie", &surf)?;
+        let captured = win.present_checked(&surf)?;
+        acceptance::screenshot(&p, "renderer", &captured)?;
+        p.stage = 3;
+        drop(p);
+        return acceptance::finish();
+    }
+    let d = data::Data::resolve().ok_or("resource data unavailable")?;
+    if !d.cn { return Err("Chinese acceptance requires WA2_LANG=cn and real script_cn resources".into()); }
+    require_chinese_font();
+    let font = load_font(&d).ok_or("bitmap font resources unavailable")?;
+    let session = Session::from_data(&d, None);
+    let mut rt = Runtime::new(&win, &session);
+    if rt.mixer.is_none() || rt.vfont.is_none() { return Err("native audio or Chinese game font unavailable".into()); }
+    {
+        let p = acceptance::probe().unwrap();
+        acceptance::native(&p, true)?;
+        acceptance::field(&p, "data", d.root.display())?;
+        acceptance::field(&p, "language", "cn")?;
+        acceptance::field(&p, "capture", "engine-surface-and-SDL-renderer-not-compositor")?;
+        let (lw, lh) = win.window_size();
+        let (dw, dh) = win.drawable_size();
+        acceptance::field(&p, "window_logical_size", format!("{lw}x{lh}"))?;
+        acceptance::field(&p, "drawable_pixel_size", format!("{dw}x{dh}"))?;
+        acceptance::field(&p, "pixel_ratio", format!("{:.2}x{:.2}", dw as f64 / lw as f64, dh as f64 / lh as f64))?;
+        let center = win.surface_pos(lw / 2, lh / 2, 1280, 720);
+        if center != (640, 360) { return Err(format!("pointer logical-coordinate mapping wrong: {center:?}")); }
+        acceptance::field(&p, "pointer_center_layout", "640,360")?;
+    }
+    if kind == "title" {
+        run_title(&mut win, &font, &session.bg_dirs(), &session.script_dir, true, rt.mixer.as_ref());
+    } else {
+        // These are real script events; no synthetic input permissions needed.
+        std::env::set_var("WA2_AUTO", "1");
+        if kind == "load" {
+            let snapshot = save::SaveState::load_from(Path::new(id)).ok_or("cannot load acceptance save")?;
+            if !["1002", "2001", "3002"].contains(&snapshot.scene.as_str()) {
+                return Err("external load restricted to ordinary acceptance entry scenes".into());
+            }
+            let image_path = Path::new(id).parent().ok_or("save parent absent")?.join("scene.tga");
+            let bytes = std::fs::read(&image_path).map_err(|e| e.to_string())?;
+            let image = codec::tga::decode(&bytes).map_err(|e| e.to_string())?;
+            {
+                let mut p = acceptance::probe().unwrap();
+                p.saved_pixels = Some(sha256::hex_digest(&image.rgba));
+                p.saved_scene = snapshot.scene.clone();
+                p.saved_pc = snapshot.vm.pc;
+                p.stage = 1;
+                acceptance::field(&p, "external_restore", true)?;
+                acceptance::field(&p, "source_save", id)?;
+                acceptance::field(&p, "scene", &snapshot.scene)?;
+                acceptance::field(&p, "pc", snapshot.vm.pc)?;
+            }
+            run_game_from(&mut win, &font, &session, snapshot, &mut rt)?;
+        } else {
+            run_game(&mut win, &font, &session, id, &mut rt)?;
+        }
+    }
+    acceptance::finish()
+}
 
 /// Chinese mode is only usable when some bundled or installed font can draw
 /// Chinese. The design requires the game to refuse to start instead of
@@ -38,6 +152,17 @@ fn main() {
         return;
     }
     match args[1].as_str() {
+        "acceptance-display" => {
+            let result = args.get(2).ok_or_else(|| "usage: acceptance-display OUT".to_string())
+                .and_then(|out| acceptance::display_cycle(Path::new(out)));
+            if let Err(error) = result { eprintln!("acceptance-display: {error}"); std::process::exit(1); }
+        }
+        "acceptance-title" | "acceptance-scene" | "acceptance-movie" | "acceptance-load" => {
+            if let Err(error) = run_acceptance(&args) {
+                eprintln!("acceptance: {error}");
+                std::process::exit(1);
+            }
+        }
         "kcap" => {
             if args.len() < 3 { eprintln!("usage: wa2-native kcap <pakfile> [outdir]"); return; }
             let out = out_dir(&args[2], &args, 3, "_extracted");
@@ -232,6 +357,20 @@ fn main() {
             if let Err(e) = surf.save_tga(&args[6]) { eprintln!("{}", e); return; }
             println!("scene-map: {} chars -> {}", page.text().chars().count(), args[6]);
         }
+        "audio-continuity" => {
+            let result = (|| -> Result<(), String> {
+                let input = args.get(2).ok_or("usage: audio-continuity FILE [SECONDS]")?;
+                let seconds = args.get(3).map(|s| s.parse::<f64>())
+                    .transpose().map_err(|e| e.to_string())?.unwrap_or(120.0);
+                if !seconds.is_finite() || !(5.0..=600.0).contains(&seconds) {
+                    return Err("duration must be between 5 and 600 seconds".into());
+                }
+                let win = sdl2::Sdl::new("WA2 audio continuity diagnostic", 320, 180)
+                    .ok_or("SDL window unavailable")?;
+                audio::acceptance::run(&win, input, seconds)
+            })();
+            if let Err(e) = result { eprintln!("audio-continuity: {e}"); std::process::exit(1); }
+        }
         "audio-test" => {
             // audio-test <file.ogg> [seconds]
             if args.len() < 3 {
@@ -241,15 +380,15 @@ fn main() {
             let secs: f64 = if args.len() >= 4 { args[3].parse().unwrap_or(5.0) } else { 5.0 };
             if !std::path::Path::new(&args[2]).is_file() {
                 eprintln!("audio-test: input file not found: {}", args[2]);
-                return;
+                std::process::exit(1);
             }
-            let win = match sdl2::Sdl::new("wa2-audio", 320, 240) { Some(w) => w, None => { eprintln!("no SDL/display"); return; } };
-            let mixer = match audio::Mixer::new(&win) { Some(m) => m, None => { eprintln!("audio device failed"); return; } };
+            let win = match sdl2::Sdl::new("wa2-audio", 320, 240) { Some(w) => w, None => { eprintln!("no SDL/display"); std::process::exit(1); } };
+            let mixer = match audio::Mixer::new(&win) { Some(m) => m, None => { eprintln!("audio device failed"); std::process::exit(1); } };
             eprintln!("playing {} for {}s", args[2], secs);
             let slot = mixer.play(&args[2], 1.0, false);
             if slot == usize::MAX {
                 eprintln!("audio-test: unable to decode or open {}", args[2]);
-                return;
+                std::process::exit(1);
             }
             let pulled_before = audio::mixer::pulled_samples();
             let t0 = std::time::Instant::now();
@@ -259,6 +398,7 @@ fn main() {
             let pulled = audio::mixer::pulled_samples();
             if pulled == pulled_before {
                 eprintln!("audio-test: decoder produced no PCM for {}", args[2]);
+                std::process::exit(1);
             }
             println!("audio-test done: driver={} pulled {} samples, queued {} bytes", sdl2::sdl_audio_driver(), pulled, audio::mixer::queued_bytes());
         }
@@ -268,9 +408,9 @@ fn main() {
                 eprintln!("usage: wa2-native movie-test <mv.pak> [bgm.ogg]");
                 return;
             }
-            let mut movie = match video::Movie::open(&args[2]) { Some(m) => m, None => { eprintln!("ffmpeg/ffprobe failed or no video"); return; } };
+            let mut movie = match video::Movie::open(&args[2]) { Some(m) => m, None => { eprintln!("ffmpeg/ffprobe failed or no video"); std::process::exit(1); } };
             eprintln!("movie {}x{} @ {:.3}fps has_audio={}", movie.width, movie.height, movie.fps, movie.has_audio);
-            let mut win = match sdl2::Sdl::new("wa2-movie", movie.width as i32 as u32, movie.height) { Some(w) => w, None => { eprintln!("no SDL/display"); return; } };
+            let mut win = match sdl2::Sdl::new("wa2-movie", movie.width as i32 as u32, movie.height) { Some(w) => w, None => { eprintln!("no SDL/display"); std::process::exit(1); } };
             // args[3] is an optional external track (old debug usage); with no
             // argument the movie's own audio stream is mixed instead.
             let mixer = if args.len() >= 4 || movie.has_audio { audio::Mixer::new(&win) } else { None };
@@ -303,6 +443,10 @@ fn main() {
             }
             if let (Some(mx), Some(s)) = (mixer.as_ref(), slot) { mx.stop(s); }
             eprintln!("played {} frames", count);
+            if count == 0 || movie.decoder_failed() {
+                eprintln!("movie-test: decoder failed or produced no video frames");
+                std::process::exit(1);
+            }
         }
         "movie-frame" => {
             // movie-frame <mv.pak> <out.tga>  : decode frame 0 and save as TGA
@@ -408,7 +552,8 @@ fn main() {
             println!("dumped {} -> {} ({}x{})", args[2], args[3], img.width, img.height);
         }
         "fmtinfo" => {
-            let mut win = match sdl2::Sdl::new("fmt", 64, 64) { Some(w) => w, None => { eprintln!("no SDL/display"); return; } };
+            let mut win = match sdl2::Sdl::new("fmt", 64, 64) { Some(w) => w, None => { eprintln!("no SDL/display"); std::process::exit(1); } };
+            println!("video driver={}", sdl2::sdl_video_driver());
             for c in [0x16362004u32, 0x16762004, 0x16462004, 0x16262004] {
                 println!("0x{:08X} = {}", c, win.format_name(c));
             }
@@ -424,8 +569,18 @@ fn main() {
             };
             let surf = render::render_scene(&bg, "\u{4E00}\u{4E8C}\u{4E09}\u{56DB}\u{4E94} test", &font, 1280, 720);
             let mut win = match sdl2::Sdl::new("wa2-verify", 1280, 720) { Some(w) => w, None => { eprintln!("no SDL/display"); return; } };
-            win.present(&surf);
-            let rb = win.read_back(1280, 720);
+            let captured = match win.present_checked(&surf) {
+                Ok(surface) => surface,
+                Err(error) => { eprintln!("SDL verification failed: {error}"); std::process::exit(1); }
+            };
+            // Retina drawable dimensions can differ from the logical surface.
+            // Normalize only for the old comparison report; capture itself was
+            // validated at the actual drawable size before RenderPresent.
+            let rb = if captured.width == 1280 && captured.height == 720 {
+                captured.pixels
+            } else {
+                captured.scaled_to(1280, 720).pixels
+            };
             // compare a sample of pixels
             let mut diff = 0u32; let mut nonblack_rb = 0u32; let mut nonblack_surf = 0u32;
             for i in 0..(1280*720) {
@@ -503,13 +658,13 @@ fn main() {
             // wa2-native run <script_dir> <font.tga> <charset.txt> <bg_dir> <start_id> [bgm] [voice_dir]
             let mut win = match sdl2::Sdl::new("wa2-native", 1280, 720) {
                 Some(w) => w,
-                None => { eprintln!("error: SDL2 unavailable / no display. Try DISPLAY=:0"); return; }
+                None => { eprintln!("error: SDL2 window unavailable; check native SDL2 libraries and an active desktop session"); std::process::exit(1); }
             };
             if args.len() < 7 {
                 // Data-tree mode: everything comes from `$WA2_DATA` or ./data.
-                let d = match data::Data::resolve() { Some(d) => d, None => return };
+                let d = match data::Data::resolve() { Some(d) => d, None => std::process::exit(1) };
                 let start_id = args.get(2).cloned().unwrap_or_else(|| "1001".to_string());
-                let font = match load_font(&d) { Some(f) => f, None => return };
+                let font = match load_font(&d) { Some(f) => f, None => std::process::exit(1) };
                 eprintln!(
                     "wa2-native run: data={} start={} (Space/Click=next, Up/Wheel=rewind, PageUp=fast rewind, 1-9=choice, Esc/q=quit)",
                     d.describe(), start_id
@@ -521,6 +676,7 @@ fn main() {
                 let mut rt = Runtime::new(&win, &session);
                 if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
                     eprintln!("run error: {}", e);
+                    std::process::exit(1);
                 }
                 render::text::log_missing_glyph_stats();
                 return;
@@ -529,7 +685,7 @@ fn main() {
             let script_dir = std::path::PathBuf::from(&args[2]);
             let bg_dir = std::path::PathBuf::from(&args[5]);
             let start_id = args[6].clone();
-            let font = match load_font_paths(std::path::Path::new(&args[3]), None, Some(std::path::Path::new(&args[4]))) { Some(f) => f, None => return };
+            let font = match load_font_paths(std::path::Path::new(&args[3]), None, Some(std::path::Path::new(&args[4]))) { Some(f) => f, None => std::process::exit(1) };
             let bgm_path = args.get(7).cloned();
             let voice_dir = args.get(8).map(std::path::PathBuf::from);
             let session = Session {
@@ -551,6 +707,7 @@ fn main() {
             let mut rt = Runtime::new(&win, &session);
             if let Err(e) = run_game(&mut win, &font, &session, &start_id, &mut rt) {
                 eprintln!("run error: {}", e);
+                    std::process::exit(1);
             }
             render::text::log_missing_glyph_stats();
         }
@@ -559,12 +716,12 @@ fn main() {
             // wa2-native title <script_dir> <font.tga> <charset.txt> <bg_dir> [start_id]
             let mut win = match sdl2::Sdl::new("wa2-native", 1280, 720) {
                 Some(w) => w,
-                None => { eprintln!("error: SDL2 unavailable / no display. Try DISPLAY=:0"); return; }
+                None => { eprintln!("error: SDL2 window unavailable; check native SDL2 libraries and an active desktop session"); std::process::exit(1); }
             };
             let (font, session, start_id, bg_dir) = if args.len() >= 6 {
                 let script_dir = std::path::PathBuf::from(&args[2]);
                 let bg_dir = std::path::PathBuf::from(&args[5]);
-                let font = match load_font_paths(std::path::Path::new(&args[3]), None, Some(std::path::Path::new(&args[4]))) { Some(f) => f, None => return };
+                let font = match load_font_paths(std::path::Path::new(&args[3]), None, Some(std::path::Path::new(&args[4]))) { Some(f) => f, None => std::process::exit(1) };
                 let start_id = args.get(6).cloned().unwrap_or_else(|| "1001".to_string());
                 let session = Session {
                     script_dir: script_dir.clone(),
@@ -583,8 +740,8 @@ fn main() {
                 };
                 (font, session, start_id, bg_dir)
             } else {
-                let d = match data::Data::resolve() { Some(d) => d, None => return };
-                let font = match load_font(&d) { Some(f) => f, None => return };
+                let d = match data::Data::resolve() { Some(d) => d, None => std::process::exit(1) };
+                let font = match load_font(&d) { Some(f) => f, None => std::process::exit(1) };
                 let start_id = args.get(2).cloned().unwrap_or_else(|| "1001".to_string());
                 let bg_dir = d.bg();
                 let session = Session::from_data(&d, None);
@@ -844,7 +1001,7 @@ fn scale_mode() -> ScaleMode {
 /// pixels are supersampling). `WA2_RENDER_SCALE=auto` keeps the old
 /// window-sized decoding, a number forces one scale.
 fn decode_scale_for_window(win: &sdl2::Sdl) -> u32 {
-    let (w, h) = win.window_size();
+    let (w, h) = win.drawable_size();
     match scale_mode() {
         ScaleMode::Forced(n) => n,
         ScaleMode::Window => render_scale_for(w, h),
@@ -872,7 +1029,7 @@ fn render_art_scale() -> u32 {
 
 /// Report and apply the decode scale for the current window.
 fn set_render_art_scale(win: &sdl2::Sdl) {
-    let (w, h) = win.window_size();
+    let (w, h) = win.drawable_size();
     let want = decode_scale_for_window(win);
     static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     REPORTED.get_or_init(|| {
@@ -1854,7 +2011,12 @@ impl Runtime {
         // without touching the menu or the history. The saved ids have to be
         // in force first - a run started straight from the command line
         // reaches this point without ever loading the settings.
-        menu::Settings::load().apply_text();
+        let startup = menu::Settings::load();
+        startup.apply_text();
+        // Apply the saved mode once, not on title/game/load transitions: the
+        // native green button and global shortcuts own the live window state.
+        win.set_fullscreen(startup.win_disp == 1);
+        set_render_art_scale(win);
         // Which id this instance belongs to: run_game_at compares it with the
         // id in force when a game starts, so a font picked on the title screen
         // reaches the first line instead of the second run.
@@ -1972,6 +2134,135 @@ fn game_font_is_stale(cn: bool, open_id: i32, want_id: i32) -> bool {
     cn && open_id != want_id
 }
 
+/// Re-decode scene art after a display-scale change, including while the VM
+/// is parked on Wait. Sprite refresh is independent of the background (which
+/// may be a solid colour rather than an asset).
+fn refresh_scene_art(
+    s: &Session,
+    bg: &mut codec::tga::TgaImage,
+    bg_scale: &mut Option<u32>,
+    bg_src_scale: &mut Option<u32>,
+    bg_id: Option<(i64, u32)>,
+    bg_label: &mut String,
+    slots: &mut [Option<ActiveSprite>; SPRITE_SLOTS],
+    bank: &mut Option<SpriteBank>,
+) {
+    if bg_scale.is_some_and(|scale| scale != render_art_scale()) {
+        let reload = match bg_id {
+            Some((id, variant)) => s.bg_index.resolve(id, variant),
+            None if !bg_label.eq_ignore_ascii_case("BLACK") => Some(bg_label.clone()),
+            None => None,
+        };
+        if let Some(name) = reload {
+            if let Some(asset) = load_background_asset(&s.bg_dirs(), &name) {
+                *bg = asset.img;
+                *bg_scale = Some(asset.art_scale);
+                *bg_src_scale = Some(asset.src_scale);
+                *bg_label = name;
+                eprintln!("art: reloaded {} at decode scale {}x", bg_label, render_art_scale());
+            }
+        }
+    }
+    for slot in slots.iter_mut().flatten() {
+        if slot.art_scale != render_art_scale() {
+            if let Some(bank) = bank.as_mut() {
+                if let Some((img, art_scale, src_scale)) = bank.get(&slot.name) {
+                    slot.img = img;
+                    slot.art_scale = art_scale;
+                    slot.src_scale = src_scale;
+                }
+            }
+        }
+    }
+}
+
+fn wait_line_needs_redraw(
+    previous: (i32, i32),
+    drawable: (i32, i32),
+    settings_changed: bool,
+    scale_changed: bool,
+) -> bool {
+    drawable.0 > 0 && drawable.1 > 0
+        && (previous != drawable || settings_changed || scale_changed)
+}
+
+/// Only replace raster state. The caller retains reveal position, typewriter
+/// timing, auto dwell, hide state, speaker and the current settings.
+fn rebuild_wait_line(
+    line_done: bool,
+    text: &str,
+    current: &mut render::Surface,
+    base: &mut Option<render::Surface>,
+    mut draw: impl FnMut(&str) -> render::Surface,
+) {
+    if line_done {
+        *current = draw(text);
+        *base = None;
+    } else {
+        // The normal typewriter pass below draws the existing reveal prefix
+        // onto this new-size base before presenting or handling input.
+        *base = Some(draw(""));
+    }
+}
+
+#[cfg(test)]
+mod wait_display_tests {
+    use super::*;
+
+    fn surface(width: u32) -> render::Surface {
+        render::Surface { width, height: 1, pixels: vec![0; width as usize * 4] }
+    }
+
+    #[test]
+    fn redraw_detects_resize_settings_and_same_size_scale_changes() {
+        let old = (1280, 720);
+        assert!(!wait_line_needs_redraw(old, old, false, false));
+        assert!(wait_line_needs_redraw(old, (2560, 1440), false, false));
+        assert!(wait_line_needs_redraw(old, old, true, false));
+        assert!(wait_line_needs_redraw(old, old, false, true));
+        assert!(!wait_line_needs_redraw(old, (0, 0), true, true));
+    }
+
+    #[test]
+    fn choice_hits_follow_resized_raster_and_reject_letterbox_margins() {
+        for (w, h) in [(1280, 720), (2560, 1440), (1920, 1080), (640, 360)] {
+            let rows = choice_row_layout(3, h);
+            for (i, row) in rows.iter().enumerate() {
+                let y = row.top + row.height / 2;
+                assert_eq!(choice_row_hit(&rows, w as i32 / 2, y, w, h), Some(i));
+                assert_eq!(choice_row_hit(&rows, -1, y, w, h), None);
+                assert_eq!(choice_row_hit(&rows, w as i32, y, w, h), None);
+            }
+            assert_eq!(choice_row_hit(&rows, 0, -1, w, h), None);
+            assert_eq!(choice_row_hit(&rows, 0, h as i32, w, h), None);
+        }
+    }
+
+    #[test]
+    fn unfinished_redraw_rebuilds_only_empty_typewriter_base() {
+        let mut current = surface(1);
+        let mut base = Some(surface(1));
+        rebuild_wait_line(false, "尚未全部显示", &mut current, &mut base, |text| {
+            assert!(text.is_empty(), "redraw must not prematurely reveal the line");
+            surface(2)
+        });
+        assert_eq!(base.unwrap().width, 2);
+        assert_eq!(current.width, 1); // replaced by the ordinary reveal pass
+    }
+
+    #[test]
+    fn completed_redraw_renders_full_line_and_discards_stale_base() {
+        let mut current = surface(1);
+        let mut base = Some(surface(1));
+        rebuild_wait_line(true, "已经显示", &mut current, &mut base, |text| {
+            assert_eq!(text, "已经显示");
+            surface(2)
+        });
+        assert_eq!(current.width, 2);
+        assert!(base.is_none());
+    }
+}
+
 fn run_game_at(
     win: &mut sdl2::Sdl,
     font: &render::Font,
@@ -1982,6 +2273,7 @@ fn run_game_at(
 ) -> Result<Option<save::SaveState>, String> {
     set_render_art_scale(win);
     let mut resume = resume;
+    let acceptance_resumed = acceptance::active() && resume.is_some();
     if resume.is_none() {
         reset_script_window_alpha();
     }
@@ -1992,7 +2284,7 @@ fn run_game_at(
     const H: u32 = 720;
     // The art is laid out at 1280x720 and stretched to the window; the
     // dialogue is rasterized at the window's own size so it stays sharp.
-    let mut win_size = win.window_size();
+    let mut win_size = win.drawable_size();
     // The command bar, the message-window sheets, the voice index, the mixer
     // and the sprite bank all live in the Runtime, so a quick load replaces
     // the scene state instead of the whole engine. The dialogue font is
@@ -2041,9 +2333,9 @@ fn run_game_at(
     let voices = &rt.voices;
     // Player settings (option screen / wa2.ini).
     let mut settings = menu::Settings::load();
-    // A debug jump (`run <scene>`) starts from the saved 画面模式 too, so the
-    // decode scale matches what the title screen would have chosen.
-    win.set_fullscreen(settings.win_disp == 1);
+    // Runtime applied the startup preference. A native fullscreen change or
+    // shortcut since then must survive entering a game or loading a save.
+    settings.win_disp = i32::from(win.is_fullscreen());
     set_render_art_scale(win);
     menu::apply(&settings, mixer.as_ref());
     // F-01: the title screen may have changed the dialogue font while this
@@ -2205,12 +2497,11 @@ fn run_game_at(
         focus = snap.focus;
         let (saved_name, saved_body) = split_saved_line(&snap.text);
         last_text = saved_body;
-        last_speaker = snap
-            .vm
-            .speaker
-            .as_ref()
-            .map(|(n, _)| n.clone())
-            .or(saved_name);
+        last_speaker = match snap.display_speaker.as_ref() {
+            Some(name) => (!name.is_empty()).then(|| name.clone()),
+            // Older saves may store the name in the VM or legacy text prefix.
+            None => snap.vm.speaker.as_ref().map(|(n, _)| n.clone()).or(saved_name),
+        };
         // BGM comes back by id: the mixer slot it was playing on is gone.
         if let (Some(mx), Some(id)) = (mixer.as_ref(), snap.bgm) {
             let dir = script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
@@ -2234,6 +2525,17 @@ fn run_game_at(
         cur_surf = draw_scene(&bg, &last_text, last_speaker.as_deref(), font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
         win.present(&cur_surf);
         eprintln!("load: scene {} at pc {}", current_id, snap.vm.pc);
+        if acceptance_resumed {
+            let mut p = acceptance::probe().unwrap();
+            let hash = acceptance::screenshot(&p, "restored", &cur_surf)?;
+            acceptance::chinese(&p, &last_text)?;
+            let captured = win.present_checked(&cur_surf)?;
+            acceptance::screenshot(&p, "restored-renderer", &captured)?;
+            if p.saved_pixels.as_deref() != Some(&hash) { return Err("save/load restored pixels differ".into()); }
+            if p.saved_scene != current_id || p.saved_pc != snap.vm.pc { return Err("save/load scene or PC differs".into()); }
+            acceptance::field(&p, "restored_pixels_equal", true)?;
+            p.stage = 2;
+        }
         remember(
             &mut history,
             capture_line(
@@ -2261,7 +2563,26 @@ fn run_game_at(
         if auto_text {
             win.delay(300);
         } else {
-            match wait_input(win) {
+            match wait_input(win, |win| {
+                let drawable = win.drawable_size();
+                let scale_changed = decode_scale_for_window(win) != render_art_scale();
+                settings.win_disp = i32::from(win.is_fullscreen());
+                if wait_line_needs_redraw(win_size, drawable, false, scale_changed) {
+                    win_size = drawable;
+                    set_render_art_scale(win);
+                    refresh_scene_art(
+                        s, &mut bg, &mut bg_scale, &mut bg_src_scale, bg_id,
+                        &mut bg_label, &mut slots, bank,
+                    );
+                    cur_surf = draw_scene(
+                        &bg, &last_text, last_speaker.as_deref(), font, &slots, focus,
+                        win_size.0 as u32, win_size.1 as u32, tint.as_deref(),
+                        effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(),
+                        &plates, scene_look(&settings, bg_cg), vfont.as_mut(),
+                    );
+                }
+                win.present(&cur_surf);
+            }) {
                 sdl2::Input::Quit => return Ok(None),
                 _ => {}
             }
@@ -2301,44 +2622,14 @@ fn run_game_at(
             it.restore(snap.vm);
         }
         'events: loop {
-        win_size = win.window_size();
+        win_size = win.drawable_size();
         if decode_scale_for_window(win) != render_art_scale() {
             set_render_art_scale(win);
         }
-        // A decode-scale change (fullscreen switch, window resize) invalidates
-        // the pixels on screen: they were decoded for the old scale. Re-decode
-        // the background and the standing sprites at the new one instead of
-        // showing the old resolution stretched.
-        if bg_scale.is_some_and(|scale| scale != render_art_scale()) {
-            let dirs = s.bg_dirs();
-            let reload = match bg_id {
-                Some((id, variant)) => s.bg_index.resolve(id, variant),
-                None if !bg_label.eq_ignore_ascii_case("BLACK") => Some(bg_label.clone()),
-                None => None,
-            };
-            if let Some(name) = reload {
-                if let Some(asset) = load_background_asset(&dirs, &name) {
-                    bg = asset.img;
-                    bg_scale = Some(asset.art_scale);
-                    bg_src_scale = Some(asset.src_scale);
-                    bg_label = name;
-                    eprintln!(
-                        "art: reloaded {} at decode scale {}x",
-                        bg_label,
-                        render_art_scale()
-                    );
-                }
-            }
-            for slot in slots.iter_mut().flatten() {
-                if let Some(bank) = bank.as_mut() {
-                    if let Some((img, art_scale, src_scale)) = bank.get(&slot.name) {
-                        slot.img = img;
-                        slot.art_scale = art_scale;
-                        slot.src_scale = src_scale;
-                    }
-                }
-            }
-        }
+        refresh_scene_art(
+            s, &mut bg, &mut bg_scale, &mut bg_src_scale, bg_id,
+            &mut bg_label, &mut slots, bank,
+        );
             let event = if park_wait {
                 park_wait = false;
                 vm::lscr::Event::Wait
@@ -2909,7 +3200,7 @@ fn run_game_at(
                     // full scene rebuild per frame would be far too slow while
                     // the mouse moves, so the scene (and that line) is composited
                     // once and the rows + highlight are redrawn on a copy.
-                    let look_alpha = scene_look(&settings, bg_cg).alpha;
+                    let mut look_alpha = scene_look(&settings, bg_cg).alpha;
                     let mut base = draw_scene(
                         &bg,
                         &last_text,
@@ -2928,7 +3219,8 @@ fn run_game_at(
                         scene_look(&settings, bg_cg),
                         vfont.as_mut(),
                     );
-                    let row_layout = choice_row_layout(opts.len(), base.height);
+                    let mut row_layout = choice_row_layout(opts.len(), base.height);
+                    let mut choice_redraw = false;
                     let ui_se = ui_se_path(&s.script_dir);
                     let mut hover: Option<usize> = None;
                     let mut bar_hover: Option<cmdbar::Cmd> = None;
@@ -2948,6 +3240,27 @@ fn run_game_at(
                         1u32
                     } else {
                         loop {
+                            let drawable = win.drawable_size();
+                            let scale_changed = decode_scale_for_window(win) != render_art_scale();
+                            settings.win_disp = i32::from(win.is_fullscreen());
+                            if wait_line_needs_redraw(win_size, drawable, choice_redraw, scale_changed) {
+                                win_size = drawable;
+                                choice_redraw = false;
+                                set_render_art_scale(win);
+                                refresh_scene_art(
+                                    s, &mut bg, &mut bg_scale, &mut bg_src_scale, bg_id,
+                                    &mut bg_label, &mut slots, bank,
+                                );
+                                base = draw_scene(
+                                    &bg, &last_text, last_speaker.as_deref(), font, &slots, focus,
+                                    win_size.0 as u32, win_size.1 as u32, tint.as_deref(),
+                                    effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(),
+                                    &plates, scene_look(&settings, bg_cg), vfont.as_mut(),
+                                );
+                                row_layout = choice_row_layout(opts.len(), base.height);
+                                look_alpha = scene_look(&settings, bg_cg).alpha;
+                                cur_surf = clone_surf(&base);
+                            }
                             if cmd_rewind || rewind_left > 0 {
                                 let announce = !cmd_rewind && rewind_left <= 1;
                                 let cruising = cmd_rewind || rewind_left > 1;
@@ -3177,6 +3490,7 @@ fn run_game_at(
                                                         scene_look(&settings, bg_cg),
                                                         vfont.as_mut(),
                                                     );
+                                                    base = clone_surf(&cur_surf);
                                                 }
                                                 other => {
                                                     let is_config = other == cmdbar::Cmd::Config;
@@ -3197,6 +3511,7 @@ fn run_game_at(
                                                         &slots,
                                                         focus,
                                                         &last_text,
+                                                        last_speaker.as_deref(),
                                                         bgm_track.map(|(id, _)| id),
                                                         &cur_surf,
                                                         &backlog,
@@ -3270,30 +3585,9 @@ fn run_game_at(
                                                             return Ok(None);
                                                         }
                                                         CmdOutcome::Stay => {
-                                                            // F-17: the line under
-                                                            // the choice rows still
-                                                            // has the old font/style.
-                                                            if is_config {
-                                                                base = draw_scene(
-                                                                    &bg,
-                                                                    &last_text,
-                                                                    last_speaker.as_deref(),
-                                                                    font,
-                                                                    &slots,
-                                                                    focus,
-                                                                    win_size.0 as u32,
-                                                                    win_size.1 as u32,
-                                                                    tint.as_deref(),
-                                                                    effect.as_ref(),
-                                                                    window,
-                                                                    msg_plate.as_ref(),
-                                                                    msg_frame.as_ref(),
-                                                                    &plates,
-                                                                    scene_look(&settings, bg_cg),
-                                                                    vfont.as_mut(),
-                                                                );
-                                                                cur_surf = clone_surf(&base);
-                                                            }
+                                                            // Refresh both the underlying line and
+                                                            // choice rows using the new font/style.
+                                                            choice_redraw |= is_config;
                                                         }
                                                     }
                                                 },
@@ -3303,9 +3597,12 @@ fn run_game_at(
                                         }
                                         win.delay(16);
                                     } else {
-                                        let hit = row_layout.iter().position(|row| {
-                                            sy >= row.top && sy < row.top + row.height
-                                        });
+                                        // Rows are raster/output coordinates, unlike
+                                        // the command bar's 1280x720 layout above.
+                                        let (cx, cy) = win.surface_pos(x, y, base.width, base.height);
+                                        let hit = choice_row_hit(
+                                            &row_layout, cx, cy, base.width, base.height,
+                                        );
                                         if hit != hover {
                                             // The original plays its system UI sound
                                             // (SE_8905, the id the menu wrappers at
@@ -3379,33 +3676,44 @@ fn run_game_at(
                     let mut cmd_hover: Option<cmdbar::Cmd> = None;
                     let mut dwell: u32 = 0;
                     'wait: loop {
-                            // F-17: the option screen may have changed the
-                            // font or the dialogue style. Repaint the line that
-                            // is already on screen instead of leaving the old
-                            // glyphs there until the next line. `last_text` is
-                            // untouched - this redraws the same line.
-                            if line_redraw {
+                            // Wait can last indefinitely: the outer interpreter
+                            // loop cannot refresh its cached size until text
+                            // advances. Include native changes and changes made
+                            // while another screen was open.
+                            let drawable = win.drawable_size();
+                            let scale_changed = decode_scale_for_window(win) != render_art_scale();
+                            settings.win_disp = i32::from(win.is_fullscreen());
+                            if wait_line_needs_redraw(win_size, drawable, line_redraw, scale_changed) {
+                                win_size = drawable;
                                 line_redraw = false;
-                                win_size = win.window_size();
-                                line_base = None;
-                                line_done = true;
-                                cur_surf = draw_scene(
-                                    &bg,
-                                    &last_text,
-                                    last_speaker.as_deref(),
-                                    font,
-                                    &slots,
-                                    focus,
-                                    win_size.0 as u32,
-                                    win_size.1 as u32,
-                                    tint.as_deref(),
-                                    effect.as_ref(),
-                                    window,
-                                    msg_plate.as_ref(),
-                                    msg_frame.as_ref(),
-                                    &plates,
-                                    scene_look(&settings, bg_cg),
-                                    vfont.as_mut(),
+                                set_render_art_scale(win);
+                                refresh_scene_art(
+                                    s, &mut bg, &mut bg_scale, &mut bg_src_scale, bg_id,
+                                    &mut bg_label, &mut slots, bank,
+                                );
+                                // Rebuild the empty typewriter base or full line
+                                // without changing reveal/type_tick/dwell. Options
+                                // redraws must not finish an unfinished line either.
+                                rebuild_wait_line(
+                                    line_done, &last_text, &mut cur_surf, &mut line_base,
+                                    |text| draw_scene(
+                                        &bg,
+                                        text,
+                                        last_speaker.as_deref(),
+                                        font,
+                                        &slots,
+                                        focus,
+                                        win_size.0 as u32,
+                                        win_size.1 as u32,
+                                        tint.as_deref(),
+                                        effect.as_ref(),
+                                        window,
+                                        msg_plate.as_ref(),
+                                        msg_frame.as_ref(),
+                                        &plates,
+                                        scene_look(&settings, bg_cg),
+                                        vfont.as_mut(),
+                                    ),
                                 );
                             }
                             if cmd_rewind || rewind_left > 0 {
@@ -3589,25 +3897,79 @@ fn run_game_at(
                             let (fw, fh) = (frame.width as i32, frame.height as i32);
                             bar.draw(&mut frame, cmd_hover, active, cmd_idle(&settings), fw, fh);
                             win.present(&frame);
+                            if acceptance::active() && line_done && !last_text.is_empty() {
+                                let mut p = acceptance::probe().unwrap();
+                                p.waits += 1;
+                                if p.waits > 20 || (!acceptance_resumed && current_id != start_id) {
+                                    return Err("ordinary acceptance checkpoint not reached within initial scene/20 waits".into());
+                                }
+                                if p.stage == 2 {
+                                    let next = make_save(&it, &current_id, bg_id, effect_mode, ambient_preset_id,
+                                        tint_name.clone(), &slots, focus, &last_text, last_speaker.as_deref(), bgm_track.map(|(id, _)| id));
+                                    if next.scene == p.saved_scene && next.vm.pc == p.saved_pc {
+                                        return Err("loaded script did not advance".into());
+                                    }
+                                    acceptance::screenshot(&p, "continued", &cur_surf)?;
+                                    acceptance::field(&p, "continued_scene", &current_id)?;
+                                    acceptance::field(&p, "continued_pc", next.vm.pc)?;
+                                    acceptance::field(&p, "continuation", true)?;
+                                    if let Some(mx) = mixer.as_ref() {
+                                        let stats = mx.stats();
+                                        acceptance::field(&p, "audio_continuity_counters", format!("{stats:?}"))?;
+                                        if stats.decoder_underrun_frames != 0 || stats.device_underruns != 0 || stats.queue_errors != 0 || stats.decoder_errors != 0 {
+                                            return Err("audio starvation while rendering/loading scene".into());
+                                        }
+                                    }
+                                    p.stage = 3;
+                                    return Ok(None);
+                                }
+                                if p.waits >= 2 && bg_id.is_some() && bg_label != "BLACK" {
+                                    acceptance::chinese(&p, &last_text)?;
+                                    let snapshot = make_save(&it, &current_id, bg_id, effect_mode, ambient_preset_id,
+                                        tint_name.clone(), &slots, focus, &last_text, last_speaker.as_deref(), bgm_track.map(|(id, _)| id));
+                                    let drawable = win.drawable_size();
+                                    if (cur_surf.width as i32, cur_surf.height as i32) != drawable {
+                                        return Err(format!("scene is not rasterized at drawable size: {}x{} vs {drawable:?}", cur_surf.width, cur_surf.height));
+                                    }
+                                    if let Some(vf) = vfont.as_ref() {
+                                        acceptance::field(&p, "dialog_raster_px", vf.size())?;
+                                    }
+                                    if std::env::var_os("WA2_OPTIONS_CAPTURE").is_some() {
+                                        let mut st = settings.clone();
+                                        menu::run(win, &s.bg_dirs(), &mut st, rt.mixer.as_ref(), None, &cur_surf);
+                                    }
+                                    p.saved_pixels = Some(acceptance::screenshot(&p, "scene", &cur_surf)?);
+                                    let captured = win.present_checked(&frame)?;
+                                    acceptance::screenshot(&p, "renderer", &captured)?;
+                                    let path = p.out.join("roundtrip.sav");
+                                    snapshot.save_to(&path).map_err(|e| e.to_string())?;
+                                    if std::env::var_os("WA2_SAVELOAD_CAPTURE").is_some() {
+                                        let preview = save::SaveState::load_from(&path).ok_or("cannot load UI preview checkpoint")?;
+                                        saveload::run(win, &s.bg_dirs(), saveload::Mode::Save,
+                                            Some(preview), Some(&cur_surf), mixer.as_ref(), Some(&ui));
+                                    }
+                                    let restored = save::SaveState::load_from(&path).ok_or("cannot read saved checkpoint")?;
+                                    let resaved = p.out.join("roundtrip-reencoded.sav");
+                                    restored.save_to(&resaved).map_err(|e| e.to_string())?;
+                                    if std::fs::read(&path).map_err(|e| e.to_string())? != std::fs::read(&resaved).map_err(|e| e.to_string())? {
+                                        return Err("save serialization roundtrip differs".into());
+                                    }
+                                    p.saved_pc = snapshot.vm.pc;
+                                    p.saved_scene = snapshot.scene.clone();
+                                    acceptance::field(&p, "scene", &current_id)?;
+                                    acceptance::field(&p, "pc", snapshot.vm.pc)?;
+                                    acceptance::field(&p, "background", &bg_label)?;
+                                    acceptance::field(&p, "save_equal", true)?;
+                                    acceptance::field(&p, "script_bnr", script_dir.join(format!("{current_id}.bnr")).display())?;
+                                    acceptance::field(&p, "script_txt", script_dir.join(format!("{current_id}.txt")).display())?;
+                                    acceptance::field(&p, "decoded_samples", audio::mixer::pulled_samples())?;
+                                    p.stage = 1;
+                                    return Ok(Some(restored));
+                                }
+                                break 'wait;
+                            }
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
-                                // F11: toggle 画面模式 without opening the option
-                                // screen. The decode scale follows on the next
-                                // loop iteration.
-                                sdl2::Input::Fullscreen => {
-                                    let on = settings.win_disp != 1;
-                                    settings.win_disp = if on { 1 } else { 0 };
-                                    win.set_fullscreen(on);
-                                    set_render_art_scale(win);
-                                    if let Err(e) = settings.save() {
-                                        eprintln!("settings: save failed: {e}");
-                                    }
-                                    eprintln!(
-                                        "display: {} (decode {}x)",
-                                        if on { "fullscreen" } else { "windowed" },
-                                        render_art_scale()
-                                    );
-                                }
                                 sdl2::Input::RightClick => {
                                     // Right-click is the direct hide-dialog
                                     // gesture in gameplay. The old configurable
@@ -3731,6 +4093,7 @@ fn run_game_at(
                                                     &slots,
                                                     focus,
                                                     &last_text,
+                                                    last_speaker.as_deref(),
                                                     bgm_track.map(|(id, _)| id),
                                                     &cur_surf,
                                                     &backlog,
@@ -4179,7 +4542,7 @@ fn rewind_step(
             }
         }
     }
-    let win_size = win.window_size();
+    let win_size = win.drawable_size();
     *cur_surf = draw_scene(
         bg,
         last_text,
@@ -4228,6 +4591,7 @@ fn make_save(
     slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
     focus: Option<u32>,
     text: &str,
+    display_speaker: Option<&str>,
     bgm: Option<i32>,
 ) -> save::SaveState {
     save::SaveState {
@@ -4243,6 +4607,7 @@ fn make_save(
             .collect(),
         focus,
         text: text.to_string(),
+        display_speaker: Some(display_speaker.unwrap_or("").to_string()),
         bgm,
         time: save::now(),
         globals: it.global_snapshot(),
@@ -4454,6 +4819,7 @@ fn handle_cmd(
     slots: &[Option<ActiveSprite>; SPRITE_SLOTS],
     focus: Option<u32>,
     last_text: &str,
+    last_speaker: Option<&str>,
     bgm: Option<i32>,
     frame: &render::Surface,
     backlog: &[String],
@@ -4471,6 +4837,7 @@ fn handle_cmd(
                 slots,
                 focus,
                 last_text,
+                last_speaker,
                 bgm,
             );
             let ok = st.save_to(&save::quick_path()).is_ok();
@@ -4521,6 +4888,7 @@ fn handle_cmd(
                 slots,
                 focus,
                 last_text,
+                last_speaker,
                 bgm,
             );
             let dirs = s.bg_dirs();
@@ -4561,11 +4929,13 @@ fn handle_cmd(
             let mut st = menu::Settings::load();
             let dirs = s.bg_dirs();
             let ui = UiSound::resolve(&dirs);
-            menu::run(win, &dirs, &mut st, mixer, Some(&ui));
+            menu::run(win, &dirs, &mut st, mixer, Some(&ui), frame);
             *settings = menu::Settings::load();
             menu::apply(settings, mixer);
             refresh_dialog_font(s.cn, vfont.as_deref_mut());
-            win.set_fullscreen(settings.win_disp == 1);
+            // The menu already applied display changes; do not override a
+            // native/global toggle with the persisted preference on return.
+            settings.win_disp = i32::from(win.is_fullscreen());
             set_render_art_scale(win);
             CmdOutcome::Stay
         }
@@ -5352,6 +5722,8 @@ fn load_seen() -> std::collections::HashSet<String> {
 }
 
 fn note_seen(set: &mut std::collections::HashSet<String>, scene: &str, text: &str) {
+    // Diagnostics must not alter the player's read/skip history.
+    if acceptance::active() { return; }
     if text.is_empty() {
         return;
     }
@@ -5779,6 +6151,15 @@ fn choice_row_layout(count: usize, surface_h: u32) -> Vec<ChoiceRow> {
         .collect()
 }
 
+/// Hit testing uses the same raster coordinates as the painted rows. Reject
+/// letterbox margins instead of allowing an off-content click to select a row.
+fn choice_row_hit(rows: &[ChoiceRow], x: i32, y: i32, w: u32, h: u32) -> Option<usize> {
+    if x < 0 || y < 0 || x as u32 >= w || y as u32 >= h {
+        return None;
+    }
+    rows.iter().position(|row| y >= row.top && y < row.top + row.height)
+}
+
 /// Paint the choice rows: one message-window plate per option, squeezed to a
 /// single line, with the option text centred inside. The hovered row gets a
 /// soft inner highlight under the glyphs.
@@ -5884,7 +6265,7 @@ fn ui_se_path(script_dir: &Path) -> Option<std::path::PathBuf> {
 
 fn play_ui_se(mixer: Option<&audio::Mixer>, path: Option<&Path>) {
     if let (Some(mx), Some(path)) = (mixer, path) {
-        if mx.play_cat(&path.to_string_lossy(), 1.0, false, audio::mixer::CAT_SE) != usize::MAX {
+        if mx.play_ui(&path.to_string_lossy(), 1.0) != usize::MAX {
             eprintln!("  SE: choice UI id={} -> {}", UI_SE_ID, path.display());
         }
     }
@@ -5931,7 +6312,7 @@ fn browse_cg(
     let mut thumb_source_scale = 0u32;
     loop {
         let page = sel / cg::PER_PAGE;
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let ww = ww.max(1) as u32;
         let wh = wh.max(1) as u32;
         let (preview_w, preview_h) = cg::preview_box(ww, wh);
@@ -6194,14 +6575,14 @@ fn view_cg(
             centre = None;
             if std::env::var_os("WA2_DEBUG_CG").is_some() {
                 if let Some(ref im) = img {
-                    eprintln!("cg: view {} decoded={}x{} window={:?}", stem, im.width, im.height, win.window_size());
+                    eprintln!("cg: view {} decoded={}x{} window={:?}", stem, im.width, im.height, win.drawable_size());
                 } else {
                     eprintln!("cg: view {} FAILED to decode", stem);
                 }
             }
         }
         let z = CG_ZOOMS[zoom];
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let ww = ww.max(1) as u32;
         let wh = wh.max(1) as u32;
         let mut frame = render::Surface::new(ww, wh, [0, 0, 0, 255]);
@@ -6393,7 +6774,7 @@ fn browse_novels(
     let mut head_px = 0u32;
     let mut sel = 0usize;
     loop {
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let ww = ww.max(1);
         let wh = wh.max(1);
         if let Some(ref img) = street {
@@ -6562,7 +6943,7 @@ fn browse_voice_messages(
     // Stream slot plus what it belongs to, so its row can be marked playing.
     let mut playing: Option<(usize, usize, usize)> = None;
     loop {
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let ww = ww.max(1) as u32;
         let wh = wh.max(1) as u32;
         let sx = |x: i32| x * ww as i32 / W as i32;
@@ -6936,6 +7317,21 @@ fn load_ui_asset_hi(
     None
 }
 
+/// Draw the five title rows from the original idle/selected atlas columns.
+fn paint_title_atlas(frame: &mut render::Surface, atlas: &HiUiAsset, selected: usize,
+    x: i32, y: i32, pitch: i32) {
+    let scale = atlas.scale as i32;
+    let ww = frame.width as i32;
+    let wh = frame.height as i32;
+    for row in 0..5 {
+        frame.blit_region_scaled(&atlas.img,
+            if row == selected { 320 * scale } else { 0 }, row as i32 * 40 * scale,
+            320 * atlas.scale, 40 * atlas.scale,
+            x * ww / 1280, (y + row as i32 * pitch) * wh / 720,
+            (320 * ww / 1280).max(1) as u32, (40 * wh / 720).max(1) as u32, 255);
+    }
+}
+
 /// Rasterize menu labels once. Each line is the system CJK font, white on
 /// transparent, ready to be tinted white or gold per frame.
 fn menu_labels(items: &[&str], size: u32) -> Vec<Option<(u32, u32, Vec<u8>)>> {
@@ -7016,7 +7412,7 @@ fn find_se(dirs: &[&std::path::Path], id: u32) -> Option<std::path::PathBuf> {
 pub fn play_ui(mixer: Option<&audio::Mixer>, sounds: Option<&UiSound>, kind: UiSe) {
     let (Some(mx), Some(s)) = (mixer, sounds) else { return };
     let Some(p) = s.path(kind) else { return };
-    if mx.play_cat(&p.to_string_lossy(), 1.0, false, audio::mixer::CAT_SE) != usize::MAX {
+    if mx.play_ui(&p.to_string_lossy(), 1.0) != usize::MAX {
         eprintln!("  SE: menu {:?} -> {}", kind, p.display());
     }
 }
@@ -7341,7 +7737,7 @@ fn run_special(
             }
             _ => {}
         }
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let ww = ww.max(1);
         let wh = wh.max(1);
         let target = (Y0 + sel as i32 * PITCH) as f32;
@@ -7557,7 +7953,7 @@ fn run_music(
         }
         let page_size = 39usize;
         let top = (selected / page_size) * page_size;
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let ww = ww.max(1) as u32;
         let wh = wh.max(1) as u32;
         let sx = |x: i32| (x as u32 * ww / W).max(0);
@@ -7766,9 +8162,9 @@ fn start_title_bgm(mixer: Option<&audio::Mixer>, bg_dirs: &[&std::path::Path]) -
     }
 }
 
-/// Original title screen. The logo, highlight bar and copyright stay the
-/// game's art. The five item labels are the system font, white at rest and
-/// gold when selected, so a player font can replace them later.
+/// Title reconstructed from the game's logo, highlight bar, copyright and
+/// original T0100 menu label atlas. Asset fidelity does not certify exact
+/// animation/layout equivalence to every original PC release.
 ///
 ///   T0000  1280x856  street plate. A 720-tall window pans down it.
 ///   weather.tga      snowfall, drawn over the street and the logo
@@ -7804,9 +8200,8 @@ fn run_title(
     const H: u32 = 720;
     const ITEM_W: i32 = 320;
     const ITEM_H: i32 = 40;
-    // The highlight oval is 40px. The labels are larger than the original
-    // bitmap row, so the rows sit further apart than the oval height.
-    const PITCH: i32 = 52;
+    // Use the original atlas row pitch rather than the enlarged custom labels.
+    const PITCH: i32 = 40;
     const N: usize = 5;
     const X0: i32 = (W as i32 - ITEM_W) / 2;
     const Y0: i32 = 412;
@@ -7835,6 +8230,10 @@ fn run_title(
     let logo = load_background(bg_dirs, "T0011.tga");
     let copyright = load_background(bg_dirs, "T0020.tga");
     let bar = load_background(bg_dirs, "T0101.tga");
+    let original_labels = load_ui_asset_hi(bg_dirs, "T0100.tga", 640, 640);
+    let street_hi = load_ui_asset_hi(bg_dirs, "T0000.tga", 1280, 856);
+    let logo_hi = load_ui_asset_hi(bg_dirs, "T0011.tga", 752, 448);
+    let copyright_hi = load_ui_asset_hi(bg_dirs, "T0020.tga", 264, 24);
     // Source Y of the 720-tall window into T0000. The exe adds 1.2 per frame
     // and stops at image_height − 720, which is 136 for the shipped plate.
     let scroll_max = street
@@ -7846,12 +8245,12 @@ fn run_title(
     let mut street_scaled: Option<(i32, i32, render::Surface)> = None;
 
     if std::env::var_os("WA2_DEBUG_INPUT").is_some() {
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         eprintln!("title: window_size = {}x{}", ww, wh);
     }
-    // 「画面模式」 applies as soon as the option screen is left.
+    // Display mode is live window state; Runtime applies its preference only
+    // at startup so returning home preserves native/global fullscreen changes.
     let startup = menu::Settings::load();
-    win.set_fullscreen(startup.win_disp == 1);
     set_render_art_scale(win);
     if let Some(mx) = mixer {
         menu::apply(&startup, Some(mx));
@@ -7865,7 +8264,7 @@ fn run_title(
     let cg_preview_scale = if win.is_fullscreen() || win.is_maximized() { 4 } else { 2 };
     let cg_preview_dirs = cg::preview_dirs(bg_dirs, cg_preview_scale);
     let cg_stems = cg::cg_stems(&cg_preview_dirs);
-    let (cg_ww, cg_wh) = win.window_size();
+    let (cg_ww, cg_wh) = win.drawable_size();
     let (cg_pw, cg_ph) = cg::preview_box(cg_ww.max(1) as u32, cg_wh.max(1) as u32);
     let cg_warmup_stems: Vec<String> = cg_stems
         .into_iter()
@@ -7890,7 +8289,6 @@ fn run_title(
     // can be stopped on the way out of every path.
     let picked: TitleAction;
     let mut sel = 0usize;
-    let mut pointer_hover = false;
     let mut notice: Option<&str> = None;
     let mut bar_y = item_y(0);
     let mut flash_until = std::time::Instant::now();
@@ -7912,20 +8310,17 @@ fn run_title(
         } else {
             match win.poll_input() {
                 sdl2::Input::Up => {
-                    pointer_hover = false;
                     sel = (sel + N - 1) % N;
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
                     play_ui(mixer, Some(&ui), UiSe::Move);
                 }
                 sdl2::Input::Down => {
-                    pointer_hover = false;
                     sel = (sel + 1) % N;
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
                     play_ui(mixer, Some(&ui), UiSe::Move);
                 }
                 sdl2::Input::Advance | sdl2::Input::Right => confirm = true,
                 sdl2::Input::Choice(k) => {
-                    pointer_hover = false;
                     sel = ((k as usize).saturating_sub(1)).min(N - 1);
                     flash_until = std::time::Instant::now() + std::time::Duration::from_millis(160);
                     confirm = true;
@@ -7943,7 +8338,6 @@ fn run_title(
                         let iy = Y0 + *i as i32 * PITCH;
                         sx >= X0 && sx < X0 + ITEM_W && sy >= iy && sy < iy + ITEM_H
                     }) {
-                        pointer_hover = true;
                         if i != sel {
                             sel = i;
                             flash_until =
@@ -7960,9 +8354,10 @@ fn run_title(
         }
 
         // ---- animate the highlight bar and the street ----------------------
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let ww = ww.max(1);
         let wh = wh.max(1);
+        if acceptance::active() { bar_y = item_y(sel); }
         slide_bar(&mut bar_y, item_y(sel), wh);
         let flashing = std::time::Instant::now() < flash_until;
         let now = std::time::Instant::now();
@@ -8010,8 +8405,10 @@ fn run_title(
                 // the plate itself is the navy field the logo was authored on.
                 let plate_bg = if street.is_some() { [0, 0, 0, 0] } else { BACKDROP };
                 let mut s = render::Surface::new(W, H, plate_bg);
-                if let Some(ref lg) = logo {
-                    s.blit(lg, (W as i32 - lg.width as i32) / 2, 24);
+                if logo_hi.is_none() {
+                    if let Some(ref lg) = logo {
+                        s.blit(lg, (W as i32 - lg.width as i32) / 2, 24);
+                    }
                 }
                 if baked_notice {
                     if let Some(n) = notice {
@@ -8028,8 +8425,10 @@ fn run_title(
                         font.draw(&mut s, n, nx, 378);
                     }
                 }
-                if let Some(ref cp) = copyright {
-                    s.blit(cp, W as i32 - cp.width as i32 - 24, H as i32 - cp.height as i32 - 14);
+                if copyright_hi.is_none() {
+                    if let Some(ref cp) = copyright {
+                        s.blit(cp, W as i32 - cp.width as i32 - 24, H as i32 - cp.height as i32 - 14);
+                    }
                 }
                 s
             },
@@ -8045,7 +8444,8 @@ fn run_title(
             };
             if rebuild {
                 let dh = ((img.height as i64 * wh as i64) / H as i64).max(wh as i64) as u32;
-                street_scaled = Some((ww, wh, surface_from_tga(img).scaled_to(ww as u32, dh)));
+                let source = street_hi.as_ref().map(|hi| &hi.img).unwrap_or(img);
+                street_scaled = Some((ww, wh, surface_from_tga(source).scaled_to(ww as u32, dh)));
             }
             let scaled = &street_scaled.as_ref().unwrap().2;
             let max_y = (scaled.height as i32 - wh).max(0);
@@ -8057,15 +8457,24 @@ fn run_title(
         } else {
             clone_surf(&fitted.plate)
         };
-        // Bar under the labels: the glyphs are drawn on top of the oval.
-        // The original selection bar remains for keyboard navigation. Mouse
-        // hover keeps the label highlight but omits the heavy background bar,
-        // which avoids a laggy full-screen hover plate over the animated snow.
-        let hide_hover_bar = pointer_hover && (win.is_fullscreen() || win.is_maximized());
-        if !hide_hover_bar {
-            paint_bar(&mut frame, fitted, if flashing { 1 } else { 0 }, bar_y, X0);
+        if let Some(hi) = logo_hi.as_ref() {
+            frame.blit_region_scaled(&hi.img, 0, 0, hi.img.width, hi.img.height,
+                264 * ww / 1280, 24 * wh / 720,
+                (752 * ww / 1280) as u32, (448 * wh / 720) as u32, 255);
         }
-        draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
+        if let Some(hi) = copyright_hi.as_ref() {
+            frame.blit_region_scaled(&hi.img, 0, 0, hi.img.width, hi.img.height,
+                992 * ww / 1280, 682 * wh / 720,
+                (264 * ww / 1280) as u32, (24 * wh / 720) as u32, 255);
+        }
+        // Preserve the authored label shapes and both atlas states. Vector labels
+        // are a missing-resource fallback, not a replacement for the game's art.
+        paint_bar(&mut frame, fitted, if flashing { 1 } else { 0 }, bar_y, X0);
+        if let Some(atlas) = original_labels.as_ref() {
+            paint_title_atlas(&mut frame, atlas, sel, X0, Y0, PITCH);
+        } else {
+            draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
+        }
         if notice.is_some() {
             if let Some((rw, rh, rgba)) = note_img.as_ref() {
                 let nx = ww / 2 - *rw as i32 / 2;
@@ -8087,6 +8496,51 @@ fn run_title(
             snow.paint(&mut frame, wh);
         }
         win.present(&frame);
+        if acceptance::active() {
+            if std::env::var_os("WA2_SAVELOAD_CAPTURE").is_some() {
+                saveload::run(win, bg_dirs, saveload::Mode::Load, None, Some(&frame), mixer, Some(&ui));
+            }
+            if std::env::var_os("WA2_OPTIONS_CAPTURE").is_some() {
+                let mut st = menu::Settings::load();
+                menu::run(win, bg_dirs, &mut st, mixer, Some(&ui), &frame);
+            }
+            let result = (|| -> Result<(), String> {
+                let mut p = acceptance::probe().unwrap();
+                if street.is_none() || logo.is_none() || copyright.is_none() || bar.is_none()
+                    || labels.iter().any(Option::is_none) {
+                    return Err("title asset or Chinese menu label missing".into());
+                }
+                acceptance::chinese(&p, &items.join(" "))?;
+                acceptance::screenshot(&p, "title", &frame)?;
+                let captured = win.present_checked(&frame)?;
+                acceptance::screenshot(&p, "renderer", &captured)?;
+                // Allow real title BGM decoding/queueing, while pumping Cocoa.
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < until {
+                    if matches!(win.poll_input(), sdl2::Input::Quit) { return Err("title cancelled".into()); }
+                    win.delay(16);
+                }
+                let samples = audio::mixer::pulled_samples();
+                acceptance::field(&p, "decoded_samples", samples)?;
+                acceptance::field(&p, "queued_bytes", audio::mixer::queued_bytes())?;
+                if bgm_slot.is_none() || samples == 0 { return Err("title BGM produced no PCM".into()); }
+                if let Some(mx) = mixer {
+                    let stats = mx.stats();
+                    acceptance::field(&p, "audio_continuity_counters", format!("{stats:?}"))?;
+                    if stats.decoder_underrun_frames != 0 || stats.device_underruns != 0 || stats.queue_errors != 0 || stats.decoder_errors != 0 {
+                        return Err("audio starvation while rendering title/options".into());
+                    }
+                }
+                acceptance::field(&p, "title_assets", "T0000,T0011,T0020,T0100,T0101")?;
+                acceptance::field(&p, "original_label_atlas", original_labels.is_some())?;
+                if original_labels.is_none() { return Err("original title label atlas unavailable".into()); }
+                p.stage = 3;
+                Ok(())
+            })();
+            if let Err(error) = result { eprintln!("acceptance: {error}"); std::process::exit(1); }
+            picked = TitleAction::Quit;
+            break;
+        }
 
         // ---- act on the confirmation ---------------------------------------
         if confirm {
@@ -8108,7 +8562,7 @@ fn run_title(
                         bg_dirs,
                         saveload::Mode::Load,
                         None,
-                        None,
+                        Some(&frame),
                         mixer,
                         Some(&ui),
                     ) {
@@ -8121,8 +8575,8 @@ fn run_title(
                     // 「系统设置」: the game's own option screen.
                     let mut st = menu::Settings::load();
                     menu::apply(&st, None);
-                    menu::run(win, bg_dirs, &mut st, mixer, Some(&ui));
-                    win.set_fullscreen(st.win_disp == 1);
+                    menu::run(win, bg_dirs, &mut st, mixer, Some(&ui), &frame);
+                    // The option screen owns explicit display changes.
                     set_render_art_scale(win);
                     notice = None;
                 }
@@ -8296,9 +8750,13 @@ fn play_movie(
     Some(())
 }
 
-/// Block until a non-None input event arrives.
-fn wait_input(win: &mut sdl2::Sdl) -> sdl2::Input {
+/// Keep a parked preview responsive to display changes without advancing it.
+fn wait_input(
+    win: &mut sdl2::Sdl,
+    mut redraw: impl FnMut(&mut sdl2::Sdl),
+) -> sdl2::Input {
     loop {
+        redraw(win);
         let ev = win.poll_input();
         match ev {
             sdl2::Input::None | sdl2::Input::Pointer { pressed: false, .. } => {}
@@ -8470,6 +8928,8 @@ mod ui_sound_tests {
         st.ero_voice = 0;
         assert!(!h_scene_voice_allowed(&st, "2031", 2));
         assert!(h_scene_voice_allowed(&st, "2001", 2));
+        assert!(!h_scene_voice_allowed(&st, "3001", 2));
+        assert!(h_scene_voice_allowed(&st, "3002", 2));
         st.ero_voice = 2;
         assert!(h_scene_voice_allowed(&st, "2031", 2));
         assert!(!h_scene_voice_allowed(&st, "2031", 10));
@@ -8480,6 +8940,24 @@ mod ui_sound_tests {
 
 #[cfg(test)]
 mod menu_bar {
+    #[test]
+    fn title_rows_use_original_idle_and_selected_columns_at_retina_size() {
+        let mut rgba = vec![0u8; 640 * 640 * 4];
+        for y in 0..200usize {
+            for x in 0..640usize {
+                let i = (y * 640 + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&[(y / 40 + 1) as u8, if x >= 320 { 200 } else { 20 }, 40, 255]);
+            }
+        }
+        let atlas = super::HiUiAsset { img: crate::codec::tga::TgaImage { width: 640, height: 640, rgba }, scale: 1 };
+        let mut frame = crate::render::Surface::new(2560, 1440, [0, 0, 0, 255]);
+        super::paint_title_atlas(&mut frame, &atlas, 2, 480, 412, 40);
+        for row in 0..5usize {
+            let i = (((412 + row * 40 + 20) * 2) * 2560 + 640 * 2) * 4;
+            assert_eq!(&frame.pixels[i..i+4], &[(row+1) as u8, if row == 2 {200} else {20}, 40, 255]);
+        }
+    }
+
     #[test]
     fn windowed_step_is_thirty_percent() {
         let mut y = 432.0;
@@ -8555,23 +9033,22 @@ mod rewind_history {
     }
 }
 
+#[cfg(test)]
 mod backlog_paint {
     #[test]
     fn history_paints_the_banner_and_the_lines() {
         let atlas = crate::codec::tga::decode_font(
-            &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
+            &std::fs::read(crate::test_data::root().join("font/cn_body80.tga")).unwrap(),
         )
         .unwrap();
         let font = crate::render::Font::from_cell_map(
             atlas,
             40,
-            std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
+            &crate::test_data::root().join("font/wa2_cell_map_cn.tsv"),
         )
         .unwrap();
-        let dirs = [
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+        let dir_buf = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = dir_buf.iter().map(|p| p.as_path()).collect();
         let header = super::load_background(&dirs, "sys_00032.tga");
         let scroll = super::load_background(&dirs, "sys_00030.tga");
         assert!(header.is_some());
@@ -8616,10 +9093,8 @@ mod backlog_paint {
         ) else {
             return;
         };
-        let dirs = [
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+        let dir_buf = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = dir_buf.iter().map(|p| p.as_path()).collect();
         let header = super::load_background(&dirs, "sys_00032.tga");
         let scroll = super::load_background(&dirs, "sys_00030.tga");
         let scene = crate::render::Surface::new(1280, 720, [80, 120, 160, 255]);
@@ -8633,11 +9108,11 @@ mod backlog_paint {
             &scene,
             &crate::render::Font::from_cell_map(
                 crate::codec::tga::decode_font(
-                    &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
+                    &std::fs::read(crate::test_data::root().join("font/cn_body80.tga")).unwrap(),
                 )
                 .unwrap(),
                 40,
-                std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
+                &crate::test_data::root().join("font/wa2_cell_map_cn.tsv"),
             )
             .unwrap(),
             Some(&mut vf),
@@ -8665,10 +9140,8 @@ mod backlog_paint {
 
     #[test]
     fn quick_load_confirm_paints_yes_and_no() {
-        let dirs = [
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+        let dir_buf = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = dir_buf.iter().map(|p| p.as_path()).collect();
         let plate = super::load_background(&dirs, "sys_00100.tga").unwrap();
         let buttons = super::load_background(&dirs, "sys_00101.tga").unwrap();
         let scene = crate::render::Surface::new(1280, 720, [20, 20, 20, 255]);

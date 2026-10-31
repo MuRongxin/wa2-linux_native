@@ -1735,6 +1735,10 @@ fn medium_paths() -> &'static [(&'static str, i64)] {
         &[
             ("/System/Library/Fonts/PingFang.ttc", 0),
             ("/Library/Fonts/NotoSansCJK-Medium.ttc", SC_FACE),
+            // PingFang may live in an on-demand asset directory on newer macOS.
+            // These installed system fonts provide a local Simplified Chinese fallback.
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+            ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
         ]
     } else {
         &[
@@ -1773,6 +1777,9 @@ fn font_search_dirs() -> Vec<String> {
         v.push("/System/Library/Fonts".to_string());
         v.push("/System/Library/Fonts/Supplemental".to_string());
         v.push("/Library/Fonts".to_string());
+        if let Ok(home) = std::env::var("HOME") {
+            v.push(format!("{}/Library/Fonts", home));
+        }
     } else {
         v.push("/usr/share/fonts".to_string());
         v.push("/usr/local/share/fonts".to_string());

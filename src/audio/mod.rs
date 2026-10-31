@@ -5,4 +5,5 @@
 //! output go through SDL2 — see `mixer`.
 
 pub mod mixer;
+pub mod acceptance;
 pub use mixer::Mixer;

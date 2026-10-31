@@ -542,16 +542,15 @@ mod tests {
         let source = scaled.join("panel.tga");
         write_tga(&source, 16, 16);
         let webp = scaled.join("panel.webp");
-        let status = std::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-i"])
-            .arg(&source)
-            .args(["-c:v", "libwebp", "-lossless", "1"])
-            .arg(&webp)
-            .status();
-        if !status.is_ok_and(|s| s.success()) {
-            std::fs::remove_dir_all(&dir).ok();
-            return;
-        }
+        // Fixed 16x16 RGBA(128,128,128,128) lossless WebP. Decoder coverage
+        // must not silently disappear when the local FFmpeg lacks libwebp's
+        // encoder (as in recent macOS Homebrew builds).
+        const FIXTURE: &[u8] = &[
+            82, 73, 70, 70, 30, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76,
+            17, 0, 0, 0, 47, 15, 192, 3, 16, 7, 80, 192, 2, 22, 176, 128,
+            129, 136, 232, 127, 0, 0,
+        ];
+        std::fs::write(&webp, FIXTURE).unwrap();
         let ui = super::decode_ui_file(&webp).unwrap();
         assert_eq!((ui.width, ui.height), (2, 2));
         let old = std::env::var_os("WA2_RENDER_SCALE");

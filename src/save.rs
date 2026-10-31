@@ -72,6 +72,9 @@ pub struct SaveState {
     pub focus: Option<u32>,
     /// The line being shown when the save was made.
     pub text: String,
+    /// Visible nameplate, separate from the VM's already-consumed speaker cue.
+    /// None means an older save without this key; Some("") is narration.
+    pub display_speaker: Option<String>,
     /// BGM track id, restarted on load.
     pub bgm: Option<i32>,
     /// Wall clock time of the save, for the slot caption.
@@ -204,6 +207,10 @@ impl SaveState {
         line("focus", self.focus.map(|f| f.to_string()).unwrap_or_default());
         line("bgm", self.bgm.map(|b| b.to_string()).unwrap_or_default());
         line("text", self.text.clone());
+        // Preserve missing-vs-explicitly-empty for backward-compatible narration.
+        if let Some(name) = self.display_speaker.as_ref() {
+            line("display_speaker", name.clone());
+        }
         line("global_values", join_nums(&self.globals));
         // Retain the old key for third-party slot browsers; it is ignored by
         // the native loader and no longer carries story state.
@@ -318,6 +325,7 @@ impl SaveState {
             slots,
             focus: num(&m, "focus"),
             text: m.get("text").cloned().unwrap_or_default(),
+            display_speaker: m.get("display_speaker").cloned(),
             bgm: num(&m, "bgm"),
             time: m.get("time").cloned().unwrap_or_default(),
             globals: if version >= 2 { nums(&m, "global_values") } else { Vec::new() },
@@ -453,6 +461,7 @@ mod tests {
             slots: vec![None; crate::SPRITE_SLOTS],
             focus: None,
             text: "line".into(),
+            display_speaker: Some("轻音部员".into()),
             bgm: None,
             time: "2026-10-21 00:00".into(),
             globals: vec![1, 2, 3, 4, 5],
@@ -461,7 +470,16 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.starts_with("; WHITE ALBUM 2 native port - save slot\n"));
         assert!(raw.contains("version=2\n"));
-        assert_eq!(SaveState::load_from(&path).unwrap().globals, st.globals);
+        let loaded = SaveState::load_from(&path).unwrap();
+        assert_eq!(loaded.globals, st.globals);
+        assert_eq!(loaded.display_speaker.as_deref(), Some("轻音部员"));
+        assert!(loaded.vm.speaker.is_none(), "display speaker must not mutate consumed VM cue");
+        let old = raw.lines().filter(|line| !line.starts_with("display_speaker=")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, old).unwrap();
+        assert!(SaveState::load_from(&path).unwrap().display_speaker.is_none());
+        let narration = SaveState { display_speaker: Some(String::new()), ..st };
+        narration.save_to(&path).unwrap();
+        assert_eq!(SaveState::load_from(&path).unwrap().display_speaker.as_deref(), Some(""));
         assert!(!dir.join(".save_00.sav.tmp").exists());
         let _ = std::fs::remove_dir_all(dir);
     }

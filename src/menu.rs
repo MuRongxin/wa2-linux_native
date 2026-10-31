@@ -833,10 +833,15 @@ fn tree_scale_suffix(dir: &Path) -> Option<&'static str> {
 }
 
 fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
+    load_resolution(dirs, name, false)
+}
+
+fn load_resolution(dirs: &[&Path], name: &str, native: bool) -> Option<TgaImage> {
+    let decode = |p: &Path| if native { crate::codec::image::decode_file(p) } else { crate::codec::image::decode_ui_file(p) };
     for dir in dirs {
         for cand in crate::codec::image::candidate_names(name) {
             let p = dir.join(&cand);
-            if let Ok(img) = crate::codec::image::decode_ui_file(&p) {
+            if let Ok(img) = decode(&p) {
                     return Some(img);
             }
         }
@@ -847,7 +852,7 @@ fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
             for e in rd.flatten() {
                 if let Ok(n) = e.file_name().into_string() {
                     if wants.iter().any(|w| n.to_ascii_lowercase() == *w) {
-                        if let Ok(img) = crate::codec::image::decode_ui_file(&e.path()) {
+                        if let Ok(img) = decode(&e.path()) {
                             return Some(img);
                         }
                     }
@@ -861,36 +866,27 @@ fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
 
 impl Assets {
     pub fn load(dirs: &[&Path]) -> Assets {
-        // The menu sheets are drawn at their logical 1280x720 size, and the
-        // patch's Chinese artwork lives in the 1x trees. The 4x tree is a
-        // runtime art tree produced by the upscaler: on the sound page its
-        // AI-upgraded sheets lost the 音量ON/OFF glyphs, so the originals come
-        // first here and 4x is only a last resort.
-        let mut ordered: Vec<&Path> = Vec::new();
-        ordered.extend(dirs.iter().copied().filter(|d| tree_scale_suffix(d).is_none()));
-        ordered.extend(
-            dirs.iter()
-                .copied()
-                .filter(|d| tree_scale_suffix(d).is_some_and(|s| s != "4x")),
-        );
-        ordered.extend(
-            dirs.iter()
-                .copied()
-                .filter(|d| tree_scale_suffix(d) == Some("4x")),
-        );
+        Self::load_resolution(dirs, false)
+    }
+
+    /// Keep native atlas pixels for drawable-resolution UI composition.
+    fn load_resolution(dirs: &[&Path], native: bool) -> Assets {
+        // Language priority must outrank resolution: an original JP tree must
+        // not shadow a scaled CN patch. Within each language prefer the least
+        // processed source, then the smallest available scaled sibling.
+        let mut ordered = dirs.to_vec();
+        ordered.sort_by_key(|d| {
+            let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let language = if name == "bg_cn" || name.starts_with("bg_cn_") { 0 } else { 1 };
+            (language, crate::codec::image::dir_art_scale(d))
+        });
         let dirs: &[&Path] = &ordered;
-        let cache = clean_dir();
-        let clean = [
-            read_clean(&cache, 0),
-            read_clean(&cache, 1),
-            read_clean(&cache, 2),
-        ];
-        let hover = [
-            read_hover(&cache, 0),
-            read_hover(&cache, 1),
-            read_hover(&cache, 2),
-        ];
-        Assets {
+        let load = |dirs: &[&Path], name: &str| load_resolution(dirs, name, native);
+        // Old menu-clean caches erase captions and flatten their alpha onto
+        // black. They are derived artwork, not an authoritative source.
+        let clean = [None, None, None];
+        let hover = [None, None, None];
+        let mut assets = Assets {
             base: [
                 load(dirs, "sys_03100.tga"),
                 load(dirs, "sys_03101.tga"),
@@ -917,7 +913,44 @@ impl Assets {
                 load(dirs, "sys_03041.tga"),
                 load(dirs, "sys_03042.tga"),
             ],
+        };
+        if using_cn_art(dirs) {
+            // The distributed CN patch incorrectly labels windowed display as
+            // 瞬间显示 (even its English subtitle says Window). Use the actual
+            // original JP button, not a guessed blank plate or generated art.
+            let jp: Vec<_> = dirs.iter().copied().filter(|d| {
+                let n = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                n == "bg" || n.starts_with("bg_") && !n.starts_with("bg_cn")
+            }).collect();
+            for (sheet, name) in [
+                (&mut assets.base[0], "sys_03100.tga"),
+                (&mut assets.gold[0], "sys_03200.tga"),
+                (&mut assets.cyan[0], "sys_03201.tga"),
+            ] {
+                if let (Some(target), Some(original)) = (sheet.as_mut(), load(&jp, name)) {
+                    copy_windowed_button(target, &original);
+                }
+            }
+            // The installed CN atlases lose the lower-right 224×64 region
+            // (including the final arrow/scale and guide rule). This rectangle
+            // carries shared UI, not translated labels. Restore the matching
+            // original pixels only when the entire patch corner is absent.
+            for page in 0..3 {
+                for (sheet, name) in [
+                    (&mut assets.base[page], format!("sys_0310{}.tga", page)),
+                    (&mut assets.cyan[page], format!("sys_032{}1.tga", page)),
+                ] {
+                    if let Some(target) = sheet.as_mut() {
+                        if missing_patch_corner(target) {
+                            if let Some(original) = load(&jp, &name) {
+                                copy_original_rect(target, &original, 800, 400, 224, 64);
+                            }
+                        }
+                    }
+                }
+            }
         }
+        assets
     }
 
     pub fn available(&self) -> bool {
@@ -947,6 +980,30 @@ pub struct Screen {
     pub font_sel: usize,
 }
 
+/// Source sheets keep native pixels; geometry and input stay in 1280×720.
+fn ui_blit(s: &mut Surface, img: &TgaImage, logical_width: i32,
+    sx: i32, sy: i32, sw: u32, sh: u32, dx: i32, dy: i32) {
+    let scale = (img.width / logical_width as u32).max(1);
+    let x = |v: i32| v * s.width as i32 / W as i32;
+    let y = |v: i32| v * s.height as i32 / H as i32;
+    s.blit_region_scaled(img, sx * scale as i32, sy * scale as i32,
+        sw * scale, sh * scale, x(dx), y(dy),
+        (x(dx + sw as i32) - x(dx)).max(0) as u32,
+        (y(dy + sh as i32) - y(dy)).max(0) as u32, 255);
+}
+
+fn restore_under(s: &mut Surface, under: &[u8], x: i32, y: i32, w: i32, h: i32) {
+    let x0 = (x * s.width as i32 / W as i32).max(0);
+    let x1 = ((x + w) * s.width as i32 / W as i32).min(s.width as i32);
+    let y0 = (y * s.height as i32 / H as i32).max(0);
+    let y1 = ((y + h) * s.height as i32 / H as i32).min(s.height as i32);
+    for yy in y0..y1 {
+        let start = ((yy as u32 * s.width + x0 as u32) * 4) as usize;
+        let end = ((yy as u32 * s.width + x1 as u32) * 4) as usize;
+        s.pixels[start..end].copy_from_slice(&under[start..end]);
+    }
+}
+
 fn draw_page(
     s: &mut Surface,
     a: &Assets,
@@ -955,18 +1012,21 @@ fn draw_page(
     st: &Settings,
     styles: &[Style],
 ) {
-    // A baked clean page replaces the art and the wipe with one blit.
+    // State sheets contain complete buttons, including their own translucent
+    // captions. Replace a state over the same backdrop, not over another
+    // caption/plate (which doubles alpha and makes lettering look ghosted).
+    let under = s.pixels.clone();
     let shift = page_shift(page);
-    let src = a.clean[page].as_ref().or_else(|| a.base[page].as_ref());
+    let src = a.base[page].as_ref();
     if let Some(b) = src {
         if shift > 0 {
             // Page 1 carries the font rows, so the artwork is cut at the split:
             // the strip above stays, everything below moves down, and the band
             // that opens up is theirs. The plate is black and so is the screen
             // behind it, so the seam does not show.
-            s.blit_region(b, 0, 0, PAGE_W as u32, FONT_SPLIT as u32, PAGE_X, PAGE_Y);
-            s.blit_region(
-                b,
+            ui_blit(s, b, PAGE_W, 0, 0, PAGE_W as u32, FONT_SPLIT as u32, PAGE_X, PAGE_Y);
+            ui_blit(s,
+                b, PAGE_W,
                 0,
                 FONT_SPLIT,
                 PAGE_W as u32,
@@ -975,13 +1035,13 @@ fn draw_page(
                 PAGE_Y + FONT_SPLIT + shift,
             );
         } else {
-            s.blit(b, PAGE_X, PAGE_Y);
+            ui_blit(s, b, PAGE_W, 0, 0, PAGE_W as u32, PAGE_H as u32, PAGE_X, PAGE_Y);
         }
     }
     // The baked state sheet carries the original captions inside every plate.
     // The cached copy has the plates rebuilt from the clean page, so only its
     // rims are new.
-    let state = a.hover[page].as_ref().or_else(|| a.cyan[page].as_ref());
+    let state = a.gold[page].as_ref();
     // Slider values: the gold layer is a "lit" copy of the whole bar, so the
     // current level is the part of it that gets blitted back over the dark bar.
     let mut done: Vec<&str> = Vec::new();
@@ -995,7 +1055,7 @@ fn draw_page(
         }
         done.push(sl.key);
         if let (Some(src), Some(w)) = (state, fill_width(st, sl)) {
-            s.blit_region(src, sl.x0, sl.y, w as u32, BAR_H as u32, PAGE_X + sl.x0, page_y(page, sl.y));
+            ui_blit(s, src, PAGE_W, sl.x0, sl.y, w as u32, BAR_H as u32, PAGE_X + sl.x0, page_y(page, sl.y));
         }
     }
     for (i, h) in hots.iter().enumerate() {
@@ -1006,10 +1066,8 @@ fn draw_page(
             continue;
         }
         let src = match style {
-            // The value sheet is gold. Its rim and the body wash both read as
-            // yellow, which fights the cyan page. Selected and hovered options
-            // use the cyan sheet; the body wash tells them apart.
-            Style::Gold | Style::Cyan => state,
+            Style::Gold => a.gold[page].as_ref(),
+            Style::Cyan => a.cyan[page].as_ref(),
             Style::Base => None,
         };
         if let Some(src) = src {
@@ -1019,30 +1077,16 @@ fn draw_page(
             if style == Style::Cyan && matches!(h.act, Act::Track) {
                 if let Some(sl) = h.slider {
                     if let Some(w) = fill_width(st, sl) {
-                        s.blit_region(src, sl.x0, sl.y, w as u32, BAR_H as u32, PAGE_X + sl.x0, page_y(page, sl.y));
+                        ui_blit(s, src, PAGE_W, sl.x0, sl.y, w as u32, BAR_H as u32, PAGE_X + sl.x0, page_y(page, sl.y));
                     }
                     continue;
                 }
             }
-            s.blit_region(src, h.x.max(0), h.y.max(0), h.w as u32, h.h as u32, PAGE_X + h.x, page_y(page, h.y));
-            // The gold and cyan sheets only recolour the rim. The interior is
-            // the same dark plate as the base, so a selected option would
-            // otherwise read as a thin outline. Wash the body, and leave the
-            // label (the bright glyphs) alone.
             if matches!(h.act, Act::Opt(_, _)) {
-                // Selected is the stronger cyan. Hover is the same hue, lighter,
-                // so the current value stays obvious under the cursor too.
-                // Three distinct states: idle is the untouched plate,
-                // selected is a mid cyan, hover is the same hue a little
-                // lighter. The old 175 washed the button out under a white
-                // caption and a bright rim.
-                let (tint, alpha) = if style == Style::Gold {
-                    ([48u8, 196, 208], 132u8)
-                } else {
-                    ([36, 176, 196], 80)
-                };
-                fill_option_body(s, PAGE_X + h.x, page_y(page, h.y), h.w, h.h, tint, alpha);
+                restore_under(s, &under, PAGE_X + h.x, page_y(page, h.y), h.w, h.h);
             }
+            ui_blit(s, src, PAGE_W, h.x.max(0), h.y.max(0), h.w as u32, h.h as u32, PAGE_X + h.x, page_y(page, h.y));
+
         }
     }
 }
@@ -1088,8 +1132,10 @@ fn fill_width(st: &Settings, sl: &Slider) -> Option<i32> {
 /// Compose the whole option screen.
 pub fn compose(s: &mut Surface, a: &Assets, st: &Settings, scr: &Screen) {
     let hots = page_hots(scr.page);
+    // Help replaces the baked guide caption, not the scene behind its alpha.
+    let backdrop = s.pixels.clone();
     if let Some(h) = a.header.as_ref() {
-        s.blit(h, 0, 0);
+        ui_blit(s, h, W as i32, 0, 0, W, HEADER_H as u32, 0, 0);
     }
     // Tabs: column = page, row = state (0 current, 1 hover, 2 idle).
     if let Some(t) = a.tabs.as_ref() {
@@ -1101,8 +1147,8 @@ pub fn compose(s: &mut Surface, a: &Assets, st: &Settings, scr: &Screen) {
             } else {
                 2
             };
-            s.blit_region(
-                t,
+            ui_blit(s,
+                t, TAB_W * 3,
                 i as i32 * TAB_W,
                 state * TAB_H,
                 TAB_W as u32,
@@ -1134,15 +1180,15 @@ pub fn compose(s: &mut Surface, a: &Assets, st: &Settings, scr: &Screen) {
     let hr = scr.help_row
         .or_else(|| hover.and_then(|i| (hots[i].row != NO_ROW).then_some(hots[i].row)));
     if let (Some(img), Some(row)) = (a.help[page].as_ref(), hr) {
-        let y = (row as i32 * HELP_H).min(img.height as i32 - HELP_H).max(0);
-        s.fill_rect(GUIDE_X, guide_y(page), GUIDE_W as u32, GUIDE_H as u32, [0, 0, 0, 255]);
-        s.blit_region(img, 0, y, HELP_W as u32, HELP_H as u32, HELP_X, help_y(page));
+        let y = (row as i32 * HELP_H).min(img.height as i32 / (img.width as i32 / HELP_W).max(1) - HELP_H).max(0);
+        restore_under(s, &backdrop, GUIDE_X, guide_y(page), GUIDE_W, GUIDE_H);
+        ui_blit(s, img, HELP_W, 0, y, HELP_W as u32, HELP_H as u32, HELP_X, help_y(page));
     }
 
     // 恢复默认, on its own under the page.
     if let Some(d) = a.defbtn.as_ref() {
         let state = if scr.nav_hover == Some(NAV_DEF) { 2 } else { 0 };
-        s.blit_region(d, 0, state * DEF_H, DEF_W as u32, DEF_H as u32, DEF_X, DEF_Y);
+        ui_blit(s, d, DEF_W, 0, state * DEF_H, DEF_W as u32, DEF_H as u32, DEF_X, DEF_Y);
     }
 }
 
@@ -1365,7 +1411,7 @@ fn page_labs(page: usize) -> Vec<Lab> {
         0 => {
             v.push(head(36, 0, 220, "画面设置"));
             v.push(row(48, 20, 240, 28, "画面模式", ""));
-            v.push(btn(458, 14, 252, 36, "瞬间显示", "Window"));
+            v.push(btn(458, 14, 252, 36, "窗口模式", "Window"));
             v.push(btn(714, 14, 252, 36, "全屏模式", "Full Screen"));
             v.push(head(36, 54, 200, "文本设置"));
             v.push(row(40, 80, 250, 30, "文本显示速度", ""));
@@ -1477,7 +1523,36 @@ fn help_lines(page: usize) -> &'static [&'static str] {
 }
 
 fn using_cn_art(dirs: &[&Path]) -> bool {
-    dirs.iter().any(|d| d.file_name().and_then(|s| s.to_str()) == Some("bg_cn"))
+    dirs.iter().any(|d| d.file_name().and_then(|s| s.to_str())
+        .is_some_and(|n| n == "bg_cn" || n.starts_with("bg_cn_")))
+}
+
+/// Copy the complete original button including alpha; no caption classifiers.
+fn copy_windowed_button(target: &mut TgaImage, original: &TgaImage) {
+    copy_original_rect(target, original, 458, 14, 252, 36);
+}
+
+fn missing_patch_corner(img: &TgaImage) -> bool {
+    let scale = (img.width / PAGE_W as u32).max(1);
+    (402 * scale..464 * scale).all(|y| (802 * scale..1024 * scale).all(|x| {
+        img.rgba[((y * img.width + x) * 4 + 3) as usize] < 32
+    }))
+}
+
+fn copy_original_rect(target: &mut TgaImage, original: &TgaImage, x0: u32, y0: u32, w: u32, h: u32) {
+    let scale = (target.width / PAGE_W as u32).max(1);
+    let original_scale = (original.width / PAGE_W as u32).max(1);
+    for y in y0 * scale..(y0 + h) * scale {
+        for x in x0 * scale..(x0 + w) * scale {
+            let ox = x * original_scale / scale;
+            let oy = y * original_scale / scale;
+            if x < target.width && ox < original.width && y < target.height && oy < original.height {
+                let dst = ((y * target.width + x) * 4) as usize;
+                let src = ((oy * original.width + ox) * 4) as usize;
+                target.rgba[dst..dst + 4].copy_from_slice(&original.rgba[src..src + 4]);
+            }
+        }
+    }
 }
 
 fn px_of(img: &TgaImage, x: i32, y: i32) -> [u8; 3] {
@@ -2741,6 +2816,10 @@ fn paint_font_rows(
     let oy = py(PAGE_Y);
     // The band starts at the split; the rows inside it keep their own grid.
     let band = oy + py(FONT_SPLIT);
+    // Only the extension needs an added backing: original page sheets already
+    // carry their authored alpha=153 plates. Keep the scene visible here too.
+    frame.fill_rect(ox, band, px(PAGE_W).max(1) as u32,
+        py(FONT_BLOCK_H).max(1) as u32, [0, 0, 0, 153]);
     for i in 0..3 {
         let y = font_row_y(i);
         let is_open = open == Some(i);
@@ -3681,6 +3760,10 @@ fn reset_fonts(st: &mut Settings) {
     st.font_game = 0;
 }
 
+fn hover_enter_sound(old: Option<(bool, usize)>, new: Option<(bool, usize)>, pressed: bool) -> bool {
+    !pressed && new.is_some() && old != new
+}
+
 /// Run the option screen until the player leaves it.
 ///
 /// `mx` is used for the little sample sound behind the volume rows; when no
@@ -3691,8 +3774,9 @@ pub fn run(
     st: &mut Settings,
     mx: Option<&crate::audio::mixer::Mixer>,
     ui: Option<&crate::UiSound>,
+    backdrop: &Surface,
 ) {
-    let assets = Assets::load(dirs);
+    let assets = Assets::load_resolution(dirs, true);
     if !assets.available() {
         eprintln!("menu: option screen artwork missing, cannot open");
         return;
@@ -3706,8 +3790,16 @@ pub fn run(
         font_sel: 0,
     };
     let mut dirty = false;
-    let cn = using_cn_art(dirs);
     let mut menu_text: Option<MenuText> = None;
+    // Opt-in visual acceptance: exercise the actual runtime renderer without
+    // synthetic pointer events or writes to the player's settings.
+    let capture = std::env::var_os("WA2_OPTIONS_CAPTURE").map(PathBuf::from);
+    if let Some(dir) = capture.as_ref() {
+        if let Err(err) = std::fs::create_dir(dir) {
+            eprintln!("menu capture: {}: {} (directory must be new)", dir.display(), err);
+            std::process::exit(1);
+        }
+    }
     let mut shown: Option<(String, Surface)> = None;
     let mut font_rows: Option<FontRows> = None;
     let mut font_list: Option<FontList> = None;
@@ -3728,7 +3820,12 @@ pub fn run(
         let mut activate: Option<Act> = None;
         // Where the click happened, for the slider tracks.
         let mut click_at: (i32, i32) = (0, 0);
-        let input = win.poll_input();
+        let polled = win.poll_input();
+        // Native green-button/global shortcut changes belong to the live window,
+        // not the last persisted INI value. Merely opening/closing this menu must
+        // never undo them or write the player's configuration.
+        st.win_disp = if win.is_fullscreen() { 1 } else { 0 };
+        let input = if capture.is_some() { sdl2::Input::None } else { polled };
         // Snapshot the modal state before any layer can close itself: on the
         // frame a list or panel consumes an event *and* goes away, that event
         // must not reach the page (F-02).
@@ -3890,12 +3987,10 @@ pub fn run(
                 let (sx, sy) = win.surface_pos(x, y, W, H);
                 let hots = page_hots(scr.page);
                 let h = hit(scr.page, &hots, sx, sy);
-                let old_hover = scr.hover;
+                let old_hover = scr.hover.or(scr.nav_hover).map(|i| (false, i))
+                    .or(scr.font_hover.map(|i| (true, i)));
                 scr.hover = h.filter(|i| !is_nav(*i));
                 scr.nav_hover = h.filter(|i| is_nav(*i));
-                if old_hover != scr.hover {
-                    crate::play_ui(mx, ui, crate::UiSe::Move);
-                }
                 if let Some(i) = h {
                     if pressed {
                         let action = if is_nav(i) { nav_act(i) } else { Some(hots[i].act) };
@@ -3935,6 +4030,11 @@ pub fn run(
                             }
                         }
                     }
+                }
+                let new_hover = scr.hover.or(scr.nav_hover).map(|i| (false, i))
+                    .or(scr.font_hover.map(|i| (true, i)));
+                if hover_enter_sound(old_hover, new_hover, pressed) {
+                    crate::play_ui(mx, ui, crate::UiSe::Move);
                 }
                 // Clicking empty space does nothing: leaving the screen is the
                 // job of the left arrow key or Escape.
@@ -4040,7 +4140,7 @@ pub fn run(
             dirty = false;
         }
 
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let ww = ww.max(1);
         let wh = wh.max(1);
         // What the font band and the list should contain, computed before the
@@ -4054,10 +4154,11 @@ pub fn run(
         let list_key = font_list.as_ref().map(|l| l.key());
         let open_row = font_list.as_ref().map(|l| l.row);
         let sig = format!(
-            "{:?}|{:?}|{:?}|{:?}|{}|{}|{}{}{}{:?}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}{}{}{:?}",
             scr.page,
             scr.hover,
             scr.help_row,
+            scr.nav_hover,
             st,
             ww,
             wh,
@@ -4068,37 +4169,10 @@ pub fn run(
         );
         let reuse = shown.as_ref().map(|(k, _)| k == &sig).unwrap_or(false);
         if !reuse {
-            if cn {
-                let stale = menu_text
-                    .as_ref()
-                    .map(|t| t.ww != ww || t.wh != wh || t.page != scr.page)
-                    .unwrap_or(true);
-                if stale {
-                    menu_text = build_menu_text(scr.page, ww, wh);
-                }
-            }
-            let mut s = Surface::new(W, H, [0, 0, 0, 255]);
-            compose(&mut s, &assets, st, &scr);
-            if cn && menu_text.is_some() {
-                s.fill_rect(GUIDE_X, guide_y(scr.page), GUIDE_W as u32, GUIDE_H as u32, [0, 0, 0, 255]);
-                // Only the page art needs the wipe, and only when it has not
-                // been baked already: with a clean page in the cache this is
-                // the one branch that does no pixel work at all.
-                if assets.clean[scr.page].is_none() {
-                    if let Some(base) = assets.base[scr.page].as_ref() {
-                        wipe_baked_captions(&mut s, base, scr.page);
-                    }
-                }
-                wipe_chrome_captions(&mut s);
-            }
-            let mut frame = if ww as u32 == W && wh as u32 == H {
-                s
-            } else {
-                s.scaled_to(ww as u32, wh as u32)
-            };
-            if let Some(text) = menu_text.as_ref() {
-                paint_menu_text(&mut frame, text, scr.help_row);
-            }
+            // Keep the scene/title under the shipped translucent sheets. Never
+            // flatten them onto black or erase and re-stamp their baked labels.
+            let mut frame = backdrop.scaled_to(ww as u32, wh as u32);
+            compose(&mut frame, &assets, st, &scr);
             // The font rows and the style panel are the two things on this
             // screen the page artwork does not provide, so they are drawn
             // last, over everything the artwork owns.
@@ -4152,6 +4226,15 @@ pub fn run(
         }
         if let Some((_, frame)) = shown.as_ref() {
             win.present(frame);
+            if let Some(dir) = capture.as_ref() {
+                let path = dir.join(format!("options-page-{}.tga", scr.page + 1));
+                if let Err(err) = frame.save_tga(&path.to_string_lossy()) {
+                    eprintln!("menu capture: {}: {}", path.display(), err);
+                    std::process::exit(1);
+                }
+                if scr.page == 2 { break; }
+                scr.page += 1;
+            }
         }
         win.delay(16);
     }
@@ -4176,6 +4259,15 @@ pub fn apply(st: &Settings, mx: Option<&crate::audio::mixer::Mixer>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_sound_only_fires_on_new_target_not_exit_or_click() {
+        assert!(hover_enter_sound(None, Some((false, 1)), false));
+        assert!(hover_enter_sound(Some((false, 1)), Some((true, 0)), false));
+        assert!(!hover_enter_sound(Some((false, 1)), Some((false, 1)), false));
+        assert!(!hover_enter_sound(Some((false, 1)), None, false));
+        assert!(!hover_enter_sound(None, Some((false, 1)), true));
+    }
 
     #[test]
     fn h_scene_voice_buttons_match_the_engine_rule_values() {
@@ -4221,13 +4313,11 @@ mod tests {
     /// With a baked clean page there is nothing left to wipe at run time: one
     /// blit replaces the whole caption-scrubbing pass.
     #[test]
-    fn clean_page_needs_no_wipe() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+    fn stale_clean_page_cannot_replace_original_captions() {
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
         let mut assets = Assets::load(&dirs);
-        let Some(base) = assets.base[0].as_ref() else { return };
+        let base = assets.base[0].as_ref().expect("page art");
         // Build the clean page from the same art, so the test does not depend
         // on the derived cache being generated in this checkout.
         let baked = bake_clean_page(base, 0);
@@ -4259,7 +4349,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(bright, 0, "clean page still shows the baked caption");
+        assert!(bright > 0, "original baked caption was erased by the stale clean cache");
     }
 
     #[test]
@@ -4321,12 +4411,10 @@ mod tests {
     /// column, while the heading bars and section rules must.
     #[test]
     fn baked_page_drops_captions_keeps_structure() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
         let assets = Assets::load(&dirs);
-        let Some(base) = assets.base[0].as_ref() else { return };
+        let base = assets.base[0].as_ref().expect("page art");
         let baked = bake_clean_page(base, 0);
         // 1) Caption column: white-ish ink is gone (white captions would be
         //    ~700 summed; the structures are dim teal, under 300).
@@ -4397,13 +4485,14 @@ mod tests {
     /// `clean_page_needs_no_wipe`.
     #[test]
     fn baked_page_captions_are_replaced_by_the_background() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
         let mut assets = Assets::load(&dirs);
         // Force the old path even if the cache exists in this checkout.
         assets.clean = [None, None, None];
+        // Exercise the retired cleaner independently, not live gold selection.
+        assets.gold = [None, None, None];
+        assets.base[0] = load(&[crate::test_data::root().join("bg_cn_2x").as_path()], "sys_03100.tga");
         let base = assets.base[0].as_ref().expect("page art");
         let st = Settings::default();
         let scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None, font_hover: None, font_sel: 0 };
@@ -4433,6 +4522,25 @@ mod tests {
         }
         let (gx, gy, before) = found.expect("no bright caption pixel on the left");
         assert!(before > 400, "expected a baked glyph, sum {before}");
+        // Scaled art moves the antialiased corner: (465, 16) is already
+        // sum 445 before wiping in the 2x release, not a white rim pixel.
+        // Check the actual top rim is bright, then require every RGBA byte in
+        // that strip to survive unchanged instead of guessing one white pixel.
+        let frame_strip = |s: &Surface| {
+            let mut pixels = Vec::new();
+            for y in 14..20 {
+                for x in 458..710 {
+                    let i = ((page_y(0, y) as u32 * s.width + (PAGE_X + x) as u32) * 4) as usize;
+                    pixels.extend_from_slice(&s.pixels[i..i + 4]);
+                }
+            }
+            pixels
+        };
+        let frame_before = frame_strip(&s);
+        assert!(
+            frame_before.chunks_exact(4).any(|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 600),
+            "source button must have a bright frame"
+        );
         wipe_baked_captions(&mut s, base, 0);
         let after = at(&s, gx, gy);
         assert!(after < 80, "glyph should be gone, sum {after}");
@@ -4459,8 +4567,7 @@ mod tests {
             "caption halo still visible: {leftover} px, worst {worst:?}"
         );
         // The button frame stays white, and the caption inside it does not.
-        let frame = at(&s, (PAGE_X as u32) + 465, (page_y(0, 0) + 16) as u32);
-        assert!(frame > 600, "frame was eaten, sum {frame}");
+        assert_eq!(frame_strip(&s), frame_before, "button frame changed during caption removal");
         let mut btn_left = 0u32;
         for y in (PAGE_Y as u32 + 22)..(PAGE_Y as u32 + 40) {
             for x in (PAGE_X as u32 + 560)..(PAGE_X as u32 + 640) {
@@ -4495,36 +4602,140 @@ mod tests {
     }
 
     #[test]
-    fn selected_option_is_filled_not_just_an_edge() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+    fn selected_and_hovered_buttons_match_original_state_sheets() {
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
         let assets = Assets::load(&dirs);
-        assert!(assets.available());
-        let mut st = Settings::default();
-        st.text_speed = 1;
+        let st = Settings::default();
+        let h = PAGE1[0];
+        for (hover, sheet) in [(None, &assets.gold[0]), (Some(0), &assets.cyan[0])] {
+            let mut actual = Surface::new(W, H, [35, 75, 125, 255]);
+            let mut expected = Surface::new(W, H, [35, 75, 125, 255]);
+            let scr = Screen { page: 0, hover, help_row: None, nav_hover: None, font_hover: None, font_sel: 0 };
+            compose(&mut actual, &assets, &st, &scr);
+            expected.blit_region(sheet.as_ref().expect("state sheet"), h.x, h.y, h.w as u32, h.h as u32, PAGE_X + h.x, page_y(0, h.y));
+            for y in page_y(0, h.y)..page_y(0, h.y) + h.h {
+                let i = ((y as u32 * W + (PAGE_X + h.x) as u32) * 4) as usize;
+                assert_eq!(&actual.pixels[i..i + h.w as usize * 4], &expected.pixels[i..i + h.w as usize * 4], "state pixels changed");
+            }
+        }
+    }
+
+    #[test]
+    fn source_captions_and_translucency_survive_on_every_page() {
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
+        let assets = Assets::load(&dirs);
+        let st = Settings::default();
+        let out = std::env::var_os("WA2_MENU_TEST_EVIDENCE").map(PathBuf::from);
+        if let Some(out) = out.as_ref() { std::fs::create_dir_all(out).unwrap(); }
+        for page in 0..3 {
+            let base = assets.base[page].as_ref().expect("page art");
+            assert_eq!((base.width, base.height), (1024, 464));
+            let background = [61, 91, 151, 255];
+            let mut actual = Surface::new(W, H, background);
+            let mut expected = Surface::new(W, H, background);
+            let scr = Screen { page, hover: None, help_row: None, nav_hover: None, font_hover: None, font_sel: 0 };
+            compose(&mut actual, &assets, &st, &scr);
+            let mut translucent = 0;
+            // Entire label column, including glyph halos, leaders and rules,
+            // must equal exactly one original alpha-blit. No heuristic wipe.
+            for y in 0..PAGE_H {
+                expected.blit_region(base, 0, y, 380, 1, PAGE_X, page_y(page, y));
+                for x in 0..380 {
+                    let i = ((page_y(page, y) as u32 * W + (PAGE_X + x) as u32) * 4) as usize;
+                    assert_eq!(&actual.pixels[i..i+4], &expected.pixels[i..i+4]);
+                    let a = base.rgba[((y as u32 * base.width + x as u32) * 4 + 3) as usize];
+                    if a > 0 && a < 255 { translucent += 1; }
+                }
+            }
+            assert!(translucent > 1000, "source alpha was flattened");
+            assert_eq!(&actual.pixels[(700 * W as usize + 10)*4..(700 * W as usize + 10)*4+4], &background);
+            if let Some(out) = out.as_ref() {
+                actual.save_tga(&out.join(format!("page-{}.tga", page+1)).to_string_lossy()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn native_menu_keeps_retina_atlas_pixels_without_roundtrip() {
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
+        let assets = Assets::load_resolution(&dirs, true);
+        let base = assets.base[0].as_ref().expect("native atlas");
+        assert!(base.width >= 2048, "Retina captions were reduced to 1x");
+        let mut actual = Surface::new(W * 2, H * 2, [61, 91, 151, 255]);
+        let mut expected = Surface::new(W * 2, H * 2, [61, 91, 151, 255]);
         let scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None, font_hover: None, font_sel: 0 };
-        let mut surf = Surface::new(W, H, [0, 0, 0, 255]);
-        compose(&mut surf, &assets, &st, &scr);
-        let sample = |x: i32, y: i32| {
-            let i = ((y as u32 * W + x as u32) * 4) as usize;
-            (surf.pixels[i], surf.pixels[i + 1], surf.pixels[i + 2])
-        };
-        // Centres of 「瞬间显示」 and the selected 「高速」.
-        // Centres of the idle and the selected text-speed button. Page 1 sits
-        // FONT_BLOCK_H lower now, and the artwork coordinates are page ones.
-        let y = page_y(0, 72) + 22;
-        let idle = sample(PAGE_X + 458 + 62, y);
-        let picked = sample(PAGE_X + 586 + 62, y);
-        assert!(
-            picked.2 > idle.2 + 15 && picked.1 > picked.0,
-            "selected body should be cyan, idle {:?} picked {:?}",
-            idle,
-            picked
-        );
-        let _ = std::fs::create_dir_all("/tmp/wa2btn");
-        let _ = surf.save_tga("/tmp/wa2btn/menu_selected.tga");
+        compose(&mut actual, &assets, &Settings::default(), &scr);
+        expected.blit_region(base, 0, 0, 760, FONT_SPLIT as u32 * 2, PAGE_X * 2, PAGE_Y * 2);
+        for y in PAGE_Y * 2..(PAGE_Y + FONT_SPLIT) * 2 {
+            let i = ((y as u32 * actual.width + PAGE_X as u32 * 2) * 4) as usize;
+            assert_eq!(&actual.pixels[i..i+760*4], &expected.pixels[i..i+760*4]);
+        }
+        if let Some(dir) = std::env::var_os("WA2_MENU_TEST_EVIDENCE") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            actual.save_tga(&dir.join("retina-page-1.tga").to_string_lossy()).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_chinese_corner_is_restored_from_original_pixels() {
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
+        let assets = Assets::load_resolution(&dirs, true);
+        for page in 0..3 {
+            for (actual, name) in [
+                (&assets.base[page], format!("sys_0310{}.tga", page)),
+                (&assets.cyan[page], format!("sys_032{}1.tga", page)),
+            ] {
+                let root = crate::test_data::root();
+                let cn = load_resolution(&[root.join("bg_cn_2x").as_path()], &name, true).unwrap();
+                let jp = load_resolution(&[root.join("bg_2x").as_path()], &name, true).unwrap();
+                let repaired = missing_patch_corner(&cn);
+                // The voice-page cyan sheet is intact; never replace it.
+                assert_eq!(repaired, name != "sys_03221.tga", "{name}");
+                let expected = if repaired { &jp } else { &cn };
+                let actual = actual.as_ref().unwrap();
+                for y in 800..928 {
+                    let i = ((y * actual.width + 1600) * 4) as usize;
+                    let end = ((y + 1) * actual.width * 4) as usize;
+                    assert_eq!(&actual.rgba[i..end], &expected.rgba[i..end]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn font_extension_backing_is_bounded_and_translucent() {
+        let mut frame = Surface::new(W, H, [100, 150, 200, 255]);
+        let scr = Screen { page: 0, hover: None, help_row: None, nav_hover: None, font_hover: None, font_sel: 0 };
+        paint_font_rows(&mut frame, W as i32, H as i32, &scr, None, None);
+        let at = |x, y| &frame.pixels[((y * W + x) * 4) as usize..((y * W + x) * 4 + 4) as usize];
+        assert_eq!(at(PAGE_X as u32 + 4, (PAGE_Y + FONT_SPLIT + 4) as u32), &[40, 60, 80, 255]);
+        assert_eq!(at(PAGE_X as u32 - 1, (PAGE_Y + FONT_SPLIT + 4) as u32), &[100, 150, 200, 255]);
+    }
+
+    #[test]
+    fn corrected_window_button_is_exact_original_and_bounded() {
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
+        let assets = Assets::load(&dirs);
+        let cn = load(&[crate::test_data::root().join("bg_cn_2x").as_path()], "sys_03100.tga").expect("CN page");
+        let jp = load(&[crate::test_data::root().join("bg_2x").as_path()], "sys_03100.tga").expect("JP page");
+        let actual = assets.base[0].as_ref().unwrap();
+        for y in 0..actual.height {
+            for x in 0..actual.width {
+                let i = ((y * actual.width + x) * 4) as usize;
+                let windowed = (458..710).contains(&x) && (14..50).contains(&y);
+                let repaired_corner = x >= 800 && y >= 400;
+                let expected = if windowed || repaired_corner { &jp } else { &cn };
+                assert_eq!(&actual.rgba[i..i+4], &expected.rgba[i..i+4]);
+            }
+        }
+        assert!(using_cn_art(&[Path::new("data/bg_cn_2x")]));
+        assert_eq!(page_labs(0)[2].text, "窗口模式");
     }
 
     /// The font block opens *inside* the 文本设置 group: page 1 is cut right

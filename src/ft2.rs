@@ -45,6 +45,19 @@ extern "C" {
 
 const RTLD_NOW: c_int = 2;
 
+#[cfg(not(target_os = "macos"))]
+const FREETYPE_LIBRARIES: &[&str] = &["libfreetype.so.6", "libfreetype.so"];
+#[cfg(target_os = "macos")]
+const FREETYPE_LIBRARIES: &[&str] = &[
+    "libfreetype.6.dylib", "libfreetype.dylib",
+    "/opt/homebrew/lib/libfreetype.6.dylib",
+    "/opt/homebrew/lib/libfreetype.dylib",
+    "/opt/homebrew/opt/freetype/lib/libfreetype.6.dylib",
+    "/usr/local/lib/libfreetype.6.dylib",
+    "/usr/local/lib/libfreetype.dylib",
+    "/usr/local/opt/freetype/lib/libfreetype.6.dylib",
+];
+
 /// FT_LOAD_RENDER: load the glyph and render it into the slot's bitmap.
 const FT_LOAD_RENDER: c_int = 0x0000_0004;
 /// FT_LOAD_NO_BITMAP: ignore embedded bitmap strikes and render the outline.
@@ -175,7 +188,7 @@ impl Ft {
         }
         unsafe {
             let mut lib = std::ptr::null_mut();
-            for cand in ["libfreetype.so.6", "libfreetype.so"] {
+            for &cand in FREETYPE_LIBRARIES {
                 let c = CString::new(cand).unwrap();
                 lib = dlopen(c.as_ptr(), RTLD_NOW);
                 if !lib.is_null() {
@@ -427,7 +440,42 @@ impl Drop for Ft {
 
 #[cfg(test)]
 mod tests {
-    use super::Ft;
+    use super::{Ft, FREETYPE_LIBRARIES};
+
+    #[test]
+    fn library_candidates_match_the_platform() {
+        #[cfg(target_os = "macos")]
+        {
+            assert!(FREETYPE_LIBRARIES.contains(&"libfreetype.6.dylib"));
+            assert!(FREETYPE_LIBRARIES.contains(&"/opt/homebrew/opt/freetype/lib/libfreetype.6.dylib"));
+            assert!(FREETYPE_LIBRARIES.contains(&"/usr/local/opt/freetype/lib/libfreetype.6.dylib"));
+            assert!(FREETYPE_LIBRARIES.iter().all(|s| s.ends_with(".dylib")));
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(FREETYPE_LIBRARIES, &["libfreetype.so.6", "libfreetype.so"]);
+    }
+
+    /// Exercise the real dylib and LP64 struct layout on macOS, not a skipped
+    /// Linux-only system font. This font is tracked in the repository.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_renders_bundled_cjk_font_with_native_freetype() {
+        let font = concat!(env!("CARGO_MANIFEST_DIR"), "/fonts/NotoSansCJK-Regular.ttc");
+        let mut ft = Ft::open(font, 40, 2).expect("macOS FreeType must open bundled CJK face");
+        assert_eq!(ft.face_index(), 2);
+        assert!(ft.num_faces() >= 3);
+        assert!(ft.family().expect("family name").contains("SC"));
+        assert!(!ft.style().expect("style name").is_empty());
+        let glyph = ft.glyph('中').expect("CJK glyph");
+        assert_eq!(glyph.advance_266, 40 * 64);
+        assert!(glyph.w > 0 && glyph.w <= 40);
+        assert!(glyph.h > 0 && glyph.h <= 40);
+        assert!(glyph.mask.iter().any(|&coverage| coverage > 200));
+        let metrics = ft.metrics().expect("scaled metrics");
+        assert!(metrics.ascender > 0 && metrics.ascender < 80);
+        assert!(metrics.descender < 0 && metrics.descender > -40);
+        assert!(metrics.height >= metrics.ascender);
+    }
 
     /// The system CJK face the engine ships with. Tests skip when it is absent
     /// rather than failing a machine that has no Noto installed.

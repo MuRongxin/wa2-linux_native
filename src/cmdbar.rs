@@ -418,14 +418,32 @@ pub struct Active {
 #[cfg(test)]
 mod integration {
     use super::*;
-    use std::path::Path;
+
+    fn dialog_assets() -> (crate::render::Font, TgaImage, TgaImage) {
+        let root = crate::test_data::root();
+        let atlas = crate::codec::tga::decode_font(
+            &std::fs::read(root.join("font/cn_body80.tga")).expect("Chinese font atlas"),
+        )
+        .expect("decode Chinese font atlas");
+        let font = crate::render::Font::from_cell_map(
+            atlas,
+            40,
+            &root.join("font/wa2_cell_map_cn.tsv"),
+        )
+        .expect("Chinese font cell map");
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
+        // The release ships scaled WebP trees, not original bg/*.tga files.
+        // Use the runtime UI loader to restore the logical plate/frame size.
+        let plate = crate::load_background(&dirs, "sys_00001.tga").expect("message window plate");
+        let frame = crate::load_background(&dirs, "sys_00000.tga").expect("message window frame");
+        (font, plate, frame)
+    }
 
     #[test]
     fn icons_use_the_original_rects() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
         let bar = CmdBar::load(&dirs);
         assert!(bar.icons.is_some(), "sys_00010.tga did not load");
         assert!(bar.labels.is_some(), "sys_00012.tga did not load");
@@ -522,24 +540,7 @@ mod integration {
 
     #[test]
     fn window_text_sits_inside_the_oval() {
-        let atlas = crate::codec::tga::decode_font(
-            &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
-        )
-        .unwrap();
-        let font = crate::render::Font::from_cell_map(
-            atlas,
-            40,
-            std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
-        )
-        .unwrap();
-        let plate = crate::codec::tga::decode(
-            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00001.tga").unwrap(),
-        )
-        .unwrap();
-        let frame = crate::codec::tga::decode(
-            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00000.tga").unwrap(),
-        )
-        .unwrap();
+        let (font, plate, frame) = dialog_assets();
         let bg = crate::codec::tga::TgaImage {
             width: 1280,
             height: 720,
@@ -561,10 +562,8 @@ mod integration {
             &[],
         );
         font.draw_pitch(&mut surf, "春希", crate::render::NAME_X, crate::render::NAME_Y, crate::render::DIALOG_PITCH);
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
         let bar = CmdBar::load(&dirs);
         bar.draw(&mut surf, Some(Cmd::Save), Active { auto: true, skip: false, rewind: false, hide: false }, 100, 1280, 720);
         // A glyph of the line must land inside the oval, not on the bare background.
@@ -582,24 +581,7 @@ mod integration {
 
     #[test]
     fn typewriter_and_window_alpha_change_the_frame() {
-        let atlas = crate::codec::tga::decode_font(
-            &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
-        )
-        .unwrap();
-        let font = crate::render::Font::from_cell_map(
-            atlas,
-            40,
-            std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
-        )
-        .unwrap();
-        let plate = crate::codec::tga::decode(
-            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00001.tga").unwrap(),
-        )
-        .unwrap();
-        let frame = crate::codec::tga::decode(
-            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00000.tga").unwrap(),
-        )
-        .unwrap();
+        let (font, plate, frame) = dialog_assets();
         let bg = crate::codec::tga::TgaImage {
             width: 1280,
             height: 720,
@@ -643,23 +625,16 @@ mod integration {
     /// the game.
     #[test]
     fn rewind_caption_is_cached_per_font_generation() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
         let bar = CmdBar::load(&dirs);
-        if bar.icons.is_none() {
-            return;
-        }
+        assert!(bar.icons.is_some(), "sys_00010.tga did not load");
         assert!(bar.rewind_label.borrow().1.is_none(), "nothing rasterized before the first hover");
         let mut surf = Surface::new(1280, 720, [8, 12, 24, 255]);
         let active = Active { auto: false, skip: false, rewind: false, hide: false };
         bar.draw(&mut surf, Some(Cmd::Rewind), active, 100, 1280, 720);
         let cached = bar.rewind_label.borrow();
-        let Some((w, h, rgba)) = cached.1.as_ref() else {
-            // No vector font on this machine: there is nothing to cache.
-            return;
-        };
+        let (w, h, rgba) = cached.1.as_ref().expect("a vector font must render the 快退 caption");
         // A parallel test may change the roles between the draw and this
         // line, so only the fact that a generation was stamped is asserted.
         assert!(
