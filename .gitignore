@@ -7,13 +7,15 @@
 *.AppImage.sha256
 *.AppImage.part
 /others/
-/tools/
+/tools/*
+!/tools/macos_acceptance.py
+!/tools/test_macos_acceptance.py
+!/tools/MACOS_ACCEPTANCE.md
 
 # Local agent notes (keep on this machine only).
 /AGENTS.md
 
-# Game assets are stored outside git history: they are published as split
-# archives on a private GitHub Release and restored with tools/fetch_data.py.
+# Game assets and local acquisition caches must stay outside source history.
 /data
 /release
 /docs
@@ -25,10 +27,8 @@
 /data/sprite_2x
 /data/bg_cn_2x
 
-# Game content as loose files. Built once from the user's own copy of the game
-# by tools/build_data_tree.py. The asset trees are tracked on purpose in this
-# private repository (the 8x WebP trees are the source of truth); derived
-# caches and proxy trees above stay out of it.
+# Keep loose game content, derived caches, captures and local diagnostics out
+# of commits. Only explicitly allowlisted acceptance tools belong in /tools.
 
 # Intermediate numpy/rasterizer artifacts from tools/ experiments.
 *.npy

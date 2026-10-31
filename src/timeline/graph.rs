@@ -522,7 +522,7 @@ mod tests {
     use super::*;
 
     fn chart() -> Vec<Node> {
-        build_nodes(Path::new("data/script"))
+        build_nodes(&crate::test_data::script())
     }
 
     fn at(nodes: &[Node], id: &str) -> usize {
@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn common_route_reaches_four_branches_without_subscripts() {
-        let nodes = build_nodes(Path::new("data/script"));
+        let nodes = chart();
         assert!(nodes.len() > 40, "expected the chapter scripts, got {}", nodes.len());
         assert!(nodes.iter().all(|n| !n.id.contains('_')));
         let at = |id: &str| nodes.iter().position(|n| n.id == id).unwrap();
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn the_ic_chain_continues_through_its_subscripts() {
         // 1008/1009/... only name the next entry from inside their _020 pages.
-        let nodes = build_nodes(Path::new("data/script"));
+        let nodes = chart();
         let at = |id: &str| nodes.iter().position(|n| n.id == id).unwrap();
         let next = |id: &str| -> Vec<&str> {
             nodes[at(id)].next.iter().map(|e| nodes[e.to].id.as_str()).collect()
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn every_node_is_reachable_from_a_root() {
-        let nodes = build_nodes(Path::new("data/script"));
+        let nodes = chart();
         let mut seen = vec![false; nodes.len()];
         let mut stack: Vec<usize> = nodes.iter().enumerate().filter(|(_, n)| n.root).map(|(i, _)| i).collect();
         while let Some(i) = stack.pop() {
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn endings_are_the_dead_ends() {
-        let nodes = build_nodes(Path::new("data/script"));
+        let nodes = chart();
         for node in &nodes {
             assert_eq!(node.ending, node.next.is_empty(), "{}", node.id);
         }
@@ -823,9 +823,9 @@ mod tests {
     /// a script-data change by eye.
     #[test]
     fn check_report_lists_the_whole_graph_and_is_stable() {
-        let dir = Path::new("data/script");
-        let report = check(dir);
-        assert_eq!(report, check(dir), "check output must be deterministic");
+        let dir = crate::test_data::script();
+        let report = check(&dir);
+        assert_eq!(report, check(&dir), "check output must be deterministic");
         let has = |needle: &str| report.iter().any(|line| line == needle);
         let starts = |needle: &str| report.iter().any(|line| line.starts_with(needle));
         assert!(has("script files: 187 .bnr, 168 entries, 163 collected"));

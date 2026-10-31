@@ -103,12 +103,15 @@ struct Mem {
     clock: u64,
 }
 
-/// Memory cache budget for decoded art, in MB.
-///
-/// 8x backgrounds are ~236 MB each, so a fixed 512 MB default would only hold
-/// two of them. Take a quarter of what the kernel says is available, clamped so
-/// a tiny box still gets a working cache and a big one does not hoard RAM.
+/// Memory cache budget for decoded art, in MB. Linux uses a quarter of
+/// MemAvailable; macOS uses a conservative fraction of physical memory because
+/// total RAM is not the same as currently available (or reclaimable) memory.
 fn default_budget_mb() -> usize {
+    #[cfg(target_os = "macos")]
+    if let Some(bytes) = macos_physical_memory() {
+        return macos_budget_mb(bytes);
+    }
+    #[cfg(target_os = "linux")]
     if let Ok(info) = std::fs::read_to_string("/proc/meminfo") {
         for line in info.lines() {
             if let Some(rest) = line.strip_prefix("MemAvailable:") {
@@ -121,13 +124,41 @@ fn default_budget_mb() -> usize {
     512
 }
 
+/// Leave ample headroom for the renderer, decoder, unified GPU memory, and
+/// other applications: one eighth of installed RAM, capped at 2 GiB. A failed
+/// query falls back to 512 MiB; WA2_ART_CACHE_MB remains the explicit override.
+#[cfg(any(target_os = "macos", test))]
+fn macos_budget_mb(physical_bytes: u64) -> usize {
+    (physical_bytes / (1024 * 1024) / 8).clamp(512, 2048) as usize
+}
+
+#[cfg(target_os = "macos")]
+fn macos_physical_memory() -> Option<u64> {
+    use std::os::raw::{c_char, c_int, c_void};
+    extern "C" {
+        fn sysctlbyname(
+            name: *const c_char, oldp: *mut c_void, oldlenp: *mut usize,
+            newp: *mut c_void, newlen: usize,
+        ) -> c_int;
+    }
+    let mut bytes = 0u64;
+    let mut len = std::mem::size_of::<u64>();
+    let rc = unsafe {
+        sysctlbyname(
+            b"hw.memsize\0".as_ptr().cast(), (&mut bytes as *mut u64).cast(),
+            &mut len, std::ptr::null_mut(), 0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<u64>() && bytes > 0).then_some(bytes)
+}
+
 fn mem() -> &'static Mutex<Mem> {
     static MEM: OnceLock<Mutex<Mem>> = OnceLock::new();
     MEM.get_or_init(|| {
         // Default: decode-at-source means an 8x background is 236 MB in memory,
         // where the old 512 MB budget held only two of them and the prefetcher
-        // thrashed. Derive the budget from available RAM instead: a quarter of
-        // MemAvailable, clamped to [512 MB, 6 GB]. WA2_ART_CACHE_MB overrides.
+        // thrashed. Use the platform's memory budget: available RAM on Linux,
+        // conservative physical RAM fraction on macOS. WA2_ART_CACHE_MB overrides.
         let budget = std::env::var("WA2_ART_CACHE_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -347,6 +378,25 @@ pub fn pending() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_memory_budget_is_conservative_and_bounded() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(macos_budget_mb(0), 512);
+        assert_eq!(macos_budget_mb(2 * gib), 512);
+        assert_eq!(macos_budget_mb(8 * gib), 1024);
+        assert_eq!(macos_budget_mb(16 * gib), 2048);
+        assert_eq!(macos_budget_mb(128 * gib), 2048);
+        assert_eq!(macos_budget_mb(u64::MAX), 2048);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reads_physical_memory_without_procfs() {
+        let bytes = macos_physical_memory().expect("sysctl hw.memsize");
+        assert!(bytes > 0);
+        assert_eq!(default_budget_mb(), macos_budget_mb(bytes));
+    }
 
     /// With the data tree present, the cached result must be identical to a
     /// straight decode - the whole point of the cache is that it changes the

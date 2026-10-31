@@ -14,6 +14,7 @@ Only the Python standard library is required.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 import fcntl
 import hashlib
 import http.client
@@ -24,6 +25,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -230,7 +232,12 @@ def sha256_file(path: Path, progress: Progress | None = None) -> str:
 
 def download_asset(asset: dict, dest: Path, token: str, expected_sha: str,
                    proxy: str | list[str] = "", completed: int = 0, total: int = 0,
-                   label: str = "下载") -> None:
+                   label: str = "下载", stop: threading.Event | None = None) -> None:
+    def check_cancelled() -> None:
+        if stop is not None and stop.is_set():
+            raise CancelledError("download cancelled; partial file retained")
+
+    check_cancelled()
     expected_size = int(asset["size"])
     partial = dest.with_suffix(dest.suffix + ".part")
 
@@ -260,6 +267,7 @@ def download_asset(asset: dict, dest: Path, token: str, expected_sha: str,
         else:
             say(f"下载通道：{route}")
         for attempt in range(3):
+            check_cancelled()
             offset = partial.stat().st_size if partial.exists() else 0
             if offset == expected_size:
                 if verified(partial):
@@ -293,6 +301,7 @@ def download_asset(asset: dict, dest: Path, token: str, expected_sha: str,
                     read = getattr(resp, "read1", resp.read)
                     with partial.open("ab" if offset else "wb") as output:
                         while chunk := read(CHUNK):
+                            check_cancelled()
                             if done + len(chunk) > expected_size:
                                 raise FetchError("下载内容超过清单大小。")
                             output.write(chunk)
@@ -324,6 +333,49 @@ def download_asset(asset: dict, dest: Path, token: str, expected_sha: str,
                 if attempt < 2:
                     time.sleep(attempt + 1)
     raise FetchError(f"{dest.name} 下载失败：{network_error(last_error)}。断点已保留，重新运行 ./run.sh 可继续。")
+
+
+def download_parts(parts: list[dict], assets: dict, parts_dir: Path, token: str,
+                   proxies: list[str], jobs: int) -> None:
+    """Download verified parts with bounded scheduling; never release live workers."""
+    if not 1 <= jobs <= 4:
+        raise ValueError("jobs must be between 1 and 4")
+    stop = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=jobs)
+    pending = set()
+    remaining = iter(enumerate(parts, 1))
+
+    def submit_next() -> bool:
+        item = next(remaining, None)
+        if item is None:
+            return False
+        index, part = item
+        say(f"下载 [{index}/{len(parts)}] {part['name']}")
+        # Parallel progress is per part, not an inaccurate serial total.
+        pending.add(pool.submit(
+            download_asset, assets[part["name"]], parts_dir / part["name"], token,
+            part["sha256"], proxies, 0, part["size"],
+            f"下载 [{index}/{len(parts)}] {part['name']}", stop=stop))
+        return True
+
+    try:
+        for _ in range(jobs):
+            if not submit_next():
+                break
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            # Observe every completed result before scheduling more work.
+            for future in done:
+                future.result()
+            for _ in done:
+                submit_next()
+    finally:
+        # Also handles KeyboardInterrupt: running workers retain partial files,
+        # and queued work is cancelled before the installer lock is released.
+        stop.set()
+        for future in pending:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def runtime_ready(data: Path, ignore_installing: bool = False) -> bool:
@@ -388,7 +440,45 @@ def check_space(data: Path, parts_dir: Path, manifest: dict) -> None:
             raise FetchError("磁盘空间不足（安装期间需要同时存放压缩包和解压后的资源）。")
 
 
+def filesystem_case_sensitive(data: Path) -> bool:
+    """Probe the destination itself; remove only our uniquely created empty file."""
+    with tempfile.NamedTemporaryFile(dir=data, prefix=".wa2-case-probe-", suffix="-a") as probe:
+        original = Path(probe.name)
+        alternate = original.with_name(original.name.upper())
+        try:
+            return not original.samefile(alternate)
+        except FileNotFoundError:
+            return True
+
+
+def check_archive_case_collisions(parts_dir: Path, data: Path, manifest: dict) -> None:
+    """Reject case aliases across all parts before writing any archive member."""
+    if filesystem_case_sensitive(data):
+        return
+    seen: dict[str, tuple[str, str]] = {}
+    for part in manifest["parts"]:
+        with zipfile.ZipFile(parts_dir / part["name"]) as archive:
+            for info in archive.infolist():
+                # Include directory components: Art/a and art/b also alias on
+                # a case-insensitive volume. Retain the ZIP spelling in errors.
+                components = info.filename.rstrip("/").split("/")
+                for count in range(1, len(components) + 1):
+                    name = "/".join(components[:count])
+                    key = name.casefold()
+                    previous = seen.get(key)
+                    if previous is not None and previous[0] != name:
+                        raise FetchError(
+                            f"目标目录 {data} 所在文件系统不区分大小写，资源文件名冲突：\n"
+                            f"  {previous[1]}\n  {info.filename}\n"
+                            "尚未解压任何分卷；不能重命名或忽略这些资源。请在 macOS 创建并挂载"
+                            "区分大小写的 APFS 卷或 APFSX 磁盘映像，再用 --data-dir 指向该卷上的"
+                            "数据目录（运行游戏时设置 WA2_DATA 为同一路径）。"
+                            "已下载并校验的分卷已保留，可用原 --parts-dir 和 --check-only 重试。")
+                    seen.setdefault(key, (name, info.filename))
+
+
 def extract_parts(parts_dir: Path, data: Path, manifest: dict) -> None:
+    check_archive_case_collisions(parts_dir, data, manifest)
     # Keep interrupted writes outside the inventoried trees. A SIGKILL must not
     # leave random temporary files that make the next inventory check fail.
     staging = data / UNPACK_DIR
@@ -473,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--proxy", "--proxies", action="append",
                         help="ordered HTTPS proxy prefixes, comma separated or repeated; '' for direct only")
     parser.add_argument("--parts-dir", help="download cache (default <dest>/.wa2-release-parts/<tag>)")
+    parser.add_argument("--jobs", type=int, choices=range(1, 5), default=1,
+                        help="parallel part downloads (1-4; default: 1)")
     parser.add_argument("--ensure", action="store_true", help="skip networking if existing runtime data is usable")
     parser.add_argument("--remove-parts", action="store_true", help="remove ZIP cache after successful installation")
     parser.add_argument("--check-only", action="store_true", help="verify/extract cached parts without networking")
@@ -537,18 +629,21 @@ def main(argv: list[str] | None = None) -> int:
         check_space(data, parts_dir, manifest)
         write_json(data / INSTALLING, {"repo": args.repo, "tag": args.tag})
         write_json(parts_dir / "manifest.json", manifest)
-        completed = 0
-        for index, part in enumerate(parts, 1):
-            target = parts_dir / part["name"]
-            if offline:
-                if (not target.is_file() or target.stat().st_size != part["size"]
-                        or sha256_file(target, Progress(f"校验 [{index}/{len(parts)}]", part["size"])) != part["sha256"]):
-                    raise FetchError(f"缓存分卷缺失或校验失败：{target.name}")
-            else:
-                say(f"下载 [{index}/{len(parts)}] {part['name']}")
-                download_asset(assets[part["name"]], target, args.token, part["sha256"], proxies,
-                               completed, total, f"下载 [{index}/{len(parts)}]")
-            completed += part["size"]
+        if not offline and args.jobs > 1:
+            download_parts(parts, assets, parts_dir, args.token, proxies, args.jobs)
+        else:
+            completed = 0
+            for index, part in enumerate(parts, 1):
+                target = parts_dir / part["name"]
+                if offline:
+                    if (not target.is_file() or target.stat().st_size != part["size"]
+                            or sha256_file(target, Progress(f"校验 [{index}/{len(parts)}]", part["size"])) != part["sha256"]):
+                        raise FetchError(f"缓存分卷缺失或校验失败：{target.name}")
+                else:
+                    say(f"下载 [{index}/{len(parts)}] {part['name']}")
+                    download_asset(assets[part["name"]], target, args.token, part["sha256"], proxies,
+                                   completed, total, f"下载 [{index}/{len(parts)}]")
+                completed += part["size"]
         say("所有分卷 SHA-256 校验通过，开始解压……")
         extract_parts(parts_dir, data, manifest)
         say("检查解压后的资源目录……")

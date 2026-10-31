@@ -156,7 +156,7 @@ pub fn run(
     current_scene: Option<&str>,
 ) -> Option<String> {
     let _ = font;
-    let (ww0, wh0) = win.window_size();
+    let (ww0, wh0) = win.drawable_size();
     let mut cover = Surface::new(W as u32, H as u32, BG);
     if let Some(banner) = load_tga(bg_dirs, "sys_06000.tga") {
         cover.blit(&banner, 0, 0);
@@ -247,7 +247,7 @@ pub fn run(
                 cn,
             },
         );
-        let (ww, wh) = win.window_size();
+        let (ww, wh) = win.drawable_size();
         let mut shown = frame.scaled_to(ww.max(1) as u32, wh.max(1) as u32);
         paint::paint_hires_text(&mut shown, &paint::PaintState {
             chart: &chart, thumbs: &thumbs, banner: banner.as_ref(), pager: pager.as_ref(),

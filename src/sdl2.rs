@@ -1,10 +1,9 @@
 //! Minimal SDL2 frontend via runtime dynamic loading (dlopen/dlsym).
 //!
-//! The environment has the SDL2 runtime (`libSDL2-2.0.so.0`) but no dev
-//! headers / `sdl2.pc`, and crates.io is unreachable. So instead of a build-time
-//! dependency we load SDL2 at runtime and call only the handful of functions we
-//! need to blit our offscreen `Surface` to a real window. If SDL2 is missing the
-//! app degrades gracefully (`Window::new` returns `None`).
+//! Load the SDL2 runtime (.so on Linux, .dylib/framework on macOS) without dev
+//! headers, `sdl2.pc`, or a build-time dependency. We call only the handful of
+//! functions needed to blit our offscreen `Surface` to a real window. If SDL2
+//! is missing the app degrades gracefully (`Sdl::new` returns `None`).
 
 use crate::render::Surface;
 use std::ffi::CString;
@@ -18,10 +17,49 @@ extern "C" {
 
 const RTLD_NOW: c_int = 2;
 
+// Keep the Linux search order unchanged. Absolute Homebrew paths also work
+// when dyld's search environment is stripped (for example, GUI launches).
+#[cfg(not(target_os = "macos"))]
+const SDL_LIBRARIES: &[&str] = &[
+    "libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so",
+];
+#[cfg(target_os = "macos")]
+const SDL_LIBRARIES: &[&str] = &[
+    "libSDL2-2.0.0.dylib", "libSDL2.dylib",
+    "/opt/homebrew/lib/libSDL2-2.0.0.dylib",
+    "/opt/homebrew/lib/libSDL2.dylib",
+    "/opt/homebrew/opt/sdl2/lib/libSDL2.dylib",
+    "/usr/local/lib/libSDL2-2.0.0.dylib",
+    "/usr/local/lib/libSDL2.dylib",
+    "/usr/local/opt/sdl2/lib/libSDL2.dylib",
+    "SDL2.framework/SDL2", "/Library/Frameworks/SDL2.framework/SDL2",
+];
+
+/// Use the same discovery for the window and diagnostics. Handles remain open
+/// because the runtime keeps function pointers into SDL for its entire lifetime.
+unsafe fn open_sdl_library() -> *mut c_void {
+    for &candidate in SDL_LIBRARIES {
+        let name = CString::new(candidate).unwrap();
+        let lib = dlopen(name.as_ptr(), RTLD_NOW);
+        if !lib.is_null() {
+            return lib;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+fn default_audio_driver() -> Option<&'static str> {
+    // Preserve the existing Linux/PipeWire preference. On macOS let SDL choose
+    // CoreAudio, and always honor an explicit SDL_AUDIODRIVER override.
+    if cfg!(target_os = "linux") { Some("pulse") } else { None }
+}
+
 // SDL constants
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
+const SDL_WINDOW_ALLOW_HIGHDPI: u32 = 0x0000_2000;
+const SDL_WINDOW_RESIZABLE: u32 = 0x0000_0020;
 /// Borderless window the size of the desktop. Exclusive fullscreen (flag 1)
 /// asks the display to switch to 1280×720, which the compositor ignores, so
 /// the 「全屏」 setting never changed the window.
@@ -86,6 +124,7 @@ pub struct Sdl {
     f_render_read_pixels: unsafe extern "C" fn(*mut c_void, *const c_void, u32, *mut c_void, c_int) -> c_int,
     f_get_pixel_format_name: unsafe extern "C" fn(u32) -> *const c_char,
     f_get_window_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int),
+    f_get_renderer_output_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int,
     f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int,
     f_destroy_texture: unsafe extern "C" fn(*mut c_void),
     f_destroy_renderer: unsafe extern "C" fn(*mut c_void),
@@ -154,6 +193,31 @@ pub enum NavKey {
     Filter,
 }
 
+/// SDL_Event (56 bytes) and SDL_SysWMinfo (72 bytes) both require 8-byte
+/// alignment on LP64. Spare capacity alone does not make a byte array safe
+/// for SDL to access as one of these C structs.
+#[repr(C, align(8))]
+struct SdlRawBuffer([u8; 128]);
+
+fn fullscreen_shortcut(sc: i32, mods: u16) -> bool {
+    // F11 everywhere; macOS standard Control+Command+F and Alt+Enter too.
+    sc == SDLK_F11 || (sc == SDLK_f && mods & 0x00c0 != 0 && mods & 0x0c00 != 0)
+        || (sc == SDLK_RETURN && mods & 0x0300 != 0)
+}
+
+/// Fit a source aspect into the output without stretching artwork or hitboxes.
+fn fitted_rect(w: i32, h: i32, sw: i32, sh: i32) -> [i32; 4] {
+    let (w, h, sw, sh) = (w.max(1) as i64, h.max(1) as i64, sw.max(1) as i64, sh.max(1) as i64);
+    let (cw, ch) = if w * sh <= h * sw { (w, (w * sh / sw).max(1)) }
+        else { ((h * sw / sh).max(1), h) };
+    [((w-cw)/2) as i32, ((h-ch)/2) as i32, cw as i32, ch as i32]
+}
+
+fn valid_rgba(w: u32, h: u32, len: usize) -> bool {
+    w > 0 && h > 0 && w <= i32::MAX as u32 / 4 && h <= i32::MAX as u32
+        && (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)) == Some(len)
+}
+
 unsafe fn sym(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
     let c = CString::new(name).ok()?;
     let p = dlsym(lib, c.as_ptr());
@@ -194,14 +258,8 @@ impl Sdl {
     /// unavailable or window creation fails (e.g. no display).
     pub fn new(title: &str, tw: u32, th: u32) -> Option<Sdl> {
         unsafe {
-            for cand in ["libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so"] {
-                let c = CString::new(cand).unwrap();
-                let lib = dlopen(c.as_ptr(), RTLD_NOW);
-                if !lib.is_null() {
-                    return Sdl::init_from(lib, title, tw, th);
-                }
-            }
-            None
+            let lib = open_sdl_library();
+            if lib.is_null() { None } else { Sdl::init_from(lib, title, tw, th) }
         }
     }
 
@@ -223,9 +281,13 @@ impl Sdl {
         let f_get_pixel_format_name: unsafe extern "C" fn(u32) -> *const c_char = std::mem::transmute(sym(lib, "SDL_GetPixelFormatName")?);
         let f_get_window_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) =
             std::mem::transmute(sym(lib, "SDL_GetWindowSize")?);
+        let f_get_renderer_output_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int =
+            std::mem::transmute(sym(lib, "SDL_GetRendererOutputSize")?);
         let f_open_audio: unsafe extern "C" fn(*const c_char, c_int, *const SdlAudioSpec, *mut SdlAudioSpec, c_int) -> u32 = std::mem::transmute(sym(lib, "SDL_OpenAudioDevice")?);
         let f_queue_audio: unsafe extern "C" fn(u32, *const c_void, u32) -> c_int = std::mem::transmute(sym(lib, "SDL_QueueAudio")?);
         let f_pause_audio: unsafe extern "C" fn(u32, c_int) = std::mem::transmute(sym(lib, "SDL_PauseAudioDevice")?);
+        let f_queued_audio_size = std::mem::transmute(sym(lib, "SDL_GetQueuedAudioSize")?);
+        let f_close_audio = std::mem::transmute(sym(lib, "SDL_CloseAudioDevice")?);
         let f_get_error: unsafe extern "C" fn() -> *const c_char = std::mem::transmute(sym(lib, "SDL_GetError")?);
         let f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(sym(lib, "SDL_PollEvent")?);
         let f_destroy_texture: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(sym(lib, "SDL_DestroyTexture")?);
@@ -241,10 +303,11 @@ impl Sdl {
         let f_show_cursor = sym(lib, "SDL_ShowCursor")
             .map(|p| std::mem::transmute(p));
 
-        // Choose the pulse audio driver BEFORE any SDL_Init (PipeWire system):
         // SDL picks the driver at init time from SDL_AUDIODRIVER.
         if std::env::var_os("SDL_AUDIODRIVER").is_none() {
-            std::env::set_var("SDL_AUDIODRIVER", "pulse");
+            if let Some(driver) = default_audio_driver() {
+                std::env::set_var("SDL_AUDIODRIVER", driver);
+            }
         }
         let init: unsafe extern "C" fn(u32) -> c_int = std::mem::transmute(s_init);
         // init video+audio together; if that fails, fall back to video only
@@ -253,7 +316,7 @@ impl Sdl {
         // Publish the audio API only after SDL has been loaded. Previously these
         // pointers were resolved but never installed, so Mixer::new always got
         // device 0 and every run was silent.
-        let _ = AUDIO.set(AudioFns { open: f_open_audio, queue: f_queue_audio, pause: f_pause_audio, get_error: f_get_error });
+        let _ = AUDIO.set(AudioFns { open: f_open_audio, queue: f_queue_audio, pause: f_pause_audio, queued_size: f_queued_audio_size, close: f_close_audio, get_error: f_get_error });
         let f_full: unsafe extern "C" fn(*mut c_void, u32) -> c_int =
             std::mem::transmute(sym(lib, "SDL_SetWindowFullscreen")?);
         let _ = FULLSCREEN.set(f_full);
@@ -264,11 +327,9 @@ impl Sdl {
             SDL_WINDOWPOS_CENTERED,
             tw as c_int,
             th as c_int,
-            // Keep a normal title bar for close/minimise, but do not mark the
-            // window resizable. SDL/most window managers derive the maximize
-            // button from this flag; fullscreen is deliberately controlled by
-            // the in-game display-mode setting (or F11) instead.
-            SDL_WINDOW_SHOWN,
+            // Native resize handles and macOS green/fullscreen button must remain
+            // available; drawable rendering and pointer mapping follow the size.
+            SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE,
         );
         if window.is_null() {
             return None;
@@ -314,6 +375,7 @@ impl Sdl {
             f_render_read_pixels,
             f_get_pixel_format_name,
             f_get_window_size,
+            f_get_renderer_output_size,
             f_poll_event,
             f_destroy_texture,
             f_destroy_renderer,
@@ -327,7 +389,16 @@ impl Sdl {
             cursor_hover: std::ptr::null_mut(),
             cursor_pressed: std::ptr::null_mut(),
         };
-        sdl.enable_game_cursor();
+        // The hand-built 16px monochrome arrow is NOT an original WA2 asset.
+        // Keep the platform's sharp, DPI-aware pointer unless explicitly requested.
+        if std::env::var("WA2_CURSOR").as_deref() == Ok("legacy") {
+            sdl.enable_game_cursor();
+        }
+        let logical = sdl.window_size();
+        let drawable = sdl.drawable_size();
+        eprintln!("SDL: logical={}x{} drawable={}x{} pixel_ratio={:.2}x{:.2}",
+            logical.0, logical.1, drawable.0, drawable.1,
+            drawable.0 as f64 / logical.0 as f64, drawable.1 as f64 / logical.1 as f64);
         Some(sdl)
     }
 
@@ -371,11 +442,14 @@ impl Sdl {
 
     /// Upload `surf` pixels to the texture and present, scaled to the window.
     pub fn present(&mut self, surf: &Surface) {
+        if !valid_rgba(surf.width, surf.height, surf.pixels.len()) {
+            eprintln!("SDL: invalid surface dimensions or buffer length");
+            return;
+        }
         Self::dump_frame(surf);
         let t0 = if Self::timing() { Some(std::time::Instant::now()) } else { None };
         unsafe {
             if surf.width != self.tex_w || surf.height != self.tex_h {
-                (self.f_destroy_texture)(self.texture);
                 let t = (self.f_create_texture)(
                     self.renderer,
                     SDL_PIXELFORMAT_RGBA32,
@@ -384,8 +458,10 @@ impl Sdl {
                     surf.height as c_int,
                 );
                 if t.is_null() {
+                    eprintln!("SDL texture creation failed: {}", sdl_get_error());
                     return;
                 }
+                (self.f_destroy_texture)(self.texture);
                 self.texture = t;
                 self.tex_w = surf.width;
                 self.tex_h = surf.height;
@@ -393,7 +469,9 @@ impl Sdl {
             let pitch = (surf.width * 4) as c_int;
             (self.f_update_texture)(self.texture, std::ptr::null(), surf.pixels.as_ptr() as *const c_void, pitch);
             (self.f_render_clear)(self.renderer);
-            (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), std::ptr::null());
+            let (ow, oh) = self.output_size();
+            let rect = fitted_rect(ow, oh, self.tex_w as i32, self.tex_h as i32);
+            (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), rect.as_ptr().cast());
             (self.f_render_present)(self.renderer);
         }
         if let Some(t0) = t0 {
@@ -403,6 +481,51 @@ impl Sdl {
                 surf.height,
                 t0.elapsed().as_secs_f64() * 1000.0
             );
+        }
+    }
+
+    /// Checked rendering diagnostic: capture SDL's actual drawable pixels before
+    /// Present invalidates its backbuffer. Drawable size can exceed window size
+    /// on Retina. This verifies the renderer, not the macOS compositor.
+    pub fn present_checked(&mut self, surf: &Surface) -> Result<Surface, String> {
+        if !valid_rgba(surf.width, surf.height, surf.pixels.len()) {
+            return Err("invalid RGBA surface".into());
+        }
+        unsafe {
+            if surf.width != self.tex_w || surf.height != self.tex_h {
+                let texture = (self.f_create_texture)(self.renderer, SDL_PIXELFORMAT_RGBA32,
+                    SDL_TEXTUREACCESS_STATIC, surf.width as c_int, surf.height as c_int);
+                if texture.is_null() { return Err(format!("create texture: {}", sdl_get_error())); }
+                (self.f_destroy_texture)(self.texture);
+                self.texture = texture;
+                self.tex_w = surf.width;
+                self.tex_h = surf.height;
+            }
+            if (self.f_update_texture)(self.texture, std::ptr::null(), surf.pixels.as_ptr().cast(),
+                (surf.width * 4) as c_int) != 0 {
+                return Err(format!("update texture: {}", sdl_get_error()));
+            }
+            let (ow, oh) = self.output_size();
+            let destination = fitted_rect(ow, oh, surf.width as i32, surf.height as i32);
+            if (self.f_render_clear)(self.renderer) != 0
+                || (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), destination.as_ptr().cast()) != 0 {
+                return Err(format!("render texture: {}", sdl_get_error()));
+            }
+            let (mut w, mut h) = (0, 0);
+            if (self.f_get_renderer_output_size)(self.renderer, &mut w, &mut h) != 0
+                || w <= 0 || h <= 0 || w > 16384 || h > 16384 {
+                return Err(format!("invalid renderer output {w}x{h}: {}", sdl_get_error()));
+            }
+            let mut captured = Surface::new(w as u32, h as u32, [0, 0, 0, 0]);
+            // An explicit rectangle also bounds writes if the window is resized
+            // between output-size query and readback.
+            let rect = [0i32, 0, w, h];
+            if (self.f_render_read_pixels)(self.renderer, rect.as_ptr().cast(), SDL_PIXELFORMAT_RGBA32,
+                captured.pixels.as_mut_ptr().cast(), w * 4) != 0 {
+                return Err(format!("read renderer: {}", sdl_get_error()));
+            }
+            (self.f_render_present)(self.renderer);
+            Ok(captured)
         }
     }
 
@@ -433,18 +556,27 @@ impl Sdl {
     /// Upload a raw RGBA buffer (w*h*4 bytes) to the texture and present,
     /// stretched to the window. Used for video frames.
     pub fn present_raw(&mut self, rgba: &[u8], w: u32, h: u32) {
+        if !valid_rgba(w, h, rgba.len()) {
+            eprintln!("SDL: invalid raw RGBA dimensions or buffer length");
+            return;
+        }
         unsafe {
             if w != self.tex_w || h != self.tex_h {
-                (self.f_destroy_texture)(self.texture);
                 let t = (self.f_create_texture)(self.renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w as c_int, h as c_int);
-                if t.is_null() { return; }
+                if t.is_null() {
+                    eprintln!("SDL texture creation failed: {}", sdl_get_error());
+                    return;
+                }
+                (self.f_destroy_texture)(self.texture);
                 self.texture = t;
                 self.tex_w = w;
                 self.tex_h = h;
             }
             (self.f_update_texture)(self.texture, std::ptr::null(), rgba.as_ptr() as *const c_void, (w * 4) as c_int);
             (self.f_render_clear)(self.renderer);
-            (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), std::ptr::null());
+            let (ow, oh) = self.output_size();
+            let rect = fitted_rect(ow, oh, self.tex_w as i32, self.tex_h as i32);
+            (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), rect.as_ptr().cast());
             (self.f_render_present)(self.renderer);
         }
     }
@@ -453,7 +585,8 @@ impl Sdl {
     /// motion is kept: during skip the game spends a long time between polls,
     /// and the motion that follows a click would otherwise replace it.
     pub fn poll_input(&mut self) -> Input {
-        let mut ev = [0u8; 128];
+        let mut storage = SdlRawBuffer([0u8; 128]);
+        let ev = &mut storage.0;
         let mut out = Input::None;
         unsafe {
             while (self.f_poll_event)(ev.as_mut_ptr() as *mut c_void) != 0 {
@@ -466,9 +599,15 @@ impl Sdl {
                     // offset 16 whose first field is the scancode; the key
                     // constants above are SDL scancode values.
                     let sc = i32::from_ne_bytes([ev[16], ev[17], ev[18], ev[19]]);
+                    let mods = u16::from_ne_bytes([ev[24], ev[25]]);
+                    if ev[13] == 0 && fullscreen_shortcut(sc, mods) {
+                        self.set_fullscreen(!self.is_fullscreen());
+                        continue;
+                    }
                     match sc {
+                        SDLK_ESCAPE if self.is_fullscreen() => { self.set_fullscreen(false); }
                         SDLK_ESCAPE | SDLK_q => out = Input::Quit,
-                        SDLK_F11 => out = Input::Fullscreen,
+                        SDLK_F11 => {},
                         SDLK_LEFT => out = Input::Left,
                         SDLK_UP => out = Input::Up,
                         SDLK_PAGEUP => out = Input::Rewind,
@@ -571,6 +710,18 @@ impl Sdl {
 /// pointer never change. After the request we move that window ourselves.
 pub fn set_fullscreen(&self, on: bool) {
     let Some(f) = FULLSCREEN.get() else { return };
+    if on == self.is_fullscreen() { return; }
+    #[cfg(target_os = "macos")]
+    {
+        // Cocoa owns Spaces/fullscreen animations and restores window geometry.
+        // Linux/X11 manual border/size hacks break the native green button.
+        let rc = unsafe { (f)(self.window, if on { SDL_WINDOW_FULLSCREEN_DESKTOP } else { 0 }) };
+        if rc != 0 { eprintln!("sdl: fullscreen change failed: {}", sdl_get_error()); }
+        self.pump();
+        IS_FULLSCREEN.store(self.is_fullscreen(), std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    #[cfg(not(target_os = "macos"))]
     if on {
         self.remember_windowed();
         let rc = unsafe { (f)(self.window, SDL_WINDOW_FULLSCREEN_DESKTOP) };
@@ -603,10 +754,19 @@ pub fn set_fullscreen(&self, on: bool) {
     }
 }
 
-/// True between `set_fullscreen(true)` and the next windowed request.
+/// Query the actual OS window flags, including native title-bar changes.
 pub fn is_fullscreen(&self) -> bool {
-    IS_FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed)
+    let Some(f) = self.fn_ptr::<unsafe extern "C" fn(*mut c_void) -> u32>("SDL_GetWindowFlags") else { return false; };
+    unsafe { f(self.window) & 1 != 0 }
 }
+
+pub fn is_resizable(&self) -> bool {
+    let Some(f) = self.fn_ptr::<unsafe extern "C" fn(*mut c_void) -> u32>("SDL_GetWindowFlags") else { return false; };
+    unsafe { f(self.window) & SDL_WINDOW_RESIZABLE != 0 }
+}
+
+/// Used by bounded display diagnostics; interactive resizing is owned by Cocoa.
+pub fn resize_window(&self, w: i32, h: i32) { self.sdl_set_size(w.max(320), h.max(180)); }
 
 /// True while the window manager has the window maximized. The title-bar
 /// maximize button is the quick way to a screen-filling window, and the art
@@ -708,7 +868,8 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
     else {
         return;
     };
-    let mut info = [0u8; 128];
+    let mut storage = SdlRawBuffer([0u8; 128]);
+    let info = &mut storage.0;
     unsafe { get_ver(info.as_mut_ptr()) };
     if unsafe { get_info(self.window, info.as_mut_ptr()) } != 1 {
         return;
@@ -753,34 +914,61 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
     }
 }
 
-    /// Current window size in pixels (the surface is stretched to it).
+    /// Current window size in logical screen coordinates, used for mouse events
+    /// and restoring window geometry. On Retina this is NOT the render size.
     pub fn window_size(&self) -> (i32, i32) {
         let (mut w, mut h) = (0i32, 0i32);
         unsafe { (self.f_get_window_size)(self.window, &mut w, &mut h); }
         (w.max(1), h.max(1))
     }
 
-    /// Map a pointer event's window coordinates onto the game surface
-    /// (`present` stretches the surface over the whole window, so this is a
-    /// plain linear scale).
+    /// Complete renderer output, including letterbox bars, in physical pixels.
+    pub fn output_size(&self) -> (i32, i32) {
+        let (mut w, mut h) = (0, 0);
+        let rc = unsafe { (self.f_get_renderer_output_size)(self.renderer, &mut w, &mut h) };
+        if rc == 0 && w > 0 && h > 0 { (w, h) } else { self.window_size() }
+    }
+
+    /// Game content pixels: preserve the authored 16:9 aspect on arbitrary windows.
+    pub fn drawable_size(&self) -> (i32, i32) {
+        let (w, h) = self.output_size();
+        let r = fitted_rect(w, h, 1280, 720);
+        (r[2], r[3])
+    }
+
+    /// Map logical window coordinates through the physical letterbox viewport.
+    /// Outside bars return negative coordinates, never a clickable edge control.
     pub fn surface_pos(&self, x: i32, y: i32, sw: u32, sh: u32) -> (i32, i32) {
         let (ww, wh) = self.window_size();
-        (x * sw as i32 / ww, y * sh as i32 / wh)
+        let (ow, oh) = self.output_size();
+        let r = fitted_rect(ow, oh, 1280, 720);
+        let px = x as i64 * ow as i64 / ww as i64;
+        let py = y as i64 * oh as i64 / wh as i64;
+        if px < r[0] as i64 || py < r[1] as i64 || px >= (r[0]+r[2]) as i64 || py >= (r[1]+r[3]) as i64 {
+            return (-1, -1);
+        }
+        (((px-r[0] as i64)*sw as i64/r[2] as i64) as i32,
+         ((py-r[1] as i64)*sh as i64/r[3] as i64) as i32)
     }
 
     /// Read back the current renderer target as RGBA (for verification),
     /// independent of the windowing/compositor path.
     pub fn read_back(&self, w: u32, h: u32) -> Vec<u8> {
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        if w == 0 || h == 0 || w > 16384 || h > 16384 { return Vec::new(); }
+        let mut buf = vec![0u8; w as usize * h as usize * 4];
         let pitch = (w * 4) as c_int;
+        let rect = [0i32, 0, w as i32, h as i32];
         unsafe {
-            (self.f_render_read_pixels)(
+            if (self.f_render_read_pixels)(
                 self.renderer,
-                std::ptr::null(),
+                rect.as_ptr().cast(),
                 SDL_PIXELFORMAT_RGBA32,
                 buf.as_mut_ptr() as *mut c_void,
                 pitch,
-            );
+            ) != 0 {
+                eprintln!("SDL readback failed: {}", sdl_get_error());
+                return Vec::new();
+            }
         }
         buf
     }
@@ -837,6 +1025,8 @@ struct AudioFns {
     open: unsafe extern "C" fn(*const c_char, c_int, *const SdlAudioSpec, *mut SdlAudioSpec, c_int) -> u32,
     queue: unsafe extern "C" fn(u32, *const c_void, u32) -> c_int,
     pause: unsafe extern "C" fn(u32, i32),
+    queued_size: unsafe extern "C" fn(u32) -> u32,
+    close: unsafe extern "C" fn(u32),
     get_error: unsafe extern "C" fn() -> *const c_char,
 }
 
@@ -875,9 +1065,21 @@ pub fn sdl_open_audio(rate: u32, ch: u16) -> u32 {
 }
 
 /// Push interleaved s16le bytes to the audio device.
-pub fn sdl_queue_audio(dev: u32, bytes: &[u8]) {
-    if let Some(f) = AUDIO.get() {
-        unsafe { (f.queue)(dev, bytes.as_ptr() as *const c_void, bytes.len() as u32); }
+pub fn sdl_queue_audio(dev: u32, bytes: &[u8]) -> bool {
+    let Some(f) = AUDIO.get() else { return false };
+    if dev == 0 || bytes.len() > u32::MAX as usize { return false; }
+    unsafe { (f.queue)(dev, bytes.as_ptr().cast(), bytes.len() as u32) == 0 }
+}
+
+/// Bytes waiting in SDL's device queue (not yet consumed by the backend).
+pub fn sdl_queued_audio_size(dev: u32) -> u32 {
+    AUDIO.get().map(|f| unsafe { (f.queued_size)(dev) }).unwrap_or(0)
+}
+
+/// Close only after the mixer worker has stopped using this device.
+pub fn sdl_close_audio(dev: u32) {
+    if dev != 0 {
+        if let Some(f) = AUDIO.get() { unsafe { (f.close)(dev); } }
     }
 }
 
@@ -891,7 +1093,7 @@ pub fn sdl_pause_audio(dev: u32, paused: bool) {
 /// Name of the active SDL audio driver (diagnostic), e.g. "pulse" / "alsa" / "dummy".
 pub fn sdl_audio_driver() -> String {
     unsafe {
-        let lib = dlopen(CString::new("libSDL2-2.0.so.0").unwrap().as_ptr(), RTLD_NOW);
+        let lib = open_sdl_library();
         if lib.is_null() { return "?".into(); }
         let p = dlsym(lib, CString::new("SDL_GetCurrentAudioDriver").unwrap().as_ptr());
         if p.is_null() { return "?".into(); }
@@ -901,10 +1103,22 @@ pub fn sdl_audio_driver() -> String {
     }
 }
 
+/// Name of the active SDL video driver (diagnostic), e.g. "cocoa" / "x11".
+pub fn sdl_video_driver() -> String {
+    unsafe {
+        let lib = open_sdl_library();
+        if lib.is_null() { return "?".into(); }
+        let Some(p) = sym(lib, "SDL_GetCurrentVideoDriver") else { return "?".into() };
+        let f: unsafe extern "C" fn() -> *const c_char = std::mem::transmute(p);
+        let n = f();
+        if n.is_null() { "none".into() } else { std::ffi::CStr::from_ptr(n).to_string_lossy().into_owned() }
+    }
+}
+
 /// SDL_GetError() string (diagnostic).
 pub fn sdl_get_error() -> String {
     unsafe {
-        let lib = dlopen(CString::new("libSDL2-2.0.so.0").unwrap().as_ptr(), RTLD_NOW);
+        let lib = open_sdl_library();
         if lib.is_null() { return "?".into(); }
         let p = dlsym(lib, CString::new("SDL_GetError").unwrap().as_ptr());
         if p.is_null() { return "?".into(); }
@@ -916,7 +1130,87 @@ pub fn sdl_get_error() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::cursor_bitmap;
+    use super::{cursor_bitmap, default_audio_driver, SDL_LIBRARIES};
+
+    #[test]
+    fn letterbox_preserves_game_aspect_for_square_wide_and_retina_outputs() {
+        assert_eq!(super::fitted_rect(1600, 1600, 1280, 720), [0,350,1600,900]);
+        assert_eq!(super::fitted_rect(2200, 1000, 1280, 720), [211,0,1777,1000]);
+        assert_eq!(super::fitted_rect(3024, 1890, 1280, 720), [0,94,3024,1701]);
+        assert_eq!(super::fitted_rect(2560, 1440, 1280, 720), [0,0,2560,1440]);
+    }
+
+    #[test]
+    fn standard_fullscreen_shortcuts_do_not_consume_plain_typing() {
+        assert!(super::fullscreen_shortcut(super::SDLK_F11, 0));
+        assert!(super::fullscreen_shortcut(super::SDLK_f, 0x0440));
+        assert!(super::fullscreen_shortcut(super::SDLK_RETURN, 0x0100));
+        assert!(!super::fullscreen_shortcut(super::SDLK_f, 0));
+        assert!(!super::fullscreen_shortcut(super::SDLK_f, 0x0040));
+        assert!(!super::fullscreen_shortcut(super::SDLK_RETURN, 0));
+    }
+
+    #[test]
+    fn raw_ffi_buffer_has_sdl_struct_capacity_and_alignment() {
+        use std::mem::{align_of, size_of};
+        assert_eq!(align_of::<super::SdlRawBuffer>(), 8);
+        assert_eq!(size_of::<super::SdlRawBuffer>(), 128);
+        let storage = super::SdlRawBuffer([0u8; 128]);
+        assert_eq!(storage.0.as_ptr() as usize % 8, 0);
+        assert!(storage.0.len() >= 56); // SDL_Event on LP64
+        assert!(storage.0.len() >= 72); // SDL_SysWMinfo on LP64
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn audio_spec_matches_sdl_lp64_layout() {
+        use std::mem::{align_of, offset_of, size_of};
+        use super::SdlAudioSpec;
+        assert_eq!(align_of::<SdlAudioSpec>(), 8);
+        assert_eq!(size_of::<SdlAudioSpec>(), 32);
+        assert_eq!(offset_of!(SdlAudioSpec, freq), 0);
+        assert_eq!(offset_of!(SdlAudioSpec, format), 4);
+        assert_eq!(offset_of!(SdlAudioSpec, channels), 6);
+        assert_eq!(offset_of!(SdlAudioSpec, silence), 7);
+        assert_eq!(offset_of!(SdlAudioSpec, samples), 8);
+        assert_eq!(offset_of!(SdlAudioSpec, padding), 10);
+        assert_eq!(offset_of!(SdlAudioSpec, size), 12);
+        assert_eq!(offset_of!(SdlAudioSpec, callback), 16);
+        assert_eq!(offset_of!(SdlAudioSpec, userdata), 24);
+    }
+
+    #[test]
+    fn rgba_upload_rejects_short_empty_and_overflowing_buffers() {
+        assert!(super::valid_rgba(2, 3, 24));
+        assert!(!super::valid_rgba(2, 3, 23));
+        assert!(!super::valid_rgba(0, 3, 0));
+        assert!(!super::valid_rgba(u32::MAX, u32::MAX, 0));
+        assert!(!super::valid_rgba(i32::MAX as u32, 1, i32::MAX as usize * 4));
+    }
+
+    #[test]
+    fn library_candidates_match_the_platform() {
+        #[cfg(target_os = "macos")]
+        {
+            assert!(SDL_LIBRARIES.contains(&"libSDL2.dylib"));
+            assert!(SDL_LIBRARIES.contains(&"/opt/homebrew/opt/sdl2/lib/libSDL2.dylib"));
+            assert!(SDL_LIBRARIES.contains(&"/usr/local/opt/sdl2/lib/libSDL2.dylib"));
+            assert!(SDL_LIBRARIES.contains(&"/Library/Frameworks/SDL2.framework/SDL2"));
+            assert!(SDL_LIBRARIES.iter().all(|s| !s.contains(".so")));
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(SDL_LIBRARIES, &[
+            "libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so",
+        ]);
+    }
+
+    #[test]
+    fn audio_default_is_platform_appropriate() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(default_audio_driver(), Some("pulse"));
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(default_audio_driver(), None);
+    }
 
     #[test]
     fn game_cursor_has_three_visible_states() {

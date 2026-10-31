@@ -963,57 +963,93 @@ mod tests {
         assert_eq!(picked(1), Some((ShotKind::Entry, "b990000.tga".to_string())));
     }
 
+    struct FixtureCache(PathBuf);
+
+    impl FixtureCache {
+        fn new(tag: &str) -> Self {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("wa2-shots-{tag}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&path).expect("isolated thumbnail cache");
+            Self(path)
+        }
+
+        fn prepare(&self, source: &Path) {
+            let target = self.0.join(format!("{}.tga", file_stem_lower(source)));
+            if target.is_file() {
+                return;
+            }
+            // Blank classification intentionally does not decode large art.
+            // Build the same small fixture it expects, without requiring or
+            // modifying the installation's optional pre-rendered cache.
+            let image = crate::codec::image::decode_file_preview(source, WORK_W, WORK_H)
+                .unwrap_or_else(|error| panic!("thumbnail fixture {}: {error}", source.display()));
+            std::fs::write(target, crate::codec::tga::encode(&image)).expect("write thumbnail fixture");
+        }
+    }
+
+    impl Drop for FixtureCache {
+        fn drop(&mut self) {
+            // This path was exclusively created by new(), never a data tree.
+            assert_eq!(self.0.parent(), Some(std::env::temp_dir().as_path()));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn blank_detection_tells_the_paper_plate_from_a_dark_scene() {
-        let cache_dir = Path::new("data/cache/timeline");
-        if !cache_dir.is_dir() {
-            return;
-        }
-        let mut provider = ThumbProvider::new(cache_dir, &[]);
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
+        let index = picture_index(&dirs);
+        let cache = FixtureCache::new("blank");
+        let mut provider = ThumbProvider::new(&cache.0, &dirs);
         // The white paper plate is near-uniform, a night scene is not.
-        assert!(provider.is_blank(Path::new("data/bg/b990000.tga")));
-        assert!(!provider.is_blank(Path::new("data/bg/b980000.tga")));
-        assert!(!provider.is_blank(Path::new("data/bg/b106001.tga")));
+        for (id, variant, expected_stem, blank) in [
+            (9900, 0, "b990000", true),
+            (9800, 0, "b980000", false),
+            (1060, 1, "b106001", false),
+        ] {
+            let source = resolve(&index, &shot(false, id, variant)).expect("background fixture");
+            assert_eq!(file_stem_lower(&source), expected_stem);
+            cache.prepare(&source);
+            assert_eq!(provider.is_blank(&source), blank, "{expected_stem} blank classification");
+        }
     }
 
     #[test]
     fn novel_roots_do_not_show_the_blank_paper_plate() {
-        let bg = Path::new("data/bg");
-        let cache_dir = Path::new("data/cache/timeline");
-        if !bg.is_dir() || !cache_dir.is_dir() {
-            return;
-        }
-        let nodes = graph::build_nodes(Path::new("data/script"));
-        let index = picture_index(&[bg]);
-        let dirs: [&Path; 1] = [bg];
-        let mut provider = ThumbProvider::new(cache_dir, &dirs);
-        let picks = pick_scene_pictures(&index, &nodes, &mut |path| provider.is_blank(path));
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
+        let nodes = graph::build_nodes(&crate::test_data::script());
+        let index = picture_index(&dirs);
+        let cache = FixtureCache::new("novel");
+        let mut provider = ThumbProvider::new(&cache.0, &dirs);
+        let picks = pick_scene_pictures(&index, &nodes, &mut |path| {
+            cache.prepare(path);
+            provider.is_blank(path)
+        });
         let pick_of = |id: &str| -> Option<String> {
             let i = nodes.iter().position(|n| n.id == id)?;
             picks[i]
                 .as_ref()
-                .and_then(|p| p.path.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
+                .map(|p| file_stem_lower(&p.path))
         };
         for id in ["5000", "5100"] {
-            let file = pick_of(id).unwrap_or_default();
-            assert_ne!(file.as_str(), "b990000.tga", "{id} still shows the blank plate");
+            let file = pick_of(id).expect("novel root must have a picture");
+            assert_ne!(file.as_str(), "b990000", "{id} still shows the blank plate");
             let i = nodes.iter().position(|n| n.id == id).unwrap();
             let pick = picks[i].as_ref().unwrap();
             assert!(!provider.is_blank(&pick.path), "{id} picked a blank picture: {file:?}");
         }
         // The normal chapters are unaffected: 1001 still opens on its own art.
-        assert_eq!(pick_of("1001").as_deref(), Some("b106001.tga"));
+        assert_eq!(pick_of("1001").as_deref(), Some("b106001"));
     }
 
     #[test]
     fn neighbouring_scenes_do_not_share_a_thumbnail() {
-        let bg = Path::new("data/bg");
-        if !bg.is_dir() {
-            return;
-        }
-        let nodes = graph::build_nodes(Path::new("data/script"));
-        let index = picture_index(&[bg]);
+        let paths = crate::test_data::bg_dirs();
+        let dirs: Vec<_> = paths.iter().map(|p| p.as_path()).collect();
+        let nodes = graph::build_nodes(&crate::test_data::script());
+        let index = picture_index(&dirs);
         let picks = pick_scene_pictures(&index, &nodes, &mut |_| false);
         let name = |id: &str| {
             let i = nodes.iter().position(|n| n.id == id)?;
@@ -1058,8 +1094,8 @@ mod tests {
             }
         }
         // The event CG sharing 1017's number never wins over the real room.
-        let room = name("3211").unwrap_or_default();
-        assert_ne!(room, "tv101700.tga");
+        let room = name("3211").expect("3211 must have a picture");
+        assert_ne!(file_stem_lower(Path::new(&room)), "tv101700");
     }
 
     #[test]
