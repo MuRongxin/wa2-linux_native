@@ -78,12 +78,18 @@ WA2_AUTO_INSTALL=0 ./run.sh
 
 ### macOS
 
-macOS（Apple 芯片与 Intel）不使用 AppImage，`run.sh` 直接从源码构建。需要 Xcode 命令行工具和 [Homebrew](https://brew.sh)；缺少 SDL2、FreeType 或 ffmpeg 时，脚本会以当前用户执行 `brew install sdl2 freetype ffmpeg webp`，无需管理员密码。资源下载、存档和设置与 Linux 相同，都在项目目录内。
+macOS（Apple 芯片与 Intel）不使用 AppImage，`run.sh` 直接从源码构建。需要 Xcode 命令行工具和 [Homebrew](https://brew.sh)；缺少 SDL2、FreeType 或 ffmpeg 时，脚本会以当前用户执行 `brew install sdl2 freetype ffmpeg webp`，无需管理员密码。
+
+macOS 默认的 APFS 卷不区分大小写，而资源中有几组仅大小写不同的文件（如 `bg_2x/T0010.tga` 与 `t0010.tga`），解压到普通目录会互相覆盖。因此资源要放进一个区分大小写的磁盘映像，再用 `WA2_DATA` 指向它：
 
 ~~~bash
 xcode-select --install   # 仅首次需要
-./run.sh
+hdiutil create -size 80g -type SPARSEBUNDLE -fs "Case-sensitive APFS" -volname WA2-data ~/wa2-data.sparsebundle
+hdiutil attach ~/wa2-data.sparsebundle   # 挂载到 /Volumes/WA2-data；重启后需要重新挂载
+WA2_DATA=/Volumes/WA2-data ./run.sh
 ~~~
+
+映像按实际占用增长（约 51 GB），存档和设置也在其中；不再需要时推出并删除 `wa2-data.sparsebundle` 即可。如果忘了这一步，安装脚本会在下载校验后、解压前停下提示，已下载的分卷保留，挂载映像后重新运行即可继续。
 
 ### 常用启动命令
 
@@ -248,7 +254,7 @@ AppImage 只包含引擎与运行组件，不随 Git 克隆下载。游戏素材
 <details>
 <summary><strong>支持 Windows、macOS 或其他 CPU 架构吗？</strong></summary>
 
-当前 AppImage 的打包目标为 Linux x86_64。Windows、macOS 和其他架构尚未完成支持验证；不能直接使用此 AppImage。
+当前 AppImage 的打包目标为 Linux x86_64。macOS 从源码构建运行，见上文 [macOS](#macos) 一节。Windows 和其他架构尚未完成支持验证；不能直接使用此 AppImage。
 
 </details>
 

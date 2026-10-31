@@ -388,6 +388,37 @@ def check_space(data: Path, parts_dir: Path, manifest: dict) -> None:
             raise FetchError("磁盘空间不足（安装期间需要同时存放压缩包和解压后的资源）。")
 
 
+def case_clashes(parts_dir: Path, manifest: dict) -> list[str]:
+    """Archive members whose paths differ from another member only by case."""
+    seen: dict[str, str] = {}
+    clashes = []
+    for part in manifest["parts"]:
+        with zipfile.ZipFile(parts_dir / part["name"]) as archive:
+            for name in archive.namelist():
+                other = seen.setdefault(name.lower(), name)
+                if other != name:
+                    clashes.append(f"{other} / {name}")
+    return clashes
+
+
+def case_sensitive(folder: Path) -> bool:
+    with tempfile.NamedTemporaryFile(dir=folder, prefix=".wa2-case-") as probe:
+        return not (folder / Path(probe.name).name.upper()).exists()
+
+
+def check_case(parts_dir: Path, data: Path, manifest: dict) -> None:
+    """Stop before extracting when same-name-but-case files would overwrite
+    each other, as on the default macOS volume. The parts stay cached."""
+    clashes = case_clashes(parts_dir, manifest)
+    if not clashes or case_sensitive(data):
+        return
+    hint = "参见 README 的 macOS 一节创建区分大小写的磁盘映像，" if sys.platform == "darwin" else ""
+    raise FetchError(
+        f"资源中有 {len(clashes)} 组仅大小写不同的文件（如 {clashes[0]}），而 {data} "
+        f"所在的文件系统不区分大小写，解压会互相覆盖。{hint}"
+        "把 WA2_DATA 指向区分大小写的目录后重新运行；已下载的分卷会继续使用。")
+
+
 def extract_parts(parts_dir: Path, data: Path, manifest: dict) -> None:
     # Keep interrupted writes outside the inventoried trees. A SIGKILL must not
     # leave random temporary files that make the next inventory check fail.
@@ -549,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
                 download_asset(assets[part["name"]], target, args.token, part["sha256"], proxies,
                                completed, total, f"下载 [{index}/{len(parts)}]")
             completed += part["size"]
+        check_case(parts_dir, data, manifest)
         say("所有分卷 SHA-256 校验通过，开始解压……")
         extract_parts(parts_dir, data, manifest)
         say("检查解压后的资源目录……")
