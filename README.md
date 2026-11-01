@@ -279,6 +279,8 @@ WA2_BUILD_FROM_SOURCE=1 ./run.sh
 cargo test --release
 ~~~
 
+测试通过 `WA2_DATA` 或仓库内的 `data/` 查找游戏素材（不写入源码路径）；素材未安装时，依赖素材的测试会打印 `skipped ...` 并跳过，其余测试照常运行。设置 `WA2_DATA` 可以指向另一份数据目录运行完整测试。
+
 </details>
 
 <details>

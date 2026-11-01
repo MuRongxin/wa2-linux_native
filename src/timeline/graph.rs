@@ -521,8 +521,16 @@ pub(super) fn check(script_dir: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn chart() -> Vec<Node> {
-        build_nodes(Path::new("data/script"))
+    /// The shipped scenario graph, or `None` when the game data is not
+    /// installed (a fresh clone carries no `data/` - the release of the
+    /// copyright assets is fetched separately). Data-dependent graph tests
+    /// skip instead of panicking on the missing node 1001.
+    fn chart() -> Option<Vec<Node>> {
+        let Some(dir) = crate::testdata::script_dir() else {
+            eprintln!("skipped graph test: no game data (see src/testdata.rs)");
+            return None;
+        };
+        Some(build_nodes(&dir))
     }
 
     fn at(nodes: &[Node], id: &str) -> usize {
@@ -552,7 +560,7 @@ mod tests {
     /// Freeze the graph shape the chart and the report are built on.
     #[test]
     fn the_graph_shape_is_frozen() {
-        let nodes = chart();
+        let Some(nodes) = chart() else { return };
         assert_eq!(nodes.len(), 163);
         assert_eq!(nodes.iter().filter(|n| n.next.len() > 1).count(), 9, "branch points");
         assert_eq!(nodes.iter().filter(|n| n.ending).count(), 11, "endings");
@@ -586,7 +594,7 @@ mod tests {
     /// Roots are legal entries (no incoming edge), endings are dead ends.
     #[test]
     fn roots_and_endings_are_exact() {
-        let nodes = chart();
+        let Some(nodes) = chart() else { return };
         let mut has_in = vec![false; nodes.len()];
         for node in &nodes {
             for edge in &node.next {
@@ -622,7 +630,7 @@ mod tests {
     /// the same chapter; sequential edges stay unlabelled.
     #[test]
     fn branch_edges_are_labelled_by_route_or_scene() {
-        let nodes = chart();
+        let Some(nodes) = chart() else { return };
         // 2019 is the four-way choice: four Branch edges, one per route.
         let choices = &nodes[at(&nodes, "2019")].next;
         assert_eq!(choices.len(), 4);
@@ -667,7 +675,7 @@ mod tests {
     /// nodes share a chart cell.
     #[test]
     fn the_layout_advances_columns_without_overlapping_cells() {
-        let nodes = chart();
+        let Some(nodes) = chart() else { return };
         let mut cells = std::collections::HashSet::new();
         for node in &nodes {
             assert!(
@@ -742,7 +750,7 @@ mod tests {
 
     #[test]
     fn common_route_reaches_four_branches_without_subscripts() {
-        let nodes = build_nodes(Path::new("data/script"));
+        let Some(nodes) = chart() else { return };
         assert!(nodes.len() > 40, "expected the chapter scripts, got {}", nodes.len());
         assert!(nodes.iter().all(|n| !n.id.contains('_')));
         let at = |id: &str| nodes.iter().position(|n| n.id == id).unwrap();
@@ -773,7 +781,7 @@ mod tests {
     #[test]
     fn the_ic_chain_continues_through_its_subscripts() {
         // 1008/1009/... only name the next entry from inside their _020 pages.
-        let nodes = build_nodes(Path::new("data/script"));
+        let Some(nodes) = chart() else { return };
         let at = |id: &str| nodes.iter().position(|n| n.id == id).unwrap();
         let next = |id: &str| -> Vec<&str> {
             nodes[at(id)].next.iter().map(|e| nodes[e.to].id.as_str()).collect()
@@ -787,7 +795,7 @@ mod tests {
 
     #[test]
     fn every_node_is_reachable_from_a_root() {
-        let nodes = build_nodes(Path::new("data/script"));
+        let Some(nodes) = chart() else { return };
         let mut seen = vec![false; nodes.len()];
         let mut stack: Vec<usize> = nodes.iter().enumerate().filter(|(_, n)| n.root).map(|(i, _)| i).collect();
         while let Some(i) = stack.pop() {
@@ -810,7 +818,7 @@ mod tests {
 
     #[test]
     fn endings_are_the_dead_ends() {
-        let nodes = build_nodes(Path::new("data/script"));
+        let Some(nodes) = chart() else { return };
         for node in &nodes {
             assert_eq!(node.ending, node.next.is_empty(), "{}", node.id);
         }
@@ -823,9 +831,12 @@ mod tests {
     /// a script-data change by eye.
     #[test]
     fn check_report_lists_the_whole_graph_and_is_stable() {
-        let dir = Path::new("data/script");
-        let report = check(dir);
-        assert_eq!(report, check(dir), "check output must be deterministic");
+        let Some(dir) = crate::testdata::script_dir() else {
+            eprintln!("skipped graph report test: no game data (see src/testdata.rs)");
+            return;
+        };
+        let report = check(&dir);
+        assert_eq!(report, check(&dir), "check output must be deterministic");
         let has = |needle: &str| report.iter().any(|line| line == needle);
         let starts = |needle: &str| report.iter().any(|line| line.starts_with(needle));
         assert!(has("script files: 187 .bnr, 168 entries, 163 collected"));

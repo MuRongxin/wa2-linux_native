@@ -245,10 +245,10 @@ mod tests {
     /// (data/script is Japanese; the Chinese patch only repaints the glyphs.)
     #[test]
     fn route_identity_is_verified_against_the_script_text() {
-        let dir = std::path::Path::new("data/script");
-        if !dir.is_dir() {
+        let Some(dir) = crate::testdata::data("script") else {
+            eprintln!("skipped route identity test: no game data (see src/testdata.rs)");
             return;
-        }
+        };
         let text = |id: &str| {
             let bytes = std::fs::read(dir.join(format!("{id}.txt"))).unwrap_or_default();
             crate::codec::sjis::decode(&bytes)

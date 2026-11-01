@@ -333,11 +333,14 @@ mod tests {
 
     #[test]
     fn the_sampled_line_decodes_as_chinese_in_cn_mode() {
-        let dir = Path::new("data/script_cn");
-        if !dir.is_dir() {
+        let (Some(dir), Some(jp)) =
+            (crate::testdata::data("script_cn"), crate::testdata::data("script"))
+        else {
+            eprintln!("skipped preview decode test: no game data (see src/testdata.rs)");
             return;
-        }
-        let jp = Path::new("data/script");
+        };
+        let dir = dir.as_path();
+        let jp = jp.as_path();
         let cn_line = line(dir, "3211", true);
         let raw = line(jp, "3211", false);
         assert!(!cn_line.is_empty(), "no preview text for 3211");
@@ -396,13 +399,14 @@ mod tests {
 
     #[test]
     fn japanese_mode_keeps_the_japanese_line() {
-        let dir = Path::new("data/script");
-        if !dir.is_dir() {
+        let Some(dir) = crate::testdata::data("script") else {
+            eprintln!("skipped japanese preview test: no game data (see src/testdata.rs)");
             return;
-        }
-        let jp = line(dir, "1001", false);
+        };
+        let jp = line(dir.as_path(), "1001", false);
         assert!(jp.chars().any(|c| ('\u{3040}'..='\u{30ff}').contains(&c)), "{jp}");
-        let cn = line(Path::new("data/script_cn"), "1001", true);
+        let Some(cn_dir) = crate::testdata::data("script_cn") else { return };
+        let cn = line(cn_dir.as_path(), "1001", true);
         assert!(cn.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "{cn}");
     }
 
@@ -486,10 +490,11 @@ mod tests {
 
     #[test]
     fn data_scenarios_all_produce_a_preview_line() {
-        let dir = Path::new("data/script_cn");
-        if !dir.is_dir() {
+        let Some(dir) = crate::testdata::data("script_cn") else {
+            eprintln!("skipped preview scenarios test: no game data (see src/testdata.rs)");
             return;
-        }
+        };
+        let dir = dir.as_path();
         // One scenario from every chapter; the preview must not be blank.
         for id in ["1001", "2019", "2020", "2301", "2401", "2501", "3001", "3101", "3201", "3901", "5000", "5100"] {
             let text = line(dir, id, true);

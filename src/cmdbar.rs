@@ -418,15 +418,16 @@ pub struct Active {
 #[cfg(test)]
 mod integration {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn icons_use_the_original_rects() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let bar = CmdBar::load(&dirs);
+        if crate::testdata::no_data("command bar icon test") {
+            return;
+        }
+        let dirs = crate::testdata::art_dirs();
+        let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let bar = CmdBar::load(&refs);
         assert!(bar.icons.is_some(), "sys_00010.tga did not load");
         assert!(bar.labels.is_some(), "sys_00012.tga did not load");
 
@@ -514,32 +515,19 @@ mod integration {
             }
         }
         assert!(cap_rew > 10, "expected the 快退 caption, pixels {cap_rew}");
-        let _ = hover_rew.save_tga("/tmp/wa2btn/rewind_hover.tga");
-
-        let _ = std::fs::create_dir_all("/tmp/wa2btn");
-        let _ = surf.save_tga("/tmp/wa2btn/cmdbar_preview.tga");
+        let out = crate::testdata::out_dir();
+        let _ = hover_rew.save_tga(&out.join("rewind_hover.tga").to_string_lossy());
+        let _ = surf.save_tga(&out.join("cmdbar_preview.tga").to_string_lossy());
     }
 
     #[test]
     fn window_text_sits_inside_the_oval() {
-        let atlas = crate::codec::tga::decode_font(
-            &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
-        )
-        .unwrap();
-        let font = crate::render::Font::from_cell_map(
-            atlas,
-            40,
-            std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
-        )
-        .unwrap();
-        let plate = crate::codec::tga::decode(
-            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00001.tga").unwrap(),
-        )
-        .unwrap();
-        let frame = crate::codec::tga::decode(
-            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00000.tga").unwrap(),
-        )
-        .unwrap();
+        if crate::testdata::no_data("window plate test") {
+            return;
+        }
+        let font = crate::testdata::bitmap_font().expect("data/font Chinese bitmap atlas");
+        let plate = crate::testdata::ui_image("sys_00001.tga").expect("sys_00001.tga");
+        let frame = crate::testdata::ui_image("sys_00000.tga").expect("sys_00000.tga");
         let bg = crate::codec::tga::TgaImage {
             width: 1280,
             height: 720,
@@ -561,11 +549,9 @@ mod integration {
             &[],
         );
         font.draw_pitch(&mut surf, "春希", crate::render::NAME_X, crate::render::NAME_Y, crate::render::DIALOG_PITCH);
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let bar = CmdBar::load(&dirs);
+        let dirs = crate::testdata::art_dirs();
+        let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let bar = CmdBar::load(&refs);
         bar.draw(&mut surf, Some(Cmd::Save), Active { auto: true, skip: false, rewind: false, hide: false }, 100, 1280, 720);
         // A glyph of the line must land inside the oval, not on the bare background.
         let i = ((600 * 1280 + 700) * 4) as usize;
@@ -576,30 +562,18 @@ mod integration {
             surf.pixels[i + 1],
             surf.pixels[i + 2]
         );
-        let _ = std::fs::create_dir_all("/tmp/wa2btn");
-        let _ = surf.save_tga("/tmp/wa2btn/window_preview.tga");
+        let out = crate::testdata::out_dir();
+        let _ = surf.save_tga(&out.join("window_preview.tga").to_string_lossy());
     }
 
     #[test]
     fn typewriter_and_window_alpha_change_the_frame() {
-        let atlas = crate::codec::tga::decode_font(
-            &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
-        )
-        .unwrap();
-        let font = crate::render::Font::from_cell_map(
-            atlas,
-            40,
-            std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
-        )
-        .unwrap();
-        let plate = crate::codec::tga::decode(
-            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00001.tga").unwrap(),
-        )
-        .unwrap();
-        let frame = crate::codec::tga::decode(
-            &std::fs::read("/home/lrxin/wa2-native/data/bg/sys_00000.tga").unwrap(),
-        )
-        .unwrap();
+        if crate::testdata::no_data("typewriter test") {
+            return;
+        }
+        let font = crate::testdata::bitmap_font().expect("data/font Chinese bitmap atlas");
+        let plate = crate::testdata::ui_image("sys_00001.tga").expect("sys_00001.tga");
+        let frame = crate::testdata::ui_image("sys_00000.tga").expect("sys_00000.tga");
         let bg = crate::codec::tga::TgaImage {
             width: 1280,
             height: 720,
@@ -643,11 +617,12 @@ mod integration {
     /// the game.
     #[test]
     fn rewind_caption_is_cached_per_font_generation() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let bar = CmdBar::load(&dirs);
+        if crate::testdata::no_data("rewind caption test") {
+            return;
+        }
+        let dirs = crate::testdata::art_dirs();
+        let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let bar = CmdBar::load(&refs);
         if bar.icons.is_none() {
             return;
         }

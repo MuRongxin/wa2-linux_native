@@ -874,6 +874,25 @@ mod tests {
         }
     }
 
+    /// The identity of a picture for chart purposes: its lower-cased file stem.
+    /// The tree/format decides the extension (`b100101.webp` in an upscaled
+    /// tree, `b100101.tga` in the 1280x720 originals), so assertions compare
+    /// stems exactly like the runtime's thumbnail cache keys do.
+    fn stem_of(path: &Path) -> String {
+        path.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+    }
+
+    /// Background trees to hand to `picture_index`/`ThumbProvider`, or `None`
+    /// with a skip line when the art release is not installed.
+    fn art_trees(what: &str) -> Option<Vec<PathBuf>> {
+        let art = crate::testdata::art_dirs();
+        if !art.is_empty() {
+            return Some(art);
+        }
+        eprintln!("skipped {what}: no background art tree (see src/testdata.rs)");
+        None
+    }
+
     #[test]
     fn thumbnails_are_preferred_for_chart_nodes() {
         let mut bg = HashMap::new();
@@ -965,59 +984,71 @@ mod tests {
 
     #[test]
     fn blank_detection_tells_the_paper_plate_from_a_dark_scene() {
-        let cache_dir = Path::new("data/cache/timeline");
-        if !cache_dir.is_dir() {
+        let Some(cache_dir) = crate::testdata::timeline_cache() else {
+            eprintln!("skipped blank detection: no timeline cache (see src/testdata.rs)");
             return;
-        }
-        let mut provider = ThumbProvider::new(cache_dir, &[]);
+        };
+        // Real source sheets: the check itself reads the pre-rendered 320x180
+        // thumbnail keyed by the source stem, exactly like the runtime does.
+        let (Some(paper), Some(night), Some(room)) = (
+            crate::testdata::art_file("b990000.tga"),
+            crate::testdata::art_file("b980000.tga"),
+            crate::testdata::art_file("b106001.tga"),
+        )
+        else {
+            eprintln!("skipped blank detection: the blank/night/room sheets are not installed");
+            return;
+        };
+        let mut provider = ThumbProvider::new(&cache_dir, &[]);
         // The white paper plate is near-uniform, a night scene is not.
-        assert!(provider.is_blank(Path::new("data/bg/b990000.tga")));
-        assert!(!provider.is_blank(Path::new("data/bg/b980000.tga")));
-        assert!(!provider.is_blank(Path::new("data/bg/b106001.tga")));
+        assert!(provider.is_blank(&paper));
+        assert!(!provider.is_blank(&night));
+        assert!(!provider.is_blank(&room));
     }
 
     #[test]
     fn novel_roots_do_not_show_the_blank_paper_plate() {
-        let bg = Path::new("data/bg");
-        let cache_dir = Path::new("data/cache/timeline");
-        if !bg.is_dir() || !cache_dir.is_dir() {
+        let (Some(script_dir), Some(cache_dir)) =
+            (crate::testdata::script_dir(), crate::testdata::timeline_cache())
+        else {
+            eprintln!("skipped novel roots: no game data or timeline cache (see src/testdata.rs)");
             return;
-        }
-        let nodes = graph::build_nodes(Path::new("data/script"));
-        let index = picture_index(&[bg]);
-        let dirs: [&Path; 1] = [bg];
-        let mut provider = ThumbProvider::new(cache_dir, &dirs);
+        };
+        let Some(art) = art_trees("novel roots") else { return };
+        let dirs: Vec<&Path> = art.iter().map(|p| p.as_path()).collect();
+        let nodes = graph::build_nodes(&script_dir);
+        let index = picture_index(&dirs);
+        let mut provider = ThumbProvider::new(&cache_dir, &dirs);
         let picks = pick_scene_pictures(&index, &nodes, &mut |path| provider.is_blank(path));
         let pick_of = |id: &str| -> Option<String> {
             let i = nodes.iter().position(|n| n.id == id)?;
-            picks[i]
-                .as_ref()
-                .and_then(|p| p.path.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
+            picks[i].as_ref().map(|p| stem_of(&p.path))
         };
         for id in ["5000", "5100"] {
-            let file = pick_of(id).unwrap_or_default();
-            assert_ne!(file.as_str(), "b990000.tga", "{id} still shows the blank plate");
+            let stem = pick_of(id).unwrap_or_default();
+            assert_ne!(stem.as_str(), "b990000", "{id} still shows the blank plate");
             let i = nodes.iter().position(|n| n.id == id).unwrap();
             let pick = picks[i].as_ref().unwrap();
-            assert!(!provider.is_blank(&pick.path), "{id} picked a blank picture: {file:?}");
+            assert!(!provider.is_blank(&pick.path), "{id} picked a blank picture: {stem:?}");
         }
         // The normal chapters are unaffected: 1001 still opens on its own art.
-        assert_eq!(pick_of("1001").as_deref(), Some("b106001.tga"));
+        assert_eq!(pick_of("1001").as_deref(), Some("b106001"));
     }
 
     #[test]
     fn neighbouring_scenes_do_not_share_a_thumbnail() {
-        let bg = Path::new("data/bg");
-        if !bg.is_dir() {
+        let Some(script_dir) = crate::testdata::script_dir() else {
+            eprintln!("skipped neighbouring scenes: no game data (see src/testdata.rs)");
             return;
-        }
-        let nodes = graph::build_nodes(Path::new("data/script"));
-        let index = picture_index(&[bg]);
+        };
+        let Some(art) = art_trees("neighbouring scenes") else { return };
+        let dirs: Vec<&Path> = art.iter().map(|p| p.as_path()).collect();
+        let nodes = graph::build_nodes(&script_dir);
+        let index = picture_index(&dirs);
         let picks = pick_scene_pictures(&index, &nodes, &mut |_| false);
         let name = |id: &str| {
             let i = nodes.iter().position(|n| n.id == id)?;
-            picks[i].as_ref().and_then(|p| p.path.file_name()).map(|s| s.to_string_lossy().into_owned())
+            picks[i].as_ref().map(|p| stem_of(&p.path))
         };
         let mut kinds = [0usize; 3];
         for pick in picks.iter().flatten() {
@@ -1059,7 +1090,7 @@ mod tests {
         }
         // The event CG sharing 1017's number never wins over the real room.
         let room = name("3211").unwrap_or_default();
-        assert_ne!(room, "tv101700.tga");
+        assert_ne!(room, "tv101700");
     }
 
     #[test]

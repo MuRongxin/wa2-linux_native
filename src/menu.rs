@@ -4222,11 +4222,12 @@ mod tests {
     /// blit replaces the whole caption-scrubbing pass.
     #[test]
     fn clean_page_needs_no_wipe() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let mut assets = Assets::load(&dirs);
+        if crate::testdata::no_data("clean page test") {
+            return;
+        }
+        let dirs = crate::testdata::art_dirs();
+        let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let mut assets = Assets::load(&refs);
         let Some(base) = assets.base[0].as_ref() else { return };
         // Build the clean page from the same art, so the test does not depend
         // on the derived cache being generated in this checkout.
@@ -4321,11 +4322,12 @@ mod tests {
     /// column, while the heading bars and section rules must.
     #[test]
     fn baked_page_drops_captions_keeps_structure() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let assets = Assets::load(&dirs);
+        if crate::testdata::no_data("baked page test") {
+            return;
+        }
+        let dirs = crate::testdata::art_dirs();
+        let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let assets = Assets::load(&refs);
         let Some(base) = assets.base[0].as_ref() else { return };
         let baked = bake_clean_page(base, 0);
         // 1) Caption column: white-ish ink is gone (white captions would be
@@ -4397,11 +4399,12 @@ mod tests {
     /// `clean_page_needs_no_wipe`.
     #[test]
     fn baked_page_captions_are_replaced_by_the_background() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let mut assets = Assets::load(&dirs);
+        if crate::testdata::no_data("caption wipe test") {
+            return;
+        }
+        let dirs = crate::testdata::art_dirs();
+        let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let mut assets = Assets::load(&refs);
         // Force the old path even if the cache exists in this checkout.
         assets.clean = [None, None, None];
         let base = assets.base[0].as_ref().expect("page art");
@@ -4496,11 +4499,12 @@ mod tests {
 
     #[test]
     fn selected_option_is_filled_not_just_an_edge() {
-        let dirs = [
-            Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let assets = Assets::load(&dirs);
+        if crate::testdata::no_data("selected option test") {
+            return;
+        }
+        let dirs = crate::testdata::art_dirs();
+        let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let assets = Assets::load(&refs);
         assert!(assets.available());
         let mut st = Settings::default();
         st.text_speed = 1;
@@ -4523,8 +4527,8 @@ mod tests {
             idle,
             picked
         );
-        let _ = std::fs::create_dir_all("/tmp/wa2btn");
-        let _ = surf.save_tga("/tmp/wa2btn/menu_selected.tga");
+        let out = crate::testdata::out_dir().join("menu_selected.tga");
+        let _ = surf.save_tga(&out.to_string_lossy());
     }
 
     /// The font block opens *inside* the 文本设置 group: page 1 is cut right

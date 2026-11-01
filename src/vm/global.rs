@@ -153,10 +153,10 @@ mod tests {
 
     #[test]
     fn shipped_global_schema_has_the_expected_route_table() {
-        let path = std::path::Path::new("data/script/Global.vrb");
-        if !path.is_file() {
+        let Some(path) = crate::testdata::data("script/Global.vrb") else {
+            eprintln!("skipped global schema test: no game data (see src/testdata.rs)");
             return;
-        }
+        };
         let g = GlobalState::load(path.parent().unwrap());
         assert_eq!(g.values.len(), 29);
         assert_eq!(g.names.first().map(String::as_str), Some("FLG_00"));

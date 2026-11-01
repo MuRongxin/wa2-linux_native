@@ -547,11 +547,11 @@ mod tests {
 
     #[test]
     fn the_chart_is_laid_out_in_bands() {
-        let dir = Path::new("data/script");
-        if !dir.is_dir() {
+        let Some(dir) = crate::testdata::data("script") else {
+            eprintln!("skipped chart bands test: no game data (see src/testdata.rs)");
             return;
-        }
-        let nodes = graph::build_nodes(dir);
+        };
+        let nodes = graph::build_nodes(dir.as_path());
         let bands = chapters::bands(&nodes);
         let chart = Chart { nodes, here: None, bands };
         assert!(chart.bands.len() >= 8, "expected the chapter bands, got {}", chart.bands.len());
@@ -568,11 +568,11 @@ mod tests {
 
     #[test]
     fn route_filter_cycles_and_keeps_selection_inside_the_chapter() {
-        let dir = Path::new("data/script");
-        if !dir.is_dir() {
+        let Some(dir) = crate::testdata::data("script") else {
+            eprintln!("skipped route filter test: no game data (see src/testdata.rs)");
             return;
-        }
-        let nodes = graph::build_nodes(dir);
+        };
+        let nodes = graph::build_nodes(dir.as_path());
         let bands = chapters::bands(&nodes);
         let chart = Chart { nodes, here: None, bands };
         if chart.nodes.is_empty() {

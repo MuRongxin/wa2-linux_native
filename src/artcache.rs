@@ -353,10 +353,16 @@ mod tests {
     /// cost, never the pixels.
     #[test]
     fn cached_load_matches_a_direct_decode() {
-        let src = std::path::Path::new("data/sprite_8x/Sat018001.webp");
-        if !src.is_file() {
-            return; // no data tree on this machine
-        }
+        // The 8x master is optional (a 4x-only install is the normal download),
+        // so fall back to the 4x tree before skipping: the assertion is about
+        // cache fidelity, not about which upscale the machine happens to keep.
+        let Some(src) = crate::testdata::data("sprite_8x/Sat018001.webp")
+            .or_else(|| crate::testdata::data("sprite_4x/Sat018001.webp"))
+        else {
+            eprintln!("skipped cached-load test: no sprite tree installed");
+            return;
+        };
+        let src = src.as_path();
         std::env::set_var("WA2_RENDER_SCALE", "1");
         let direct = image::decode_art_file(src).unwrap();
         let cached = load(src).expect("cache load");
@@ -369,7 +375,9 @@ mod tests {
     #[test]
     fn disk_path_mirrors_the_source_tree() {
         let p = disk_path(Path::new("data/bg_8x/b100400.webp"), 2).unwrap();
-        assert_eq!(p, PathBuf::from("data/cache/art/2x/bg_8x/b100400.tga"));
+        // The cache root follows `WA2_DATA`; expect it from the same resolver
+        // instead of a CWD-relative literal that only holds when it is unset.
+        assert_eq!(p, root().join("2x").join("bg_8x").join("b100400.tga"));
     }
 
     #[test]

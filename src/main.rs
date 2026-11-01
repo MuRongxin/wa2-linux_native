@@ -16,6 +16,9 @@ mod timeline;
 mod video;
 mod vm;
 
+#[cfg(test)]
+mod testdata;
+
 use std::path::Path;
 
 /// Chinese mode is only usable when some bundled or installed font can draw
@@ -8401,8 +8404,23 @@ mod ui_sound_tests {
     use super::*;
 
     /// A fake art tree: `<root>/bg` plus the `se/` directory next to it.
-    fn tree(files: &[&str]) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
-        let root = std::env::temp_dir().join(format!("wa2-ui-{}", std::process::id()));
+    ///
+    /// Every test gets its own directory: `cargo test` runs tests in parallel
+    /// threads of one process, so a pid-only name made the three UI-sound
+    /// tests delete each other's `se/` tree. The guard removes the tree when
+    /// the test ends instead of leaving it under the temporary directory.
+    struct TempTree(std::path::PathBuf);
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tree(files: &[&str]) -> (TempTree, Vec<std::path::PathBuf>) {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("wa2-ui-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let se = root.join("se");
         std::fs::create_dir_all(root.join("bg")).unwrap();
@@ -8411,7 +8429,7 @@ mod ui_sound_tests {
             std::fs::write(se.join(f), b"").unwrap();
         }
         let dirs: Vec<std::path::PathBuf> = vec![root.join("bg")];
-        (root, dirs)
+        (TempTree(root), dirs)
     }
 
     #[test]
@@ -8555,27 +8573,18 @@ mod rewind_history {
     }
 }
 
+#[cfg(test)]
 mod backlog_paint {
+    use crate::testdata;
+
     #[test]
     fn history_paints_the_banner_and_the_lines() {
-        let atlas = crate::codec::tga::decode_font(
-            &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
-        )
-        .unwrap();
-        let font = crate::render::Font::from_cell_map(
-            atlas,
-            40,
-            std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
-        )
-        .unwrap();
-        let dirs = [
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let header = super::load_background(&dirs, "sys_00032.tga");
-        let scroll = super::load_background(&dirs, "sys_00030.tga");
-        assert!(header.is_some());
-        assert!(scroll.is_some());
+        if testdata::no_data("backlog banner test") {
+            return;
+        }
+        let font = testdata::bitmap_font().expect("data/font Chinese bitmap atlas");
+        let header = testdata::ui_image("sys_00032.tga").expect("sys_00032.tga");
+        let scroll = testdata::ui_image("sys_00030.tga").expect("sys_00030.tga");
         let scene = crate::render::Surface::new(1280, 720, [80, 120, 160, 255]);
         let lines = [
             "春希：不我".to_string(),
@@ -8593,16 +8602,16 @@ mod backlog_paint {
             &rows,
             top,
             per_page,
-            header.as_ref(),
-            scroll.as_ref(),
+            Some(&header),
+            Some(&scroll),
             false,
             false,
         );
         // Banner sits on the top edge and is not the flat scene colour.
         let i = (20 * 1280 + 200) * 4;
         assert!(surf.pixels[i + 2] > surf.pixels[i], "banner should be cyan, not grey");
-        let _ = std::fs::create_dir_all("/tmp/wa2btn");
-        let _ = surf.save_tga("/tmp/wa2btn/backlog.tga");
+        let out = testdata::out_dir().join("backlog.tga");
+        let _ = surf.save_tga(&out.to_string_lossy());
     }
 
     /// The history is the last screen that still reached for the atlas. In
@@ -8610,18 +8619,17 @@ mod backlog_paint {
     /// differ - that is the whole point of the change.
     #[test]
     fn history_paints_the_lines_with_the_vector_font() {
+        if testdata::no_data("backlog vector test") {
+            return;
+        }
         let Some(mut vf) = crate::render::text::VectorFont::open(
             crate::render::text::DEFAULT_FONT,
             crate::render::DIALOG_FONT_720,
         ) else {
             return;
         };
-        let dirs = [
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let header = super::load_background(&dirs, "sys_00032.tga");
-        let scroll = super::load_background(&dirs, "sys_00030.tga");
+        let header = testdata::ui_image("sys_00032.tga").expect("sys_00032.tga");
+        let scroll = testdata::ui_image("sys_00030.tga").expect("sys_00030.tga");
         let scene = crate::render::Surface::new(1280, 720, [80, 120, 160, 255]);
         let lines = vec![
             "春希：不我".to_string(),
@@ -8631,21 +8639,13 @@ mod backlog_paint {
         assert!(rows.iter().any(|r| r.name), "speaker row is missing");
         let painted = super::paint_backlog(
             &scene,
-            &crate::render::Font::from_cell_map(
-                crate::codec::tga::decode_font(
-                    &std::fs::read("/home/lrxin/wa2-native/data/font/cn_body80.tga").unwrap(),
-                )
-                .unwrap(),
-                40,
-                std::path::Path::new("/home/lrxin/wa2-native/data/font/wa2_cell_map_cn.tsv"),
-            )
-            .unwrap(),
+            &testdata::bitmap_font().expect("data/font Chinese bitmap atlas"),
             Some(&mut vf),
             &rows,
             0,
             19,
-            header.as_ref(),
-            scroll.as_ref(),
+            Some(&header),
+            Some(&scroll),
             false,
             false,
         );
@@ -8660,17 +8660,17 @@ mod backlog_paint {
             }
         }
         assert!(ink > 200, "vector history drew no glyphs ({ink} px)");
-        let _ = painted.save_tga("/tmp/wa2btn/backlog_vector.tga");
+        let out = testdata::out_dir().join("backlog_vector.tga");
+        let _ = painted.save_tga(&out.to_string_lossy());
     }
 
     #[test]
     fn quick_load_confirm_paints_yes_and_no() {
-        let dirs = [
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
-            std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
-        ];
-        let plate = super::load_background(&dirs, "sys_00100.tga").unwrap();
-        let buttons = super::load_background(&dirs, "sys_00101.tga").unwrap();
+        if testdata::no_data("quick load confirm test") {
+            return;
+        }
+        let plate = testdata::ui_image("sys_00100.tga").expect("sys_00100.tga");
+        let buttons = testdata::ui_image("sys_00101.tga").expect("sys_00101.tga");
         let scene = crate::render::Surface::new(1280, 720, [20, 20, 20, 255]);
         let text = crate::render::text::with_ui_font(22, |f| {
             f.line_rgba("要读取快速存档吗？", 22)
@@ -8689,8 +8689,8 @@ mod backlog_paint {
         assert!(yes > 400, "yes button should be the gold hover row, sum {yes}");
         assert!(no > 400, "no button should still be the idle row, sum {no}");
         assert!(yes != no, "hover should change the yes button");
-        let _ = std::fs::create_dir_all("/tmp/wa2btn");
-        let _ = surf.save_tga("/tmp/wa2btn/confirm.tga");
+        let out = testdata::out_dir().join("confirm.tga");
+        let _ = surf.save_tga(&out.to_string_lossy());
     }
 }
 
