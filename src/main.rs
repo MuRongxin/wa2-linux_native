@@ -7755,9 +7755,8 @@ fn title_bgm_path(bg_dirs: &[&std::path::Path]) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Play the title/special track on the title screen's own mixer. That mixer
-/// lives exactly as long as the title loop, so leaving the title (starting or
-/// loading the game, quitting) drops every stream with it.
+/// Play the title/special track. The mixer is shared with the game: scene
+/// entry stops this track, and `run_title` stops the game's streams first.
 fn start_title_bgm(mixer: Option<&audio::Mixer>, bg_dirs: &[&std::path::Path]) -> Option<usize> {
     let (mixer, path) = (mixer?, title_bgm_path(bg_dirs)?);
     let slot = mixer.play_cat(&path.to_string_lossy(), 1.0, true, audio::mixer::CAT_BGM);
@@ -7858,6 +7857,11 @@ fn run_title(
     set_render_art_scale(win);
     if let Some(mx) = mixer {
         menu::apply(&startup, Some(mx));
+        // Returning from a game, its BGM, looping ambience and voice are still
+        // on this shared mixer. Clear them, as scene entry clears the title's.
+        mx.stop_category(audio::mixer::CAT_BGM);
+        mx.stop_category(audio::mixer::CAT_SE);
+        mx.stop_category(audio::mixer::CAT_VOICE);
     }
     let mut bgm_slot = start_title_bgm(mixer, bg_dirs);
     let ui = UiSound::resolve(bg_dirs);
