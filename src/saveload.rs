@@ -59,7 +59,11 @@ pub enum Mode {
 }
 
 struct Assets {
-    header: Option<TgaImage>,
+    /// sys_01000 「Save セーブ」 / sys_02000 「Load ロード」 banners. sys_05000
+    /// is the CG-mode banner and was shown here before; it is only the
+    /// fallback for a tree without the save/load banners.
+    header_save: Option<TgaImage>,
+    header_load: Option<TgaImage>,
     panel: Option<TgaImage>,
     panel_hi: Option<TgaImage>,
     frame: Option<TgaImage>,
@@ -94,12 +98,15 @@ fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
 impl Assets {
     fn load(dirs: &[&Path]) -> Assets {
         Assets {
-            header: load(dirs, "sys_05000.tga"),
+            header_save: load(dirs, "sys_01000.tga").or_else(|| load(dirs, "sys_05000.tga")),
+            header_load: load(dirs, "sys_02000.tga").or_else(|| load(dirs, "sys_05000.tga")),
             panel: load(dirs, "sys_05900.tga"),
             panel_hi: load(dirs, "sys_05901.tga"),
             frame: load(dirs, "sys_05100.tga"),
             shadow: load(dirs, "sys_05110.tga"),
-            footer: load(dirs, "sys_05021.tga"),
+            // sys_05021 is the CG-mode footer ("CG MODE", 上一页/下一页);
+            // the data has no save/load footer, so none is drawn.
+            footer: None,
         }
     }
 }
@@ -195,7 +202,7 @@ pub fn run(
             hint = h;
             caps_key = key;
         }
-        compose(&mut s, &assets, &scr, &page_slots, &thumbs[scr.page * PER_PAGE..], caps.as_ref(), hint.as_ref());
+        compose(&mut s, &assets, mode, &scr, &page_slots, &thumbs[scr.page * PER_PAGE..], caps.as_ref(), hint.as_ref());
         win.present(&s);
 
         let mut activate: Option<usize> = None;
@@ -305,8 +312,24 @@ fn render_captions(
     let font_px = (14.0 * scale_y).round().max(8.0) as u32;
     let cap_w = (FRAME_W as f32 * scale_x).round().max(1.0) as u32;
     let cap_h = (CAP_H as f32 * scale_y).round().max(1.0) as u32;
+    // Render every caption on its own and stack them at exactly cap_h rows
+    // each. One block for all lines used the font's own line pitch, which is
+    // taller than cap_h, so the per-slot strips cut lines in half and showed
+    // "02 -" over "03" on the wrong cells.
     let caps = crate::render::text::with_ui_font(font_px, |f| {
-        f.block_rgba(&lines, cap_w, (n as u32) * cap_h, font_px)
+        let mut out = vec![0u8; (cap_w * cap_h * n as u32 * 4) as usize];
+        for (i, line) in lines.iter().enumerate() {
+            if let Some((w, h, rgba)) = f.block_rgba(std::slice::from_ref(line), cap_w, cap_h, font_px) {
+                let rows = h.min(cap_h) as usize;
+                let cols = w.min(cap_w) as usize;
+                for r in 0..rows {
+                    let src = r * w as usize * 4;
+                    let dst = ((i * cap_h as usize) + r) * cap_w as usize * 4;
+                    out[dst..dst + cols * 4].copy_from_slice(&rgba[src..src + cols * 4]);
+                }
+            }
+        }
+        Some((cap_w, cap_h * n as u32, out))
     })
     .flatten();
     let hint_text = format!(
@@ -325,6 +348,7 @@ fn render_captions(
 fn compose(
     s: &mut Surface,
     a: &Assets,
+    mode: Mode,
     scr: &Screen,
     slots: &[Option<&SaveState>],
     thumbs: &[Option<TgaImage>],
@@ -338,7 +362,8 @@ fn compose(
     let pw = |v: i32| (v as f32 * sx).round().max(1.0) as u32;
     let ph = |v: i32| (v as f32 * sy).round().max(1.0) as u32;
     s.fill_rect(0, 0, s.width, s.height, [0, 0, 0, 190]);
-    if let Some(h) = a.header.as_ref() {
+    let header = if mode == Mode::Save { a.header_save.as_ref() } else { a.header_load.as_ref() };
+    if let Some(h) = header {
         s.blit_region_scaled(h, 0, 0, h.width, h.height, 0, 0, s.width, ph(36), 255);
     }
     for i in 0..slots.len() {
