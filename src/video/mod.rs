@@ -56,7 +56,7 @@ impl Movie {
             // Passthrough emits each decoded
             // frame exactly once and `fps` (packets / duration) paces it.
             .args(&["-hide_banner", "-loglevel", "error", "-i", path,
-                    "-vsync", "0",
+                    passthrough_flag()[0], passthrough_flag()[1],
                     "-f", "rawvideo", "-pix_fmt", "rgba",
                     "-s", &format!("{}x{}", width, height), "-"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
@@ -102,6 +102,24 @@ impl Drop for Movie {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The frame-passthrough option for this ffmpeg. `-vsync` was removed in
+/// FFmpeg 7 (an unknown option makes ffmpeg exit before decoding, so every
+/// movie "ended" instantly); `-fps_mode passthrough` exists since 5.1. Older
+/// builds keep the legacy spelling.
+fn passthrough_flag() -> [&'static str; 2] {
+    static FLAG: std::sync::OnceLock<[&'static str; 2]> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let ok = Command::new("ffmpeg")
+            .args(&["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=s=16x16:d=0.1",
+                    "-frames:v", "1", "-fps_mode", "passthrough", "-f", "null", "-"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok { ["-fps_mode", "passthrough"] } else { ["-vsync", "0"] }
+    })
 }
 
 /// Does the container carry an audio stream? Some `mv*.pak` (silent cuts) do not.
