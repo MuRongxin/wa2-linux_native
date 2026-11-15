@@ -83,6 +83,9 @@ pub struct SaveState {
 
 /// Where the slots live: `<data root>/save`.
 pub fn dir() -> PathBuf {
+    if std::env::var_os("WA2_USER_DIR").is_some() {
+        return crate::data::user_root().join("save");
+    }
     match crate::data::Data::resolve() {
         Some(d) => d.root.join("save"),
         None => PathBuf::from("data/save"),

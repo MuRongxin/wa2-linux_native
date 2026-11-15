@@ -474,6 +474,9 @@ impl Settings {
         if let Some(p) = std::env::var_os("WA2_INI") {
             return PathBuf::from(p);
         }
+        if std::env::var_os("WA2_USER_DIR").is_some() {
+            return crate::data::user_root().join("wa2.ini");
+        }
         match crate::data::Data::resolve() {
             Some(d) => d.root.join("wa2.ini"),
             None => PathBuf::from("wa2.ini"),
@@ -1533,8 +1536,7 @@ fn dim_caption(p: [u8; 3]) -> bool {
 /// Returns the pages it wrote, so a caller can report what happened.
 /// Where the baked caption-free pages live.
 fn clean_dir() -> std::path::PathBuf {
-    let root = std::env::var("WA2_DATA").unwrap_or_else(|_| "data".to_string());
-    std::path::Path::new(&root).join("cache/ui/menu")
+    crate::data::user_root().join("cache/ui/menu")
 }
 
 fn read_clean(dir: &Path, page: usize) -> Option<TgaImage> {

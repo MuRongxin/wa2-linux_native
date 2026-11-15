@@ -122,7 +122,11 @@ fn ui_cache_path(path: &Path) -> Option<std::path::PathBuf> {
     if !(tree.ends_with("_2x") || tree.ends_with("_4x") || tree.ends_with("_8x")) {
         return None;
     }
-    let root = parent.parent()?;
+    let root = if std::env::var_os("WA2_USER_DIR").is_some() {
+        crate::data::user_root()
+    } else {
+        parent.parent()?.to_path_buf()
+    };
     let stem = path.file_stem()?.to_string_lossy();
     Some(root.join("cache").join("ui").join(tree).join(format!("{stem}.tga")))
 }

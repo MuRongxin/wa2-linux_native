@@ -168,8 +168,11 @@ pub fn run(
         eprintln!("timeline: no scenes under {}", script_dir.display());
         return None;
     }
-    let cache_dir = script_dir
-        .parent()
+    let cache_dir = if std::env::var_os("WA2_USER_DIR").is_some() {
+        Some(crate::data::user_root())
+    } else {
+        script_dir.parent().map(|p| p.to_path_buf())
+    }
         .map(|root| root.join("cache").join("timeline"))
         .unwrap_or_else(|| PathBuf::from("cache/timeline"));
     let thumbs = shots::load_thumbs(bg_dirs, &chart, &cache_dir);

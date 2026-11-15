@@ -6831,6 +6831,9 @@ impl SpecialStats {
 }
 
 fn special_stats_path(dirs: &[&std::path::Path]) -> Option<std::path::PathBuf> {
+    if std::env::var_os("WA2_USER_DIR").is_some() {
+        return Some(crate::data::user_root().join("save").join("special_stats.tsv"));
+    }
     dirs.iter().find_map(|d| d.parent().map(|root| root.join("save").join("special_stats.tsv")))
 }
 

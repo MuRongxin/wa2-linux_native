@@ -34,6 +34,18 @@ pub struct Data {
     pub art_scale: u32,
 }
 
+/// Writable per-user root for saves, settings and caches: `$WA2_USER_DIR`,
+/// else the data root (the historical layout). The macOS app bundle points
+/// this at ~/Library/Application Support so nothing is written into the app.
+pub fn user_root() -> PathBuf {
+    if let Some(p) = std::env::var_os("WA2_USER_DIR") {
+        return PathBuf::from(p);
+    }
+    std::env::var_os("WA2_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"))
+}
+
 impl Data {
     /// Locate the data root: `$WA2_DATA`, else `./data`.
     ///
