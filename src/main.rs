@@ -1007,6 +1007,16 @@ fn resolve_asset_path(dirs: &[&std::path::Path], name: &str) -> Vec<(std::path::
     let mut out = Vec::new();
     for dir in dirs {
         for cand in &candidates {
+            // A case-insensitive volume (default macOS APFS) cannot hold
+            // both T0010 and t0010; the lowercase twin is stored as
+            // "t0010~lc.webp" and wins for a lowercase request.
+            if let Some(twin) = lowercase_twin(cand) {
+                let p = dir.join(twin);
+                if p.is_file() {
+                    out.push((p, false));
+                    continue;
+                }
+            }
             let p = dir.join(cand);
             if p.is_file() {
                 out.push((p, false));
@@ -1028,6 +1038,27 @@ fn resolve_asset_path(dirs: &[&std::path::Path], name: &str) -> Vec<(std::path::
     #[cfg(not(unix))]
     let _ = dirs;
     out
+}
+
+/// "t0010.webp" -> "t0010~lc.webp" when the name starts lowercase and has
+/// an uppercase counterpart that could shadow it on a case-insensitive disk.
+fn lowercase_twin(name: &str) -> Option<String> {
+    let first = name.chars().next()?;
+    if !first.is_ascii_lowercase() {
+        return None;
+    }
+    let (stem, ext) = name.rsplit_once('.')?;
+    Some(format!("{stem}~lc.{ext}"))
+}
+
+#[cfg(test)]
+mod twin_tests {
+    #[test]
+    fn lowercase_names_have_a_twin_uppercase_do_not() {
+        assert_eq!(super::lowercase_twin("t0010.webp").as_deref(), Some("t0010~lc.webp"));
+        assert_eq!(super::lowercase_twin("T0010.webp"), None);
+        assert_eq!(super::lowercase_twin("noext"), None);
+    }
 }
 
 /// The names one logical asset may be stored under.
