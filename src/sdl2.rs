@@ -101,6 +101,7 @@ pub struct Sdl {
     cursor_normal: *mut c_void,
     cursor_hover: *mut c_void,
     cursor_pressed: *mut c_void,
+    pending_release: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +357,7 @@ impl Sdl {
             cursor_normal: std::ptr::null_mut(),
             cursor_hover: std::ptr::null_mut(),
             cursor_pressed: std::ptr::null_mut(),
+            pending_release: None,
         };
         sdl.enable_game_cursor();
         sdl.fit_to_screen();
@@ -486,6 +488,12 @@ impl Sdl {
     /// motion is kept: during skip the game spends a long time between polls,
     /// and the motion that follows a click would otherwise replace it.
     pub fn poll_input(&mut self) -> Input {
+        if let Some((x, y)) = self.pending_release.take() {
+            return Input::Release { x, y };
+        }
+        if let Some(i) = self.test_input() {
+            return i;
+        }
         let mut ev = [0u8; 128];
         let mut out = Input::None;
         unsafe {
@@ -887,6 +895,88 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
         let (w, h) = self.drawable_size();
         let (x, y, fw, fh) = fit_16_9(w, h);
         [x, y, fw, fh]
+    }
+
+    /// WA2_TEST_INPUT=<file>: scripted input for unattended play-tests.
+    /// One event per line, `<ms after previous> <action> [args]`; actions:
+    /// advance, back, rclick, up, down, left, right, fullscreen, choice N,
+    /// click X Y / move X Y (1280x720 layout), wheel N, shot <png path>
+    /// (whole-screen capture), quit. `#` starts a comment.
+    fn test_input(&mut self) -> Option<Input> {
+        use std::sync::Mutex;
+        static Q: OnceLock<Mutex<(std::collections::VecDeque<(u64, String)>, std::time::Instant)>> = OnceLock::new();
+        let q = Q.get_or_init(|| {
+            let mut v = std::collections::VecDeque::new();
+            if let Some(p) = std::env::var_os("WA2_TEST_INPUT") {
+                for line in std::fs::read_to_string(p).unwrap_or_default().lines() {
+                    let line = line.split('#').next().unwrap_or("").trim();
+                    if let Some((ms, rest)) = line.split_once(' ') {
+                        if let Ok(ms) = ms.parse::<u64>() {
+                            v.push_back((ms, rest.trim().to_string()));
+                        }
+                    }
+                }
+            }
+            Mutex::new((v, std::time::Instant::now()))
+        });
+        let mut g = q.lock().ok()?;
+        let (ms, _) = g.0.front()?.clone();
+        if g.1.elapsed().as_millis() < ms as u128 {
+            return None;
+        }
+        let (_, cmd) = g.0.pop_front()?;
+        g.1 = std::time::Instant::now();
+        drop(g);
+        eprintln!("test-input: {cmd}");
+        let a: Vec<&str> = cmd.split_whitespace().collect();
+        let num = |i: usize| a.get(i).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+        let to_win = |x: i32, y: i32| {
+            let (ww, wh) = self.point_size();
+            let (bx, by, bw, bh) = fit_16_9(ww, wh);
+            (bx + x * bw / 1280, by + y * bh / 720)
+        };
+        Some(match a.first().copied().unwrap_or("") {
+            "advance" => Input::Advance,
+            "back" => Input::Back,
+            "rclick" => Input::RightClick,
+            "up" => Input::Up,
+            "down" => Input::Down,
+            "left" => Input::Left,
+            "right" => Input::Right,
+            "fullscreen" => Input::Fullscreen,
+            "choice" => Input::Choice(num(1) as u8),
+            "wheel" => Input::Wheel { y: num(1) },
+            "click" => {
+                let (x, y) = to_win(num(1), num(2));
+                // press now, release on the next poll
+                self.pending_release = Some((x, y));
+                Input::Pointer { x, y, pressed: true }
+            }
+            "release" => {
+                let (x, y) = to_win(num(1), num(2));
+                Input::Release { x, y }
+            }
+            "move" => {
+                let (x, y) = to_win(num(1), num(2));
+                Input::Pointer { x, y, pressed: false }
+            }
+            "shot" => {
+                if let Some(path) = a.get(1) {
+                    // WA2_TEST_SHOT_CMD: optional capture command, the path is appended.
+                    match std::env::var("WA2_TEST_SHOT_CMD") {
+                        Ok(cmd) => {
+                            let _ = std::process::Command::new("/bin/sh").args(["-c", &format!("{cmd} '{path}'")]).status();
+                        }
+                        Err(_) => {
+                            let _ = std::process::Command::new("/usr/sbin/screencapture").args(["-x", path]).status();
+                        }
+                    }
+                }
+                Input::None
+            }
+            "quit" => std::process::exit(0),
+            _ => Input::None,
+        })
     }
 
     /// Window size in points: the space pointer events are reported in.
