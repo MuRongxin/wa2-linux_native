@@ -195,6 +195,7 @@ fn cursor_bitmap(kind: u8) -> ([u8; 32], [u8; 32]) {
 const SDL_LIBS: &[&str] = &["libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so"];
 #[cfg(target_os = "macos")]
 const SDL_LIBS: &[&str] = &[
+    "@executable_path/../Frameworks/libSDL2-2.0.0.dylib",
     "libSDL2-2.0.0.dylib",
     "/opt/homebrew/lib/libSDL2-2.0.0.dylib",
     "/usr/local/lib/libSDL2-2.0.0.dylib",
