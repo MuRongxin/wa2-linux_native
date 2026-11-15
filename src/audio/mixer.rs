@@ -85,6 +85,10 @@ pub struct Mixer {
 
 struct MixerInner {
     streams: Vec<Option<Stream>>,
+    /// Generation of each slot. A handle is `gen << GEN_SHIFT | index`, so a
+    /// slot freed after its stream finished can be reused without a stale
+    /// handle (a voice line kept by the scene) reaching the new stream.
+    gens: Vec<usize>,
     /// gains[CAT_ALL] * gains[category] scales every stream.
     gains: [f32; CAT_COUNT],
     quit: bool,
@@ -100,6 +104,7 @@ impl Mixer {
         }
         let inner = Arc::new(Mutex::new(MixerInner {
             streams: Vec::new(),
+            gens: Vec::new(),
             gains: [1.0; CAT_COUNT],
             quit: false,
         }));
@@ -153,6 +158,19 @@ impl Mixer {
                                     st.child = None;
                                 }
                             }
+                        }
+                    }
+                    // Free a slot once its stream is fully played and its
+                    // decoder reaped; play_cat reuses it. Before this every
+                    // SE and voice line kept its slot for the whole session
+                    // and both loops here walked all of them every 5 ms.
+                    for slot in g.streams.iter_mut() {
+                        let done = slot
+                            .as_ref()
+                            .map(|st| st.eos && st.pcm.is_empty() && st.child.is_none() && !st.looping)
+                            .unwrap_or(false);
+                        if done {
+                            *slot = None;
                         }
                     }
                 }
@@ -217,7 +235,13 @@ impl Mixer {
         s.volume = volume;
         s.looping = looping;
         s.cat = cat.min(CAT_COUNT - 1);
+        if let Some(i) = g.streams.iter().position(|x| x.is_none()) {
+            g.gens[i] = (g.gens[i] + 1) & GEN_MASK;
+            g.streams[i] = Some(s);
+            return (g.gens[i] << GEN_SHIFT) | i;
+        }
         g.streams.push(Some(s));
+        g.gens.push(0);
         g.streams.len() - 1
     }
 
@@ -240,6 +264,7 @@ impl Mixer {
     pub fn fade(&self, idx: usize, target: f32, frames: i32, stop: bool) {
         if frames <= 0 && stop { self.stop(idx); return; }
         let mut g = self.inner.lock().unwrap();
+        let Some(idx) = g.slot(idx) else { return };
         if let Some(Some(s)) = g.streams.get_mut(idx) {
             if frames <= 0 { s.volume = target; s.ramp = None; }
             else { s.ramp = Some((s.volume, target, std::time::Instant::now(),
@@ -249,17 +274,20 @@ impl Mixer {
 
     pub fn settled(&self, idx: usize) -> bool {
         let g = self.inner.lock().unwrap();
+        let Some(idx) = g.slot(idx) else { return true };
         g.streams.get(idx).and_then(|s| s.as_ref()).map(|s| s.ramp.is_none()).unwrap_or(true)
     }
 
     pub fn finished(&self, idx: usize) -> bool {
         let g = self.inner.lock().unwrap();
+        let Some(idx) = g.slot(idx) else { return true };
         g.streams.get(idx).and_then(|s| s.as_ref())
             .map(|s| s.eos && s.pcm.is_empty()).unwrap_or(true)
     }
 
     pub fn stop(&self, idx: usize) {
         let mut g = self.inner.lock().unwrap();
+        let Some(idx) = g.slot(idx) else { return };
         if idx < g.streams.len() {
             if let Some(mut s) = g.streams[idx].take() {
                 if let Some(mut c) = s.child.take() { let _ = c.kill(); let _ = c.wait(); }
@@ -268,8 +296,12 @@ impl Mixer {
     }
 
     pub fn stop_all(&self) {
-        let n = { self.inner.lock().unwrap().streams.len() };
-        for i in 0..n { self.stop(i); }
+        let mut g = self.inner.lock().unwrap();
+        for slot in g.streams.iter_mut() {
+            if let Some(mut s) = slot.take() {
+                if let Some(mut c) = s.child.take() { let _ = c.kill(); let _ = c.wait(); }
+            }
+        }
     }
 
     /// Stop every stream in one category, including streams owned by a modal
@@ -289,6 +321,36 @@ impl Mixer {
                 }
             }
         }
+    }
+}
+
+const GEN_SHIFT: u32 = 20;
+const GEN_MASK: usize = 0x7ff;
+
+impl MixerInner {
+    /// Slot index of a handle from `play_cat`, if that stream still owns it.
+    fn slot(&self, handle: usize) -> Option<usize> {
+        if handle == usize::MAX {
+            return None;
+        }
+        let idx = handle & ((1 << GEN_SHIFT) - 1);
+        let gen = handle >> GEN_SHIFT;
+        (idx < self.gens.len() && self.gens[idx] == gen).then_some(idx)
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    #[test]
+    fn a_stale_handle_does_not_reach_a_reused_slot() {
+        let mut m = MixerInner { streams: vec![None], gens: vec![0], gains: [1.0; CAT_COUNT], quit: false };
+        assert_eq!(m.slot(0), Some(0));
+        m.gens[0] = 1; // slot reused
+        assert_eq!(m.slot(0), None);
+        assert_eq!(m.slot(1 << GEN_SHIFT), Some(0));
+        assert_eq!(m.slot(usize::MAX), None);
+        assert_eq!(m.slot(5), None);
     }
 }
 
