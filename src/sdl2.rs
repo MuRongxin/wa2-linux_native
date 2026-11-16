@@ -930,11 +930,7 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
         eprintln!("test-input: {cmd}");
         let a: Vec<&str> = cmd.split_whitespace().collect();
         let num = |i: usize| a.get(i).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
-        let to_win = |x: i32, y: i32| {
-            let (ww, wh) = self.point_size();
-            let (bx, by, bw, bh) = fit_16_9(ww, wh);
-            (bx + x * bw / 1280, by + y * bh / 720)
-        };
+        let to_win = |x: i32, y: i32| unmap_pointer(x, y, self.drawable_size(), (1280, 720));
         Some(match a.first().copied().unwrap_or("") {
             "advance" => Input::Advance,
             "back" => Input::Back,
