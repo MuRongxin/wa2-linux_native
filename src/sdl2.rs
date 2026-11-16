@@ -896,13 +896,15 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
         (w.max(1), h.max(1))
     }
 
-    /// Map a pointer event's window coordinates onto the game surface
-    /// (`present` stretches the surface over the whole window, so this is a
-    /// plain linear scale).
+    /// Map a pointer event's coordinates (renderer pixels) onto the game
+    /// surface, through the letterbox `present` draws (see `map_pointer`).
     pub fn surface_pos(&self, x: i32, y: i32, sw: u32, sh: u32) -> (i32, i32) {
-        let (ww, wh) = self.point_size();
-        let (bx, by, bw, bh) = fit_16_9(ww, wh);
-        ((x - bx) * sw as i32 / bw.max(1), (y - by) * sh as i32 / bh.max(1))
+        let px = self.drawable_size();
+        let r = map_pointer(x, y, px, (sw as i32, sh as i32));
+        if std::env::var_os("WA2_DEBUG_POINTER").is_some() {
+            eprintln!("pointer: raw=({x},{y}) points={:?} drawable={px:?} -> ({},{}) of {sw}x{sh}", self.point_size(), r.0, r.1);
+        }
+        r
     }
 
     /// Read back the current renderer target as RGBA (for verification),
@@ -1077,6 +1079,28 @@ mod tests {
     }
 }
 
+/// Pointer event -> game-surface coordinates.
+///
+/// With a renderer on an SDL_WINDOW_ALLOW_HIGHDPI window, SDL reports mouse
+/// positions in renderer output pixels (measured on a 2x Retina panel: the
+/// window centre at 573,359 pt arrives as 1146,718), not window points. So the
+/// pointer is mapped through the same `fit_16_9` box `present` draws into,
+/// directly in drawable pixels.
+pub fn map_pointer(x: i32, y: i32, px: (i32, i32), surf: (i32, i32)) -> (i32, i32) {
+    let (bx, by, bw, bh) = fit_16_9(px.0, px.1);
+    let sx = (x - bx) as f64 * surf.0 as f64 / bw.max(1) as f64;
+    let sy = (y - by) as f64 * surf.1 as f64 / bh.max(1) as f64;
+    (sx.floor() as i32, sy.floor() as i32)
+}
+
+/// Inverse of `map_pointer` (used by the scripted test input).
+pub fn unmap_pointer(sx: i32, sy: i32, px: (i32, i32), surf: (i32, i32)) -> (i32, i32) {
+    let (bx, by, bw, bh) = fit_16_9(px.0, px.1);
+    let x = bx as f64 + (sx as f64 + 0.5) * bw as f64 / surf.0 as f64;
+    let y = by as f64 + (sy as f64 + 0.5) * bh as f64 / surf.1 as f64;
+    (x.floor() as i32, y.floor() as i32)
+}
+
 /// Largest centered 16:9 box inside `w`x`h`: (x, y, w, h).
 pub fn fit_16_9(w: i32, h: i32) -> (i32, i32, i32, i32) {
     let (w, h) = (w.max(1), h.max(1));
@@ -1088,6 +1112,30 @@ pub fn fit_16_9(w: i32, h: i32) -> (i32, i32, i32, i32) {
         (0, (h - fh) / 2, w, fh)
     } else {
         (0, 0, w, h)
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::{map_pointer, unmap_pointer};
+    #[test]
+    fn fullscreen_16_10_letterbox() {
+        // 14" MacBook fullscreen: drawable 2294x1438 px, picture 2294x1290 at y=74.
+        let px = (2294, 1438);
+        // Measured: cursor at the picture centre arrives as (1146,718).
+        assert_eq!(map_pointer(1146, 718, px, (1280, 720)), (639, 359));
+        assert_eq!(map_pointer(0, 74, px, (1280, 720)), (0, 0));
+        // Inside the top black bar is above the picture.
+        assert!(map_pointer(10, 40, px, (1280, 720)).1 < 0);
+    }
+    #[test]
+    fn windowed_and_round_trip() {
+        for px in [(2110, 1186), (2294, 1438), (2560, 1440)] {
+            for &(x, y) in &[(0, 0), (100, 600), (1200, 650), (640, 40), (1279, 719)] {
+                let (wx, wy) = unmap_pointer(x, y, px, (1280, 720));
+                assert_eq!(map_pointer(wx, wy, px, (1280, 720)), (x, y), "{px:?} {x},{y}");
+            }
+        }
     }
 }
 
