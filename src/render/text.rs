@@ -1877,6 +1877,9 @@ fn scan_system_fonts() -> Vec<FontProfile> {
 }
 
 fn font_cache_path() -> Option<std::path::PathBuf> {
+    if std::env::var_os("WA2_USER_DIR").is_some() {
+        return Some(crate::data::user_root().join("cache").join("fonts.tsv"));
+    }
     Some(crate::data::Data::resolve()?.root.join("cache").join("fonts.tsv"))
 }
 

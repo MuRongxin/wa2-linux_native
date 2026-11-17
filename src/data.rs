@@ -34,6 +34,38 @@ pub struct Data {
     pub art_scale: u32,
 }
 
+/// Writable per-user root for saves, settings and caches: `$WA2_USER_DIR`,
+/// else the data root (the historical layout). The macOS app bundle points
+/// this at ~/Library/Application Support so nothing is written into the app.
+pub fn user_root() -> PathBuf {
+    if let Some(p) = std::env::var_os("WA2_USER_DIR") {
+        return PathBuf::from(p);
+    }
+    std::env::var_os("WA2_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"))
+}
+
+/// Read caches from the user directory first, then the prebuilt data package.
+/// Writable caches still use user_root(); packaged caches remain read-only.
+pub fn cache_dirs(data_root: &Path, relative: &Path) -> Vec<PathBuf> {
+    let user = std::env::var_os("WA2_USER_DIR").map(PathBuf::from);
+    cache_dirs_at(data_root, user.as_deref(), relative)
+}
+
+fn cache_dirs_at(data_root: &Path, user: Option<&Path>, relative: &Path) -> Vec<PathBuf> {
+    let bundled = data_root.join("cache").join(relative);
+    let mut dirs = Vec::new();
+    if let Some(user) = user {
+        let writable = user.join("cache").join(relative);
+        if writable != bundled {
+            dirs.push(writable);
+        }
+    }
+    dirs.push(bundled);
+    dirs
+}
+
 impl Data {
     /// Locate the data root: `$WA2_DATA`, else `./data`.
     ///

@@ -28,10 +28,7 @@ use std::time::SystemTime;
 
 /// data/cache/art, the derived tree. Never part of the repository.
 fn root() -> PathBuf {
-    let base = std::env::var_os("WA2_DATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data"));
-    base.join("cache").join("art")
+    crate::data::user_root().join("cache").join("art")
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {

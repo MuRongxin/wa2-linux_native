@@ -168,11 +168,9 @@ pub fn run(
         eprintln!("timeline: no scenes under {}", script_dir.display());
         return None;
     }
-    let cache_dir = script_dir
-        .parent()
-        .map(|root| root.join("cache").join("timeline"))
-        .unwrap_or_else(|| PathBuf::from("cache/timeline"));
-    let thumbs = shots::load_thumbs(bg_dirs, &chart, &cache_dir);
+    let data_root = script_dir.parent().unwrap_or_else(|| Path::new(""));
+    let cache_dirs = crate::data::cache_dirs(data_root, Path::new("timeline"));
+    let thumbs = shots::load_thumbs(bg_dirs, &chart, &cache_dirs, data_root);
     let banner = load_tga(bg_dirs, "sys_06000.tga");
     let pager = load_tga(bg_dirs, "sys_06021.tga");
     let banner_hi = load_hi_tga(bg_dirs, "sys_06000.tga", 1280, 36);

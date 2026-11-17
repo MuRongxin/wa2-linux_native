@@ -469,10 +469,13 @@ impl Settings {
         v
     }
 
-    /// `WA2_INI`, else `wa2.ini` next to the data directory.
+    /// `WA2_INI`, else `wa2.ini` under WA2_USER_DIR or the data directory.
     pub fn path() -> PathBuf {
         if let Some(p) = std::env::var_os("WA2_INI") {
             return PathBuf::from(p);
+        }
+        if std::env::var_os("WA2_USER_DIR").is_some() {
+            return crate::data::user_root().join("wa2.ini");
         }
         match crate::data::Data::resolve() {
             Some(d) => d.root.join("wa2.ini"),
@@ -530,7 +533,13 @@ impl Settings {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Settings::path();
+        self.save_at(&Settings::path())
+    }
+
+    fn save_at(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
         let mut out = String::from("; WHITE ALBUM 2 native port\n; keys follow the original wa2.ini\n");
         for k in Settings::all_keys() {
             if let Some(v) = self.get(&k) {
@@ -879,17 +888,10 @@ impl Assets {
                 .filter(|d| tree_scale_suffix(d) == Some("4x")),
         );
         let dirs: &[&Path] = &ordered;
-        let cache = clean_dir();
-        let clean = [
-            read_clean(&cache, 0),
-            read_clean(&cache, 1),
-            read_clean(&cache, 2),
-        ];
-        let hover = [
-            read_hover(&cache, 0),
-            read_hover(&cache, 1),
-            read_hover(&cache, 2),
-        ];
+        let root = std::env::var_os("WA2_DATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("data"));
+        let caches = crate::data::cache_dirs(&root, Path::new("ui/menu"));
+        let clean = [0, 1, 2].map(|page| caches.iter().find_map(|dir| read_clean(dir, page)));
+        let hover = [0, 1, 2].map(|page| caches.iter().find_map(|dir| read_hover(dir, page)));
         Assets {
             base: [
                 load(dirs, "sys_03100.tga"),
@@ -1520,23 +1522,7 @@ fn dim_caption(p: [u8; 3]) -> bool {
 /// and put the colour underneath back. Rules, dotted leaders, snowflakes and
 /// widget frames stay. The mask comes from the base art, so a selected
 /// button's wash cannot hide the letters or get punched out.
-/// Bake the caption-free page art once, instead of repairing the composed
-/// frame on every state change.
-///
-/// `wipe_baked_captions` classifies pixels of the page art, grows the mask and
-/// repaints each masked pixel from a neighbour. That is the right algorithm
-/// but the wrong place for it: on every hover it walked the whole 1024x464
-/// page and could still leave a halo where the classifier disagreed with the
-/// artwork. Running it here, once, writes a clean page that the runtime only
-/// blits; the wipe stays as the fallback for a data tree with no cache.
-///
-/// Returns the pages it wrote, so a caller can report what happened.
-/// Where the baked caption-free pages live.
-fn clean_dir() -> std::path::PathBuf {
-    let root = std::env::var("WA2_DATA").unwrap_or_else(|_| "data".to_string());
-    std::path::Path::new(&root).join("cache/ui/menu")
-}
-
+/// Load one prebuilt caption-free page; the runtime wipe remains the fallback.
 fn read_clean(dir: &Path, page: usize) -> Option<TgaImage> {
     let p = clean_page_path(dir, page);
     match crate::codec::image::decode_ui_file(&p) {
@@ -5078,5 +5064,28 @@ mod tests {
         assert!(first > 0, "no preview was cached");
         let _ = build_list_text(&l, 1280, 720, &mut previews);
         assert_eq!(previews.len(), first, "rebuilding reopened and recached previews");
+    }
+}
+
+#[cfg(test)]
+mod user_directory_tests {
+    use super::*;
+
+    #[test]
+    fn settings_save_creates_a_fresh_directory_and_replaces_the_file() {
+        let root = std::env::temp_dir().join(format!("wa2-settings-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("new/user/wa2.ini");
+        let mut settings = Settings::default();
+        settings.auto_speed = 3;
+        settings.save_at(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("auto_max=3\n"));
+        settings.auto_speed = 7;
+        settings.save_at(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("auto_max=7\n"));
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -58,10 +58,10 @@ struct MemoEntry {
 ///
 /// Keys: the scene id for the node image, "preview:{id}" for the preview bar.
 /// Pictures whose art cannot be loaded simply do not appear in the map.
-pub(super) fn load_thumbs(dirs: &[&Path], chart: &Chart, cache_dir: &Path) -> ThumbSet {
+pub(super) fn load_thumbs(dirs: &[&Path], chart: &Chart, cache_dirs: &[PathBuf], data_root: &Path) -> ThumbSet {
     let started = std::time::Instant::now();
     let index = picture_index(dirs);
-    let mut provider = ThumbProvider::new(cache_dir, dirs);
+    let mut provider = ThumbProvider::with_caches(cache_dirs, data_root, dirs);
     // Blank white "paper" plates are not pictures of a scene; the selection
     // looks past them (see pick_scene_pictures).
     let picks = pick_scene_pictures(&index, &chart.nodes, &mut |path| provider.is_blank(path));
@@ -155,20 +155,25 @@ fn mtime_ns(meta: &std::fs::Metadata) -> Option<u128> {
 
 /// cache_dir is data/cache/timeline, so the manifest's source_paths resolve
 /// against the grandparent directory.
+#[cfg(test)]
 fn data_root_of(cache_dir: &Path) -> Option<PathBuf> {
     let cache = cache_dir.parent()?;
     let root = cache.parent()?;
     if root.as_os_str().is_empty() { None } else { Some(root.to_path_buf()) }
 }
 
-/// Loads thumbnails through the cache, warning once when it is stale and
-/// walking the documented fallback chain otherwise.
+/// One cache directory and its independently validated manifest.
+struct CacheLocation {
+    dir: PathBuf,
+    manifest: HashMap<String, ManifestEntry>,
+}
+
+/// Load user and packaged caches against the actual data root, then source art.
 struct ThumbProvider<'a> {
-    cache_dir: &'a Path,
+    caches: Vec<CacheLocation>,
     /// Art trees searched for a cheap stand-in of a stale source picture.
     dirs: &'a [&'a Path],
     data_root: Option<PathBuf>,
-    manifest: HashMap<String, ManifestEntry>,
     warned_no_manifest: bool,
     stale: usize,
     stale_first: Option<String>,
@@ -184,12 +189,20 @@ struct ThumbProvider<'a> {
 }
 
 impl<'a> ThumbProvider<'a> {
-    fn new(cache_dir: &'a Path, dirs: &'a [&'a Path]) -> ThumbProvider<'a> {
+    #[cfg(test)]
+    fn new(cache_dir: &Path, dirs: &'a [&'a Path]) -> ThumbProvider<'a> {
+        let root = data_root_of(cache_dir).unwrap_or_default();
+        Self::with_caches(&[cache_dir.to_path_buf()], &root, dirs)
+    }
+
+    fn with_caches(cache_dirs: &[PathBuf], data_root: &Path, dirs: &'a [&'a Path]) -> ThumbProvider<'a> {
         ThumbProvider {
-            cache_dir,
+            caches: cache_dirs.iter().map(|dir| CacheLocation {
+                dir: dir.clone(),
+                manifest: load_manifest(dir),
+            }).collect(),
             dirs,
-            data_root: data_root_of(cache_dir),
-            manifest: load_manifest(cache_dir),
+            data_root: Some(data_root.to_path_buf()),
             warned_no_manifest: false,
             stale: 0,
             stale_first: None,
@@ -213,8 +226,9 @@ impl<'a> ThumbProvider<'a> {
         // Prefer the pre-rendered 320x180 thumbnail: cheap and already at the
         // analysis size. A missing cache source only becomes blank when it can
         // be decoded cheaply; large scaled art is assumed to be a real picture.
-        let cache = self.cache_dir.join(format!("{stem}.tga"));
-        let img = crate::codec::image::decode_file(&cache).ok().or_else(|| {
+        let mut candidates = self.cache_candidates(&stem);
+        candidates.sort_by_key(|(_, fresh)| !*fresh);
+        let img = candidates.iter().find_map(|(cache, _)| crate::codec::image::decode_file(cache).ok()).or_else(|| {
             if source_is_small(path) {
                 crate::codec::image::decode_file(path).ok()
             } else {
@@ -246,24 +260,12 @@ impl<'a> ThumbProvider<'a> {
         }
     }
 
-    /// Trust level of the cached file: fresh rows are read directly, any other
-    /// state flags a stale row and forces a fresh small picture from source.
-    fn cache_is_fresh(&mut self, stem: &str, cache: &Path) -> bool {
-        match self.manifest.get(stem) {
-            None if self.manifest.is_empty() => {
-                self.warn_no_manifest();
-                false
-            }
-            None => {
-                self.note_stale(stem);
-                false
-            }
-            Some(entry) if !self.fresh(entry, cache) => {
-                self.note_stale(stem);
-                false
-            }
-            Some(_) => true,
-        }
+    fn cache_candidates(&self, stem: &str) -> Vec<(PathBuf, bool)> {
+        self.caches.iter().map(|location| {
+            let path = location.dir.join(format!("{stem}.tga"));
+            let fresh = location.manifest.get(stem).is_some_and(|entry| self.fresh(entry, &path));
+            (path, fresh)
+        }).collect()
     }
 
     fn load(&mut self, source: &Path, stem: &str) -> Option<Arc<TgaImage>> {
@@ -285,19 +287,21 @@ impl<'a> ThumbProvider<'a> {
     }
 
     fn load_uncached(&mut self, source: &Path, stem: &str) -> Option<Arc<TgaImage>> {
-        let cache = self.cache_dir.join(format!("{stem}.tga"));
-        let fresh = self.cache_is_fresh(stem, &cache);
+        let candidates = self.cache_candidates(stem);
         self.last_from_cache = false;
-        if fresh {
-            match crate::codec::image::decode_file(&cache) {
-                Ok(img) => {
+        for (cache, fresh) in &candidates {
+            if *fresh {
+                if let Ok(img) = crate::codec::image::decode_file(cache) {
                     self.cache_hits += 1;
                     self.last_from_cache = true;
                     return Some(Arc::new(img));
                 }
-                // A matching row but an unreadable file: rebuild below.
-                Err(_) => self.note_stale(stem),
             }
+        }
+        if self.caches.iter().all(|location| location.manifest.is_empty()) {
+            self.warn_no_manifest();
+        } else {
+            self.note_stale(stem);
         }
         // The cache is missing or stale. The report's P1 complaint was that an
         // outdated thumbnail kept being shown, so decode the actual source now
@@ -307,8 +311,8 @@ impl<'a> ThumbProvider<'a> {
             return Some(reduce_to_work_size(&img));
         }
         // Source art is gone too: an outdated picture still beats a hole.
-        if !fresh {
-            if let Ok(img) = crate::codec::image::decode_file(&cache) {
+        for (cache, _) in &candidates {
+            if let Ok(img) = crate::codec::image::decode_file(cache) {
                 self.cache_hits += 1;
                 self.last_from_cache = true;
                 return Some(Arc::new(img));
@@ -409,7 +413,7 @@ impl<'a> ThumbProvider<'a> {
         self.warned_no_manifest = true;
         eprintln!(
             "timeline: no thumbnail manifest under {}; run 'python3 tools/build_timeline_cache.py --force' (rebuilding thumbnails from the source pictures)",
-            self.cache_dir.display()
+            self.caches.last().map(|c| c.dir.as_path()).unwrap_or_else(|| Path::new("")).display()
         );
     }
 
@@ -1180,6 +1184,71 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn write_manifest_row(cache_dir: &Path, data_root: &Path, relative: &str, stem: &str) {
+        let source = std::fs::metadata(data_root.join(relative)).unwrap();
+        let cache = std::fs::metadata(cache_dir.join(format!("{stem}.tga"))).unwrap();
+        let row = format!("{stem}\t{relative}\t{}\t{}\tunused\t{}\t{}\n",
+            source.len(), mtime_ns(&source).unwrap(), cache.len(), mtime_ns(&cache).unwrap());
+        std::fs::write(cache_dir.join("manifest.tsv"), format!("{}{row}", header())).unwrap();
+    }
+
+    #[test]
+    fn relocated_cache_validates_against_the_separate_data_root() {
+        let dir = std::env::temp_dir().join(format!("wa2-shots-relocated-{}", std::process::id()));
+        let data = dir.join("read-only-data");
+        let cache = dir.join("user/cache/timeline");
+        let source = data.join("bg/tv100100.tga");
+        write_tga(&source, [200, 10, 10, 255]);
+        write_tga(&cache.join("tv100100.tga"), [10, 20, 200, 255]);
+        write_manifest_row(&cache, &data, "bg/tv100100.tga", "tv100100");
+        let mut provider = ThumbProvider::with_caches(&[cache.clone()], &data, &[]);
+        let img = provider.load(&source, "tv100100").unwrap();
+        assert_eq!(&img.rgba[..4], &[10, 20, 200, 255]);
+        assert_eq!((provider.cache_hits, provider.decoded, provider.stale), (1, 0, 0));
+        // Moving the cache must not disable source-change invalidation.
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&source).unwrap().write_all(b"changed").unwrap();
+        let mut provider = ThumbProvider::with_caches(&[cache], &data, &[]);
+        let img = provider.load(&source, "tv100100").unwrap();
+        assert_eq!(&img.rgba[..4], &[200, 10, 10, 255]);
+        assert_eq!((provider.cache_hits, provider.decoded, provider.stale), (0, 1, 1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundled_cache_handles_missing_stale_and_corrupt_user_cache() {
+        let dir = std::env::temp_dir().join(format!("wa2-shots-bundled-{}", std::process::id()));
+        let data = dir.join("data");
+        let user = dir.join("user/cache/timeline");
+        let bundled = data.join("cache/timeline");
+        let source = data.join("bg/tv100100.tga");
+        write_tga(&source, [200, 10, 10, 255]);
+        write_tga(&bundled.join("tv100100.tga"), [255, 255, 255, 255]);
+        write_manifest_row(&bundled, &data, "bg/tv100100.tga", "tv100100");
+        let caches = [user.clone(), bundled];
+        for state in ["missing", "corrupt", "stale", "valid"] {
+            if state != "missing" {
+                write_tga(&user.join("tv100100.tga"), [10, 200, 10, 255]);
+                if state == "corrupt" {
+                    std::fs::write(user.join("tv100100.tga"), b"broken").unwrap();
+                }
+                write_manifest_row(&user, &data, "bg/tv100100.tga", "tv100100");
+                if state == "stale" {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new().append(true).open(user.join("tv100100.tga")).unwrap().write_all(b"changed").unwrap();
+                }
+            }
+            let mut provider = ThumbProvider::with_caches(&caches, &data, &[]);
+            let img = provider.load(&source, "tv100100").unwrap();
+            let expected = if state == "valid" { [10, 200, 10, 255] } else { [255, 255, 255, 255] };
+            assert_eq!(&img.rgba[..4], &expected, "{state}");
+            assert_eq!((provider.cache_hits, provider.decoded, provider.stale), (1, 0, 0), "{state}");
+            assert!(!provider.warned_no_manifest, "{state}");
+            assert_eq!(provider.is_blank(&source), state != "valid", "{state}: blank-entry detection must use the same cache priority");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn thumbnail_downscale_averages_neighbouring_pixels() {
         let img = TgaImage {
@@ -1228,7 +1297,7 @@ mod tests {
         );
         std::fs::write(cache_dir.join("manifest.tsv"), format!("{header}{row}")).unwrap();
         let provider = ThumbProvider::new(&cache_dir, &[]);
-        let entry = provider.manifest.get("b100101").expect("manifest row");
+        let entry = provider.caches[0].manifest.get("b100101").expect("manifest row");
         assert!(provider.fresh(entry, &cache), "a matching row must be fresh");
         // A source edit invalidates the row even when the cache is untouched.
         std::fs::write(&source, b"source-edited").unwrap();

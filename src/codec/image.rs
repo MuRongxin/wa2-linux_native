@@ -113,7 +113,7 @@ pub fn source_art_scale(path: &Path) -> u32 {
 /// a 59 MP 8x WebP only to throw away 63/64 of the pixels is pure waste. The
 /// tool pre-renders the logical TGA once; the loader prefers it and falls
 /// back to decoding the 8x WebP whenever the cache file is absent.
-fn ui_cache_path(path: &Path) -> Option<std::path::PathBuf> {
+fn ui_cache_paths(path: &Path) -> Option<Vec<std::path::PathBuf>> {
     if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("webp")) != Some(true) {
         return None;
     }
@@ -124,7 +124,8 @@ fn ui_cache_path(path: &Path) -> Option<std::path::PathBuf> {
     }
     let root = parent.parent()?;
     let stem = path.file_stem()?.to_string_lossy();
-    Some(root.join("cache").join("ui").join(tree).join(format!("{stem}.tga")))
+    let relative = Path::new("ui").join(tree).join(format!("{stem}.tga"));
+    Some(crate::data::cache_dirs(root, &relative))
 }
 
 pub fn decode_ui_file(path: &Path) -> Result<TgaImage, String> {
@@ -134,9 +135,11 @@ pub fn decode_ui_file(path: &Path) -> Result<TgaImage, String> {
     if !path.is_file() {
         return Err(format!("missing {}", path.display()));
     }
-    if let Some(cache) = ui_cache_path(path) {
-        if let Ok(img) = decode_file(&cache) {
-            return Ok(img);
+    if let Some(caches) = ui_cache_paths(path) {
+        for cache in caches {
+            if let Ok(img) = decode_file(&cache) {
+                return Ok(img);
+            }
         }
     }
     let scale = source_art_scale(path);
