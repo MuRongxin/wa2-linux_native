@@ -22,6 +22,8 @@ const RTLD_NOW: c_int = 2;
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
+/// Retina: ask Cocoa for a backing store at the panel's real pixel count.
+const SDL_WINDOW_ALLOW_HIGHDPI: u32 = 0x0000_2000;
 /// Borderless window the size of the desktop. Exclusive fullscreen (flag 1)
 /// asks the display to switch to 1280×720, which the compositor ignores, so
 /// the 「全屏」 setting never changed the window.
@@ -86,6 +88,7 @@ pub struct Sdl {
     f_render_read_pixels: unsafe extern "C" fn(*mut c_void, *const c_void, u32, *mut c_void, c_int) -> c_int,
     f_get_pixel_format_name: unsafe extern "C" fn(u32) -> *const c_char,
     f_get_window_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int),
+    f_get_output_size: Option<unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int>,
     f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int,
     f_destroy_texture: unsafe extern "C" fn(*mut c_void),
     f_destroy_renderer: unsafe extern "C" fn(*mut c_void),
@@ -287,7 +290,7 @@ impl Sdl {
             // window resizable. SDL/most window managers derive the maximize
             // button from this flag; fullscreen is deliberately controlled by
             // the in-game display-mode setting (or F11) instead.
-            SDL_WINDOW_SHOWN,
+            SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI,
         );
         if window.is_null() {
             return None;
@@ -297,10 +300,17 @@ impl Sdl {
         // second CPU-side copy.  Prefer the GPU path and keep software as a
         // fallback for Xvfb/llvmpipe setups and for explicit headless tests.
         let force_software = std::env::var_os("WA2_SOFTWARE").is_some();
+        // WA2_VSYNC=1 paces presents to the display refresh (120 Hz panels
+        // included) instead of tearing; off by default elsewhere.
+        let vsync = if std::env::var("WA2_VSYNC").map(|v| v == "1").unwrap_or(false) {
+            SDL_RENDERER_PRESENTVSYNC
+        } else {
+            0
+        };
         let mut renderer = if force_software {
             f_create_renderer(window, -1, SDL_RENDERER_SOFTWARE)
         } else {
-            f_create_renderer(window, -1, SDL_RENDERER_ACCELERATED)
+            f_create_renderer(window, -1, SDL_RENDERER_ACCELERATED | vsync)
         };
         if renderer.is_null() {
             renderer = if force_software {
@@ -333,6 +343,7 @@ impl Sdl {
             f_render_read_pixels,
             f_get_pixel_format_name,
             f_get_window_size,
+            f_get_output_size: sym(lib, "SDL_GetRendererOutputSize").map(|p| std::mem::transmute(p)),
             f_poll_event,
             f_destroy_texture,
             f_destroy_renderer,
@@ -347,6 +358,7 @@ impl Sdl {
             cursor_pressed: std::ptr::null_mut(),
         };
         sdl.enable_game_cursor();
+        sdl.fit_to_screen();
         Some(sdl)
     }
 
@@ -412,7 +424,8 @@ impl Sdl {
             let pitch = (surf.width * 4) as c_int;
             (self.f_update_texture)(self.texture, std::ptr::null(), surf.pixels.as_ptr() as *const c_void, pitch);
             (self.f_render_clear)(self.renderer);
-            (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), std::ptr::null());
+            let dst = self.dest_rect();
+            (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), dst.as_ptr() as *const c_void);
             (self.f_render_present)(self.renderer);
         }
         if let Some(t0) = t0 {
@@ -463,7 +476,8 @@ impl Sdl {
             }
             (self.f_update_texture)(self.texture, std::ptr::null(), rgba.as_ptr() as *const c_void, (w * 4) as c_int);
             (self.f_render_clear)(self.renderer);
-            (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), std::ptr::null());
+            let dst = self.dest_rect();
+            (self.f_render_copy)(self.renderer, self.texture, std::ptr::null(), dst.as_ptr() as *const c_void);
             (self.f_render_present)(self.renderer);
         }
     }
@@ -478,6 +492,12 @@ impl Sdl {
             while (self.f_poll_event)(ev.as_mut_ptr() as *mut c_void) != 0 {
                 let etype = u32::from_ne_bytes([ev[0], ev[1], ev[2], ev[3]]);
                 if etype == SDL_QUIT {
+                    // macOS: the red close button, Dock "Quit" and the app
+                    // menu's Cmd-Q all arrive here and mean "leave the app",
+                    // not "back to the title" as Esc does on Linux.
+                    if cfg!(target_os = "macos") {
+                        std::process::exit(0);
+                    }
                     out = Input::Quit;
                 } else if etype == SDL_KEYDOWN {
                     // SDL_KeyboardEvent layout: type(4) + timestamp(4) +
@@ -485,6 +505,39 @@ impl Sdl {
                     // offset 16 whose first field is the scancode; the key
                     // constants above are SDL scancode values.
                     let sc = i32::from_ne_bytes([ev[16], ev[17], ev[18], ev[19]]);
+                    // Keysym.mod sits after scancode(4) + sym(4).
+                    let kmod = u16::from_ne_bytes([ev[24], ev[25]]);
+                    let repeat = ev[13] != 0;
+                    if cfg!(target_os = "macos") {
+                        const KMOD_GUI: u16 = 0x0C00;
+                        const SC_LALT: i32 = 226;
+                        const SC_RALT: i32 = 230;
+                        if kmod & KMOD_GUI != 0 {
+                            match sc {
+                                // Cmd-Q: leave the app like any Mac app. Saves and
+                                // settings are written when they change.
+                                SDLK_q => std::process::exit(0),
+                                SDLK_f | SDLK_RETURN => out = Input::Fullscreen,
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        match sc {
+                            // Option opens the in-game menu (same as a right click).
+                            SC_LALT | SC_RALT if !repeat => {
+                                out = Input::RightClick;
+                                continue;
+                            }
+                            // Esc / Q alone would drop an unsaved story back to
+                            // the title; on the Mac Esc means "back".
+                            SDLK_ESCAPE => {
+                                out = Input::Back;
+                                continue;
+                            }
+                            SDLK_q => continue,
+                            _ => {}
+                        }
+                    }
                     match sc {
                         SDLK_ESCAPE | SDLK_q => out = Input::Quit,
                         SDLK_F11 => out = Input::Fullscreen,
@@ -656,7 +709,8 @@ fn remember_windowed(&self) {
         return;
     }
     let (x, y) = self.window_pos();
-    let (w, h) = self.window_size();
+    // Points, not pixels: this is fed back to SDL_SetWindowSize.
+    let (w, h) = self.point_size();
     *slot = Some((x, y, w, h));
 }
 
@@ -669,6 +723,30 @@ fn window_pos(&self) -> (i32, i32) {
     let (mut x, mut y) = (0i32, 0i32);
     unsafe { f(self.window, &mut x, &mut y) };
     (x, y)
+}
+
+/// Shrink a new window that does not fit the usable screen area (a MacBook
+/// panel in a scaled "more space" mode is only ~1150 points wide, so the
+/// 1280x720-point window ran off the edge). Keeps 16:9 and centers it.
+fn fit_to_screen(&self) {
+    let Some(index) = self.fn_ptr::<unsafe extern "C" fn(*mut c_void) -> i32>("SDL_GetWindowDisplayIndex") else { return };
+    let Some(usable) = self.fn_ptr::<unsafe extern "C" fn(i32, *mut i32) -> i32>("SDL_GetDisplayUsableBounds") else { return };
+    let idx = unsafe { index(self.window) };
+    let mut r = [0i32; 4];
+    if idx < 0 || unsafe { usable(idx, r.as_mut_ptr()) } != 0 || r[2] <= 0 || r[3] <= 0 {
+        return;
+    }
+    let (w, h) = self.point_size();
+    // room for the title bar
+    let (aw, ah) = (r[2] * 92 / 100, (r[3] - 40) * 92 / 100);
+    if w <= aw && h <= ah {
+        return;
+    }
+    let (_, _, nw, nh) = fit_16_9(aw, ah);
+    self.sdl_set_size(nw, nh);
+    self.sdl_set_pos(r[0] + (r[2] - nw) / 2, r[1] + (r[3] - nh) / 2 + 14);
+    self.pump();
+    eprintln!("sdl: window {}x{} does not fit {}x{}, now {}x{} points", w, h, r[2], r[3], nw, nh);
 }
 
 fn display_bounds(&self) -> Option<(i32, i32, i32, i32)> {
@@ -779,18 +857,54 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
 }
 
     /// Current window size in pixels (the surface is stretched to it).
+    ///
+    /// On a Retina display this is the drawable size in real pixels (the
+    /// renderer output), not the window's point size, so text and art are
+    /// rasterized for the panel rather than upscaled from points.
+    ///
+    /// The game is 16:9; on another aspect (a 16:10 MacBook panel in
+    /// fullscreen) this is the largest 16:9 box that fits, and `present`
+    /// letterboxes into it instead of stretching.
     pub fn window_size(&self) -> (i32, i32) {
+        let (w, h) = self.drawable_size();
+        let (_, _, fw, fh) = fit_16_9(w, h);
+        (fw, fh)
+    }
+
+    /// Full drawable size in real pixels.
+    pub fn drawable_size(&self) -> (i32, i32) {
+        if let Some(f) = self.f_get_output_size {
+            let (mut w, mut h) = (0i32, 0i32);
+            if unsafe { f(self.renderer, &mut w, &mut h) } == 0 && w > 0 && h > 0 {
+                return (w, h);
+            }
+        }
+        self.point_size()
+    }
+
+    /// Letterbox rectangle (x, y, w, h) in renderer pixels as an SDL_Rect.
+    fn dest_rect(&self) -> [c_int; 4] {
+        let (w, h) = self.drawable_size();
+        let (x, y, fw, fh) = fit_16_9(w, h);
+        [x, y, fw, fh]
+    }
+
+    /// Window size in points: the space pointer events are reported in.
+    pub fn point_size(&self) -> (i32, i32) {
         let (mut w, mut h) = (0i32, 0i32);
         unsafe { (self.f_get_window_size)(self.window, &mut w, &mut h); }
         (w.max(1), h.max(1))
     }
 
-    /// Map a pointer event's window coordinates onto the game surface
-    /// (`present` stretches the surface over the whole window, so this is a
-    /// plain linear scale).
+    /// Map a pointer event's coordinates (renderer pixels) onto the game
+    /// surface, through the letterbox `present` draws (see `map_pointer`).
     pub fn surface_pos(&self, x: i32, y: i32, sw: u32, sh: u32) -> (i32, i32) {
-        let (ww, wh) = self.window_size();
-        (x * sw as i32 / ww, y * sh as i32 / wh)
+        let px = self.drawable_size();
+        let r = map_pointer(x, y, px, (sw as i32, sh as i32));
+        if std::env::var_os("WA2_DEBUG_POINTER").is_some() {
+            eprintln!("pointer: raw=({x},{y}) points={:?} drawable={px:?} -> ({},{}) of {sw}x{sh}", self.point_size(), r.0, r.1);
+        }
+        r
     }
 
     /// Read back the current renderer target as RGBA (for verification),
@@ -962,5 +1076,76 @@ mod tests {
         assert!(pressed.1.iter().any(|&b| b != 0));
         assert_ne!(normal, hover);
         assert_ne!(normal, pressed);
+    }
+}
+
+/// Pointer event -> game-surface coordinates.
+///
+/// With a renderer on an SDL_WINDOW_ALLOW_HIGHDPI window, SDL reports mouse
+/// positions in renderer output pixels (measured on a 2x Retina panel: the
+/// window centre at 573,359 pt arrives as 1146,718), not window points. So the
+/// pointer is mapped through the same `fit_16_9` box `present` draws into,
+/// directly in drawable pixels.
+pub fn map_pointer(x: i32, y: i32, px: (i32, i32), surf: (i32, i32)) -> (i32, i32) {
+    let (bx, by, bw, bh) = fit_16_9(px.0, px.1);
+    let sx = (x - bx) as f64 * surf.0 as f64 / bw.max(1) as f64;
+    let sy = (y - by) as f64 * surf.1 as f64 / bh.max(1) as f64;
+    (sx.floor() as i32, sy.floor() as i32)
+}
+
+/// Inverse of `map_pointer` (used by the scripted test input).
+pub fn unmap_pointer(sx: i32, sy: i32, px: (i32, i32), surf: (i32, i32)) -> (i32, i32) {
+    let (bx, by, bw, bh) = fit_16_9(px.0, px.1);
+    let x = bx as f64 + (sx as f64 + 0.5) * bw as f64 / surf.0 as f64;
+    let y = by as f64 + (sy as f64 + 0.5) * bh as f64 / surf.1 as f64;
+    (x.floor() as i32, y.floor() as i32)
+}
+
+/// Largest centered 16:9 box inside `w`x`h`: (x, y, w, h).
+pub fn fit_16_9(w: i32, h: i32) -> (i32, i32, i32, i32) {
+    let (w, h) = (w.max(1), h.max(1));
+    if w * 9 > h * 16 {
+        let fw = (h * 16 + 4) / 9;
+        ((w - fw) / 2, 0, fw, h)
+    } else if w * 9 < h * 16 {
+        let fh = (w * 9 + 8) / 16;
+        (0, (h - fh) / 2, w, fh)
+    } else {
+        (0, 0, w, h)
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::{map_pointer, unmap_pointer};
+    #[test]
+    fn fullscreen_16_10_letterbox() {
+        // 14" MacBook fullscreen: drawable 2294x1438 px, picture 2294x1290 at y=74.
+        let px = (2294, 1438);
+        // Measured: cursor at the picture centre arrives as (1146,718).
+        assert_eq!(map_pointer(1146, 718, px, (1280, 720)), (639, 359));
+        assert_eq!(map_pointer(0, 74, px, (1280, 720)), (0, 0));
+        // Inside the top black bar is above the picture.
+        assert!(map_pointer(10, 40, px, (1280, 720)).1 < 0);
+    }
+    #[test]
+    fn windowed_and_round_trip() {
+        for px in [(2110, 1186), (2294, 1438), (2560, 1440)] {
+            for &(x, y) in &[(0, 0), (100, 600), (1200, 650), (640, 40), (1279, 719)] {
+                let (wx, wy) = unmap_pointer(x, y, px, (1280, 720));
+                assert_eq!(map_pointer(wx, wy, px, (1280, 720)), (x, y), "{px:?} {x},{y}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    #[test]
+    fn letterbox_keeps_16_9() {
+        assert_eq!(super::fit_16_9(1280, 720), (0, 0, 1280, 720));
+        assert_eq!(super::fit_16_9(3456, 2234), (0, 145, 3456, 1944));
+        assert_eq!(super::fit_16_9(3840, 2160), (0, 0, 3840, 2160));
+        assert_eq!(super::fit_16_9(2000, 720), (360, 0, 1280, 720));
     }
 }

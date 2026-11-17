@@ -3413,6 +3413,13 @@ fn run_game_at(
                     let mut cmd_hover: Option<cmdbar::Cmd> = None;
                     let mut dwell: u32 = 0;
                     'wait: loop {
+                            // A fullscreen switch on macOS finishes its
+                            // animation after the request returns, so the
+                            // drawable size changes a few frames later:
+                            // repaint the current line at the new size.
+                            if !line_redraw && win.window_size() != win_size {
+                                line_redraw = true;
+                            }
                             // F-17: the option screen may have changed the
                             // font or the dialogue style. Repaint the line that
                             // is already on screen instead of leaving the old
