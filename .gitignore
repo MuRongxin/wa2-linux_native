@@ -41,3 +41,4 @@ tools/__pycache__/
 
 # Local upscale-runner pid file (not part of the project).
 run_sprite.pid
+macos/AppIcon.icns

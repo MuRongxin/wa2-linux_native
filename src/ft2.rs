@@ -51,6 +51,7 @@ const RTLD_NOW: c_int = 2;
 const FT_LIBS: &[&str] = &["libfreetype.so.6", "libfreetype.so"];
 #[cfg(target_os = "macos")]
 const FT_LIBS: &[&str] = &[
+    "@executable_path/../Frameworks/libfreetype.6.dylib",
     "libfreetype.6.dylib",
     "/opt/homebrew/lib/libfreetype.6.dylib",
     "/usr/local/lib/libfreetype.6.dylib",
